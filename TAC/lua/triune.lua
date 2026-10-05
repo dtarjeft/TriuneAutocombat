@@ -128,7 +128,7 @@ local function getNumGems()
 end
 local lvlMin, lvlMax = 1, 65
 
--- loadout.gems[i] = { cls=, spell=, target=, when=, pct= }  (or nil)
+-- loadout.gems[i] = { cls=, spell=, target=, when=, pct=, priority_before_clickies= }  (or nil)
 -- loadout.aas, loadout.discs, loadout.actions are maps: name -> { cls=, target=, when=, enabled=, pct=, ... }
 -- (actions = innate combat abilities, e.g. Kick/Bash/Mend/Backstab/Flying Kick -- fired via /doability)
 -- (discs = disciplines, e.g. Defensive/Stonewall/Trueshot -- fired via /disc)
@@ -656,6 +656,29 @@ local runtime = {
     lastDowntimeSwapAt = {},
     interruptedSwap = nil
 }
+
+function runtime.runCombatCategories(runners)
+    for _, category in ipairs({ 'abilities', 'disciplines', 'priority_spells', 'clickies', 'spells' }) do
+        runners[category]()
+    end
+end
+
+function runtime.spellIndicesForPass(gems, priorityPass)
+    local ordered, indices = {}, {}
+    for i, g in ipairs(gems or {}) do
+        if type(g) == 'table' and g.spell and g.spell ~= '' and runtime.isHealAction(g.spell, g.target, g) then
+            table.insert(ordered, 1, i)
+        else
+            table.insert(ordered, i)
+        end
+    end
+    for _, i in ipairs(ordered) do
+        if type(gems[i]) == 'table' and (gems[i].priority_before_clickies == true) == priorityPass then
+            indices[#indices + 1] = i
+        end
+    end
+    return indices
+end
 
 local petState = {
     myPets = {},           -- cls -> living spawn ID of that class's pet (one pet per pet class, an ID is never tracked under two classes)
@@ -9024,6 +9047,16 @@ function UI.drawGemList(gemsTable, idPrefix, isActiveSet, allowBurn)
                                 end
                             end
                         end
+                    end
+
+                    ImGui.SameLine()
+                    local priorityVal = ImGui.Checkbox('High Priority##priority', g.priority_before_clickies == true)
+                    if priorityVal ~= (g.priority_before_clickies == true) then
+                        g.priority_before_clickies = priorityVal
+                        runtime.saveLoadout(true)
+                    end
+                    if ImGui.IsItemHovered() then
+                        ImGui.SetTooltip('Try this spell after Abilities and Disciplines, but before Clickies. Other spells remain after Clickies.')
                     end
 
                     if allowBurn then
@@ -23453,7 +23486,24 @@ local function combatTick()
             end
         end
     end
+    local categoryRunners = {}
+    local canCastMove = false
+    local eventsProcessed = false
+    local prioritySpellPass = false
+    local spellCastedThisTick = false
+    local function prepareCastState()
+        if eventsProcessed then return end
+        mq.doevents()
+        local isMoving = false
+        pcall(function() isMoving = mq.TLO.Me.Moving() or false end)
+        local isBrdMe = false
+        pcall(function() isBrdMe = (mq.TLO.Me.Class.ShortName() == 'BRD') end)
+        canCastMove = isBrdMe or not isMoving
+        eventsProcessed = true
+    end
+
     -- Innate Combat Abilities (/doability): Autoskill (continuous on cooldown) and Priority Conditions
+    categoryRunners.abilities = function()
     if combatReady and loadout.actions then
         -- 1. Autoskill: continuously fire high-frequency combat attacks on cooldown when ready
         for name, act in pairs(loadout.actions) do
@@ -23511,8 +23561,10 @@ local function combatTick()
             end
         end
     end
+    end
 
     -- Disciplines (/disc): Gather every enabled disc whose condition is met, try in priority order
+    categoryRunners.disciplines = function()
     if combatReady and loadout.discs then
         local eligibleDiscs = {}
         for name, d in pairs(loadout.discs) do
@@ -23545,6 +23597,14 @@ local function combatTick()
             if fireDisc(e.name, e.entry, e.id) then break end
         end
     end
+    end
+
+    categoryRunners.priority_spells = function()
+        prioritySpellPass = true
+        categoryRunners.spells()
+        prioritySpellPass = false
+    end
+
     -- one spell cast per tick, only when not already casting/singing AND not
     -- actively moving. EQ interrupts/cancels almost every spell cast if you
     -- move during it -- with no check for this, a gem's cast would fire while
@@ -23553,14 +23613,8 @@ local function combatTick()
     -- immediately become eligible to retry again next cooldown -- repeating
     -- for the whole approach ("keeps trying to cast X while pulling"). AAs
     -- above are unaffected (instant, no cast bar, usable on the move). Casts
-    mq.doevents()
-
-    local isMoving = false
-    pcall(function() isMoving = mq.TLO.Me.Moving() or false end)
-    local isBrdMe = false
-    pcall(function() isBrdMe = (mq.TLO.Me.Class.ShortName() == 'BRD') end)
-    local canCastMove = isBrdMe or not isMoving
-
+    categoryRunners.clickies = function()
+    prepareCastState()
     if combatReady and not isCasting() and not isMoveActive() and canCastMove and loadout.clickies and #loadout.clickies > 0 then
         if not isCasting() and runtime.restoreTargetId ~= nil then
             local rId = runtime.restoreTargetId
@@ -23600,11 +23654,14 @@ local function combatTick()
             end
         end
     end
+    end
 
+    categoryRunners.spells = function()
+    prepareCastState()
     local inRealCombat = isCombat() or anyXtarAlive(true) or countNPCXtarget() > 0 or mq.TLO.Me.Combat() or (mq.TLO.Me.CombatState and mq.TLO.Me.CombatState() == 'COMBAT') or runtime.hasDowntimeAggroThreat()
     local gemCasted = false
 
-    if combatReady and not isCasting() and not isMoveActive() and canCastMove then
+    if combatReady and not spellCastedThisTick and not isCasting() and not isMoveActive() and canCastMove then
         if not isCasting() and runtime.restoreTargetId ~= nil then
             local rId = runtime.restoreTargetId
             runtime.restoreTargetId = nil
@@ -23615,15 +23672,7 @@ local function combatTick()
             end
         end
         if loadout.gems then
-            local gemOrder = {}
-            for i = 1, #loadout.gems do
-                local g = loadout.gems[i]
-                if g and g.spell and g.spell ~= '' and runtime.isHealAction(g.spell, g.target, g) then
-                    table.insert(gemOrder, 1, i)
-                else
-                    table.insert(gemOrder, i)
-                end
-            end
+            local gemOrder = runtime.spellIndicesForPass(loadout.gems, prioritySpellPass)
             for _, i in ipairs(gemOrder) do
                 local g = loadout.gems[i]
                 if g and g.spell and g.spell ~= '' then
@@ -23666,6 +23715,7 @@ local function combatTick()
                                         local targetValid = (id == mq.TLO.Me.ID()) or (not isDet and runtime.isTargetInRange(g.spell, id)) or (isDet and isHostileTarget(id) and isTargetInRange(g.spell, id))
                                         if targetValid and castGem(actualGem, g, id) then
                                             gemCasted = true
+                                            spellCastedThisTick = true
                                             if g.when == 'missing buff' then
                                                 local bene = false
                                                 pcall(function() bene = mq.TLO.Spell(g.spell).Beneficial() end)
@@ -23707,13 +23757,16 @@ local function combatTick()
 
     -- A downtime swap waiting on SpellReady must be serviced even when combat
     -- starts, so the aggro branch can hand it to interruptedSwap.
-    if runtime.pendingDowntimeReady then
+    if not prioritySpellPass and runtime.pendingDowntimeReady then
         runtime.tickPendingDowntimeReady()
     end
     -- If out of combat and no spell was cast, process downtime buff swapping & priority spell restoration
-    if not gemCasted and not inRealCombat and not isCasting() and not isCastingOrStarting() and not isMoveActive() and not runtime.medBreakActive then
+    if not prioritySpellPass and not gemCasted and not spellCastedThisTick and not inRealCombat and not isCasting() and not isCastingOrStarting() and not isMoveActive() and not runtime.medBreakActive then
         runtime.processDowntimeBuffing()
     end
+    end
+
+    runtime.runCombatCategories(categoryRunners)
 end
 
 local function normalizeCommandKey(text)

@@ -25,7 +25,8 @@ Triune opens by itself when you log in. If you close it, type `/ac` or `/lua run
 
 1. **Check your classes.** The main window shows the three classes it detected. Click **Re-detect** if they are wrong.
 2. **Set up what to cast.** Go through the tabs: **Spell Gems** (spells), **Abilities** (kick, bash, backstab...), **AAs**, **Disciplines** and **Clickies**. Each entry gets a simple rule for when to fire it, such as *Target HP < 90%*, *My HP < 40%*, *Missing Buff* or *Always*. **Import Bar** fills the spell list from whatever you have memorized.
-3. **Pick a mode** on the **Control** tab and click **Start** (or type `/ac run`).
+3. In **Spell Gems**, mark emergency heals, lifetaps, or other spells **High Priority** to check them after Abilities and Disciplines but before Clickies. Other spells remain after Clickies; the overall action-category order stays fixed.
+4. **Pick a mode** on the **Control** tab and click **Start** (or type `/ac run`).
 
 Your setup is saved automatically and reloads next time.
 

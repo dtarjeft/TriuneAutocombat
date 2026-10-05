@@ -709,6 +709,31 @@ assert_eq(dc.auto_summon_fireworks, false, 'defaultCtrl: auto_summon_fireworks=f
 assert_eq(dc.pause_on_zone, true, 'defaultCtrl: pause_on_zone=true')
 assert_eq(dc.fov, 100, 'defaultCtrl: fov=100')
 assert_eq(dc.fov_enabled, false, 'defaultCtrl: fov_enabled=false')
+local spellIndicesForPass = loadFunc(src, 'spellIndicesForPass', {
+    runtime = { isHealAction = function(name) return name == 'Emergency Heal' or name == 'Lifetap' end },
+})
+local mixedSpellEntries = {
+    { spell = 'Damage Spell' },
+    { spell = 'Emergency Heal', priority_before_clickies = true },
+    { spell = 'Buff' },
+    { spell = 'Lifetap', priority_before_clickies = true },
+}
+assert_tbl_eq(spellIndicesForPass(mixedSpellEntries, true), { 4, 2 },
+    'high-priority spell pass preserves heal-first order for promoted spells')
+assert_tbl_eq(spellIndicesForPass(mixedSpellEntries, false), { 1, 3 },
+    'normal spell pass excludes high-priority spells and preserves remaining order')
+local dispatchedCategories = {}
+local categoryRunners = {}
+for _, category in ipairs({ 'abilities', 'disciplines', 'priority_spells', 'clickies', 'spells' }) do
+    categoryRunners[category] = function() dispatchedCategories[#dispatchedCategories + 1] = category end
+end
+local runCombatCategories = loadFunc(src, 'runCombatCategories')
+runCombatCategories(categoryRunners)
+assert_tbl_eq(dispatchedCategories, { 'abilities', 'disciplines', 'priority_spells', 'clickies', 'spells' },
+    'category order remains fixed with promoted spells immediately before clickies')
+assert_true(src:find("ImGui%.Checkbox%('High Priority##priority'") ~= nil
+    and src:find("runtime%.spellIndicesForPass%(loadout%.gems, prioritySpellPass%)") ~= nil,
+    'Spell Gems exposes and applies High Priority')
 
 -- ============================================================================
 -- 9.  isActionSkill(name) & defaultActionEntry
