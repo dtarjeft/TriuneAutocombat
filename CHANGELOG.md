@@ -1,5 +1,9 @@
 # Triune AutoCombat Change Log
 
+## 2026-10-05
+
+- **Friendly action target fallback (`TAC/lua/triune.lua`, `tests/test_pure_logic.lua`).** When a friendly action's configured target cannot be resolved, fall back to the caster instead of the currently selected hostile target.
+
 ## 2026-10-01
 
 - **Ordered self/group targets for spells, discs, and clickies (`TAC/lua/triune.lua`, `tests/test_pure_logic.lua`).** Adds **Me, then Group** and **Group, then Me** so single-target actions choose the first present, living, in-range member whose individual condition is met, in the configured priority order. Self-HP and self-mana conditions stay on the caster; target switching restores the previous target.

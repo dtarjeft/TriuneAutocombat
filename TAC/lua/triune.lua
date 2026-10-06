@@ -15409,6 +15409,19 @@ local function baseTok(token)
     return s
 end
 
+local function friendlyTargetFallbackId(token, currentTargetId)
+    local b = baseTok(token)
+    local isFriendly = b == 'Myself' or b == 'Me, then Group' or b == 'Group, then Me'
+        or b == 'Whole Group' or b == 'Main Assist' or b == 'Tank' or b == 'Lowest-HP Ally'
+        or b == 'Pet'
+    if isFriendly then
+        local myId = 0
+        pcall(function() myId = mq.TLO.Me.ID() or 0 end)
+        if myId > 0 then return myId end
+    end
+    return currentTargetId or mq.TLO.Target.ID() or 0
+end
+runtime.friendlyTargetFallbackId = friendlyTargetFallbackId
 
 function runtime.setTarget(id)
     if not id or id == 0 then return false end
@@ -18224,7 +18237,16 @@ runtime.fireSkill = function(name, a, id)
     end
     if not runtime.isSkillReady(name) then return false end
 
-    id = id or (a and runtime.resolveTargetId(a.target, a.cls, a.when, name, tonumber(a.pct) or 100)) or mq.TLO.Target.ID() or mq.TLO.Me.ID()
+    if not id then
+        id = a and runtime.resolveTargetId(a.target, a.cls, a.when, name, tonumber(a.pct) or 100)
+    end
+    if not id or id <= 0 then
+        local fallbackId = friendlyTargetFallbackId(a and a.target, mq.TLO.Target.ID() or 0)
+        if fallbackId and fallbackId > 0 then
+            id = fallbackId
+        end
+    end
+    id = id or mq.TLO.Target.ID() or mq.TLO.Me.ID()
     local selfCast = (id == mq.TLO.Me.ID())
     local orig = mq.TLO.Target.ID() or 0
     local wasAttacking = mq.TLO.Me.Combat()
