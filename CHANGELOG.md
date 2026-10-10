@@ -1,5 +1,11 @@
 # Triune AutoCombat Change Log
 
+## 2026-10-10
+
+- Fix in-combat cures using **Me, then Group** or **Group, then Me** to target the afflicted character, hold that target through the cast, and restore the previous target. Cure priority and ordered selection stay intact; gems, AAs, and clickies only cast through a hostile target for metadata-confirmed single-target HP heals.
+
+---
+
 ## 2026-10-01
 
 - **Ordered self/group targets for spells, discs, and clickies (`TAC/lua/triune.lua`, `tests/test_pure_logic.lua`).** Adds **Me, then Group** and **Group, then Me** so single-target actions choose the first present, living, in-range member whose individual condition is met, in the configured priority order. Self-HP and self-mana conditions stay on the caster; target switching restores the previous target.

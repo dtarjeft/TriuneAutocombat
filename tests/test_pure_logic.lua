@@ -4974,6 +4974,351 @@ do
 end
 
 -- ============================================================================
+-- 46b. Ordered Cure Targeting With Real Runtime Logic
+-- ============================================================================
+print('--- Ordered Cure Targeting With Real Runtime Logic ---')
+do
+(function()
+    local meId, allyId, mobId = 1001, 2002, 9009
+    local world = { clock = 100, target = mobId, counters = {}, hp = {}, castMs = 2500 }
+    local runtime = { healActionCache = {}, lastCast = {} }
+    local ctrl = { running = true, mode = 'Assist', medbreak_enabled = false }
+    local loadout = { clickies = {} }
+    local tracker = { isLockedOut = function() return false end, recordSuccess = function() end }
+    local function noop() end
+    local function no() return false end
+    local function yes() return true end
+    local function callable(t, call)
+        return setmetatable(t, { __call = call or yes })
+    end
+    local cures = {
+        { spell = 'Cure Poison', when = 'has Poison', key = 'poison', spa = 36 },
+        { spell = 'Cure Disease', when = 'has Disease', key = 'disease', spa = 35 },
+        { spell = 'Counter Remedy', when = 'has Poison/Disease', key = 'poison', spa = 36 },
+        { spell = 'Counter Remedy', when = 'has Poison/Disease', key = 'disease', spa = 35 },
+        { spell = 'Cure Curse', when = 'has Curse', key = 'curse', spa = 116 },
+        { spell = 'Cure Corruption', when = 'has Corruption', key = 'corruption', spa = 369 },
+    }
+    local spells = {}
+    local function addSpell(name, effects, targetType, beneficial)
+        local id = 100 + #name
+        spells[name] = callable({
+            ID = function() return id end,
+            Name = function() return name end,
+            Beneficial = function() return beneficial ~= false end,
+            TargetType = function() return targetType or 'Single' end,
+            Category = function() return 'Heals' end,
+            Subcategory = function() return 'Cure' end,
+            HasSPA = function(spa) return effects[spa] == true end,
+            Duration = function() return 0 end,
+            Mana = function() return 10 end,
+            EnduranceCost = function() return 0 end,
+            CastTime = function() return world.castMs end,
+        })
+    end
+    for _, cure in ipairs(cures) do addSpell(cure.spell, { [cure.spa] = true }) end
+    addSpell('Counter Remedy', { [35] = true, [36] = true })
+    addSpell('Greater Healing', { [0] = true })
+    addSpell('Group Healing', { [0] = true }, 'Group v1')
+    addSpell('Healing Focus', { [125] = true })
+    addSpell('HP Damage', { [0] = true }, 'Single', false)
+
+    local function counter(id, key)
+        return (world.counters[id] and world.counters[id][key]) or 0
+    end
+    local spawns = {}
+    for _, id in ipairs({ meId, allyId, mobId }) do
+        spawns[id] = callable({
+            ID = function() return id end,
+            CleanName = function() return 'Character' .. id end,
+            Type = function() return id == mobId and 'NPC' or 'PC' end,
+            State = function() return 'STAND' end,
+            Dead = no,
+            Present = yes,
+            OtherZone = no,
+            Offline = no,
+            PctHPs = function() return world.hp[id] or 100 end,
+            CountersPoison = function() return counter(id, 'poison') end,
+            CountersDisease = function() return counter(id, 'disease') end,
+            CountersCurse = function() return counter(id, 'curse') end,
+            CountersCorruption = function() return counter(id, 'corruption') end,
+        })
+    end
+    local me = spawns[meId]
+    me.Combat = function() return world.attacking end
+    me.Sitting, me.Ducking, me.Moving, me.Feigning = no, no, no, no
+    me.PctMana = function() return 100 end
+    me.CurrentMana, me.CurrentEndurance = me.PctMana, me.PctMana
+    me.CountBuffs = function() return 0 end
+    me.Class = { ShortName = function() return 'CLR' end }
+    me.Pet = { ID = function() return 0 end }
+    me.Casting = callable({
+        ID = function() return world.casting and 123 or 0 end,
+        TargetType = function() return spells[world.casting].TargetType() end,
+    }, function() return world.casting ~= nil end)
+    me.ItemReady, me.SpellReady, me.AltAbilityReady = function() return callable({}) end,
+        function() return callable({}) end, function() return callable({}) end
+    me.Gem = function() return callable({}, function() return 1 end) end
+    local function aa()
+        return callable({
+            ID = function() return 42 end,
+            Rank = function() return 1 end,
+            MyReuseTime = function() return 60 end,
+            Spell = spells[world.aaSpell],
+        })
+    end
+    me.AltAbility = aa
+    local mockMq = {
+        TLO = {
+            Me = me,
+            Target = { ID = function() return world.target end },
+            Spawn = function(id) return spawns[id] or callable({}, no) end,
+            Spell = function(name) return spells[name] or callable({}, no) end,
+            Group = {
+                Members = function() return 1 end,
+                Member = function(i) return i == 0 and me or spawns[allyId] end,
+            },
+            NetBots = function() return callable({}, no) end,
+            FindItem = function()
+                return callable({
+                    CastTime = function() return world.castMs end,
+                    TimerReady = function() return 0 end,
+                })
+            end,
+            AltAbility = aa,
+        },
+        doevents = noop,
+        delay = function(ms)
+            world.clock = world.clock + ms / 1000
+            if world.onDelay then world.onDelay(ms) end
+        end,
+    }
+    mockMq.cmd = function(command)
+        local target = command:match('^/target id (%d+)$')
+        if target then
+            world.target = tonumber(target)
+        elseif command == '/target clear' then
+            world.target = 0
+        elseif command == '/attack on' then
+            world.attacking = true
+        elseif command:find('^/useitem ') or command:find('^/cast ') or command:find('^/alt act ') then
+            world.firedTarget = world.target
+            world.firedCommand = command
+            world.casting = world.castMs > 0 and
+                (command:match('^/cast "(.-)"$') or (command:find('^/alt act ') and world.aaSpell) or world.itemSpell) or nil
+        end
+    end
+    mockMq.cmdf = function(fmt, ...) mockMq.cmd(string.format(fmt, ...)) end
+
+    local env = {
+        mq = mockMq, runtime = runtime, ctrl = ctrl, loadout = loadout, castTracker = tracker,
+        os = setmetatable({ clock = function() return world.clock end }, { __index = os }),
+        print = noop, clearCursor = noop, updatePetTracking = noop,
+        isSitting = no, isDucking = no, isMoveActive = no, navLoaded = no, stickLoaded = no,
+        isHostileTarget = function(id) return id == mobId end,
+        isSpawnAlive = function(id) return spawns[id] ~= nil end,
+        isIgnored = no, isSpawnMyPet = no, isAnyPet = no,
+        isCombat = yes, buffActive = no, bardKeepSinging = no,
+        hasSpellReagents = yes, isGemMatching = yes,
+        distToId = function(id) return id == meId and 0 or 20 end,
+        AFFLICTION_MEMBERS = {
+            Poison = { flag = 'Poisoned', counter = 'CountersPoison', boxnet = 'poison' },
+            Disease = { flag = 'Diseased', counter = 'CountersDisease', boxnet = 'disease' },
+        },
+    }
+    local function real(name) return loadFunc(src, name, env) end
+    env.baseTok = real('baseTok')
+    env.isFeignDeathAbility = real('isFeignDeathAbility')
+    env.checkHasSPA = real('checkHasSPA')
+    env.isDetrimentalSpell = real('isDetrimentalSpell')
+    runtime.isDetrimentalAction = real('isDetrimentalAction')
+    runtime.computeIsHealAction = real('computeIsHealAction')
+    runtime.isHealAction = real('isHealAction')
+    runtime.isRedirectableHeal = real('isRedirectableHeal')
+    env.castThroughHostileTarget = real('castThroughHostileTarget')
+    env.isTargetRequiredSpell = real('isTargetRequiredSpell')
+    env.isCasting = real('isCasting')
+    env.isCastingOrStarting = real('isCastingOrStarting')
+    env.getActiveTargetRequiredCastingId = real('getActiveTargetRequiredCastingId')
+    runtime.setTarget = real('setTarget')
+    runtime.clearTarget = real('clearTarget')
+    runtime.abortPendingCast = real('abortPendingCast')
+    env.pctHP = real('pctHP')
+    env.hasAffliction = real('hasAffliction')
+    env.isPoisoned = real('isPoisoned')
+    env.isDiseased = real('isDiseased')
+    env.isPoisonedOrDiseased = real('isPoisonedOrDiseased')
+    env.isCursed = real('isCursed')
+    env.isCorrupted = real('isCorrupted')
+    runtime.conditionMet = real('conditionMet')
+    runtime.isTargetInRange = real('isTargetInRange')
+    runtime.anyGroupMemberId = real('anyGroupMemberId')
+    runtime.resolveTargetId = real('resolveTargetId')
+    runtime.stopMovementForCast, runtime.noteAAEffectStarted = noop, noop
+    runtime.checkStuck, runtime.checkCombatStall, runtime.checkGemMemSync, runtime.decayZoneHazards = noop, noop, noop, noop
+    runtime.wpBeginTick = noop
+    runtime.isMoveActive, runtime.aaGroupBusy = no, no
+    runtime.useClickie = real('useClickie')
+    runtime.castGem = real('castGem')
+    runtime.fireAA = real('fireAA')
+    runtime.processHealPriority = real('processHealPriority')
+    local combatTick = real('combatTick')
+
+    local function reset(entry, original, castMs)
+        world.clock, world.target = 100, original == nil and mobId or original
+        world.counters, world.hp = {}, {}
+        world.castMs = castMs == nil and 2500 or castMs
+        world.casting, world.firedTarget, world.firedCommand, world.onDelay = nil, nil, nil, nil
+        world.attacking, world.itemSpell, world.aaSpell = true, entry.spell, entry.spell
+        runtime.lastCast, runtime.healActionCache = {}, {}
+        runtime.npcCastCounts, runtime.npcSpellLastCast = {}, {}
+        runtime.restoreTargetId = nil
+        tracker.activeSpell, tracker.activeTargetId, tracker.activeKind, tracker.targetRequired = nil, nil, nil, nil
+        tracker.wasCasting, tracker.failed, tracker.castStartTime = false, false, 0
+        loadout.gems, loadout.aas, loadout.actions, loadout.discs = nil, nil, nil, nil
+        loadout.clickies = { entry }
+    end
+    local function finishCast()
+        world.casting, world.clock = nil, world.clock + 3
+        local priority = runtime.processHealPriority
+        runtime.processHealPriority = yes -- stop the real combat tick after its cast-completion/restoration block
+        combatTick()
+        runtime.processHealPriority = priority
+    end
+    local function checkHeldAndRestored(id, label)
+        assert_eq(world.firedTarget, id, label .. ': item fires on the selected character')
+        assert_eq(world.target, id, label .. ': selected character remains targeted')
+        assert_eq(tracker.targetRequired, true, label .. ': cast requires its selected target')
+        assert_eq(runtime.restoreTargetId, mobId, label .. ': hostile saved for restoration')
+        assert_eq(env.getActiveTargetRequiredCastingId(), id, label .. ': target lock uses the real tracker')
+        assert_eq(runtime.setTarget(mobId), false, label .. ': combat retargeting blocked during cast')
+        assert_eq(runtime.clearTarget(), false, label .. ': clearing target blocked during cast')
+        combatTick()
+        world.target = mobId -- simulate an external target change, not one allowed by setTarget
+        combatTick()
+        assert_eq(world.target, id, label .. ': combat tick reasserts the required target')
+        finishCast()
+        assert_eq(world.target, mobId, label .. ': hostile restored after cast completion')
+        assert_nil(runtime.restoreTargetId, label .. ': pending restoration consumed')
+        assert_nil(tracker.targetRequired, label .. ': target lock released')
+    end
+
+    for _, selector in ipairs({ 'F: Me, then Group', 'F: Group, then Me' }) do
+        for _, cure in ipairs(cures) do
+            local entry = { name = cure.spell .. ' Clickie', spell = cure.spell,
+                target = selector, when = cure.when, pct = 100, enabled = true, cls = 'Clr' }
+            local label = selector .. ' / ' .. cure.when .. ' / ' .. cure.key
+            reset(entry)
+            assert_true(runtime.computeIsHealAction(entry.spell, selector, entry), label .. ': real classification preserves cure priority')
+            assert_true(runtime.isHealAction(entry.spell, selector, entry), label .. ': memoized cure priority remains eligible')
+            assert_eq(runtime.isRedirectableHeal(entry.spell, entry), false, label .. ': cure may not redirect through hostile')
+            assert_nil(runtime.resolveTargetId(selector, 'ALL', entry.when, entry.spell, 100, entry),
+                label .. ': clean characters do not match the cure condition')
+            assert_eq(runtime.processHealPriority(), false, label .. ': no cure fired without affliction')
+            world.counters[meId] = { [cure.key] = 3 }
+            assert_eq(runtime.resolveTargetId(selector, 'ALL', entry.when, entry.spell, 100, entry), meId,
+                label .. ': afflicted caster resolved while hostile is targeted')
+            assert_true(runtime.processHealPriority(), label .. ': cure dispatched by the real priority engine')
+            checkHeldAndRestored(meId, label .. ' self')
+
+            reset(entry)
+            world.counters[allyId] = { [cure.key] = 3 }
+            assert_eq(runtime.resolveTargetId(selector, 'ALL', entry.when, entry.spell, 100, entry), allyId,
+                label .. ': affliction is checked on each group member')
+            assert_true(runtime.processHealPriority(), label .. ': ally cure dispatched')
+            checkHeldAndRestored(allyId, label .. ' ally')
+
+            reset(entry)
+            world.counters[meId], world.counters[allyId] = { [cure.key] = 3 }, { [cure.key] = 3 }
+            local first = selector == 'F: Me, then Group' and meId or allyId
+            assert_eq(runtime.resolveTargetId(selector, 'ALL', entry.when, entry.spell, 100, entry), first,
+                label .. ': configured order preserved when both characters are afflicted')
+        end
+
+        local heal = { name = 'Healing Clickie', spell = 'Greater Healing', target = selector, when = 'HP <=', pct = 75 }
+        reset(heal)
+        world.hp[meId] = 50
+        assert_true(runtime.isRedirectableHeal(heal.spell, heal), selector .. ': actual HP heal is redirectable')
+        assert_true(runtime.processHealPriority(), selector .. ': actual self-heal dispatched')
+        assert_eq(world.firedTarget, mobId, selector .. ': actual self-heal fires through hostile')
+        assert_eq(tracker.activeTargetId, meId, selector .. ': self-heal records caster as recipient')
+        assert_eq(tracker.targetRequired, false, selector .. ': self-heal does not require a self target lock')
+        assert_nil(runtime.restoreTargetId, selector .. ': self-heal has no target to restore')
+        combatTick()
+        assert_eq(world.target, mobId, selector .. ': hostile preserved throughout actual self-heal')
+        finishCast()
+        assert_eq(world.target, mobId, selector .. ': hostile unchanged after actual self-heal')
+
+        reset(heal)
+        world.hp[allyId] = 50
+        assert_true(runtime.processHealPriority(), selector .. ': actual ally heal dispatched')
+        checkHeldAndRestored(allyId, selector .. ' HP heal on ally')
+    end
+
+    for _, spa in ipairs({ 0, 79, 100, 101, 147 }) do
+        local name = 'HP Effect ' .. spa
+        addSpell(name, { [spa] = true })
+        assert_true(runtime.isRedirectableHeal(name, {}), name .. ': HP effect metadata recognized')
+    end
+    for _, spa in ipairs({ 35, 36, 116, 369 }) do
+        local name = 'Heal With Counter ' .. spa
+        addSpell(name, { [0] = true, [spa] = true })
+        assert_eq(runtime.isRedirectableHeal(name, { kind = 'heal', when = 'always' }), false,
+            name .. ': cure metadata overrides heal kind and HP effect')
+    end
+    for _, name in ipairs({ 'Group Healing', 'Healing Focus', 'HP Damage', 'Unknown Heal' }) do
+        assert_eq(runtime.isRedirectableHeal(name, { kind = 'heal', target = 'F: Me, then Group' }), false,
+            name .. ': category, name, kind, and ally selector cannot prove safe redirection')
+    end
+    assert_eq(runtime.isRedirectableHeal('Greater Healing', { kind = 'cure' }), false, 'explicit cure kind cannot redirect')
+
+    for _, surface in ipairs({ 'gem', 'aa' }) do
+        for _, id in ipairs({ meId, allyId }) do
+            local entry = { spell = 'Cure Curse', target = 'F: Group, then Me', when = 'has Curse',
+                pct = 100, enabled = true, cls = 'Clr', gem = 1 }
+            reset(entry)
+            world.counters[id] = { curse = 3 }
+            loadout.clickies = {}
+            if surface == 'gem' then loadout.gems = { entry } else loadout.aas = { ['Purifying AA'] = entry } end
+            assert_true(runtime.processHealPriority(), surface .. ': cure remains priority eligible')
+            checkHeldAndRestored(id, surface .. ' cure on ' .. id)
+        end
+        local heal = { spell = 'Greater Healing', target = 'F: Me, then Group', when = 'HP <=',
+            pct = 75, enabled = true, cls = 'Clr', gem = 1 }
+        reset(heal)
+        world.hp[meId], loadout.clickies = 50, {}
+        if surface == 'gem' then loadout.gems = { heal } else loadout.aas = { ['Healing AA'] = heal } end
+        assert_true(runtime.processHealPriority(), surface .. ': actual self-heal remains eligible')
+        assert_eq(world.firedTarget, mobId, surface .. ': actual HP heal uses spell metadata to preserve hostile')
+        assert_eq(tracker.targetRequired, false, surface .. ': actual self-heal does not lock self')
+        assert_nil(runtime.restoreTargetId, surface .. ': actual self-heal does not schedule restoration')
+    end
+
+    local cure = { name = 'Curse Clickie', spell = 'Cure Curse', target = 'F: Me, then Group',
+        when = 'has Curse', pct = 100 }
+    for _, castMs in ipairs({ 0, 2500 }) do
+        for _, original in ipairs({ mobId, 0 }) do
+            reset(cure, original, castMs)
+            assert_true(runtime.useClickie(cure, meId), 'cure cast with duration ' .. castMs .. ' and original target ' .. original)
+            assert_eq(world.firedTarget, meId, 'cure selects self before useitem for either restoration path')
+            if castMs > 0 then
+                assert_eq(world.target, meId, 'non-instant cure holds self until completion')
+                assert_eq(runtime.restoreTargetId, original, 'non-instant cure preserves zero original target too')
+                combatTick()
+                finishCast()
+            end
+            assert_eq(world.target, original, 'cure restores hostile or clears an originally empty target')
+            assert_nil(runtime.restoreTargetId, 'restoration leaves no pending original target')
+        end
+    end
+    reset(cure, 0, 0)
+    world.onDelay = function(ms) if ms == 60 then world.target = allyId end end
+    assert_true(runtime.useClickie(cure, meId), 'instant cure with an external target change fires')
+    assert_eq(world.target, allyId, 'instant cure without an original target does not clear a newly selected character')
+end)()
+end
+
+-- ============================================================================
 -- Suite 49: Decoupled Spell Gems & Downtime Buff Swapping Logic
 -- ============================================================================
 print('--- Decoupled Spell Gems & Downtime Buff Swapping Logic ---')

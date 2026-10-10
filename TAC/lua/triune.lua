@@ -3388,13 +3388,11 @@ local function isCastingOrStarting()
 end
 runtime.isCastingOrStarting = isCastingOrStarting
 
--- Can a cast aimed at ourselves go out with the current hostile mob still
--- targeted? Only heals redirect onto the caster when an enemy is targeted.
--- Everything else -- buffs, group spells, cures, AAs, clickies -- has to be
--- cast with the caster targeted or it does not land, so those switch to self
--- for the cast and restore the mob afterwards (restoreTargetId).
-local function castThroughHostileTarget(selfCast, hostileTarget, isHeal)
-    return selfCast == true and hostileTarget == true and isHeal == true
+-- Only single-target HP heals can redirect from a hostile target to the
+-- caster. Heal-priority eligibility also includes cures and is not proof
+-- that retargeting can be skipped.
+local function castThroughHostileTarget(selfCast, hostileTarget, redirectableHeal)
+    return selfCast == true and hostileTarget == true and redirectableHeal == true
 end
 runtime.castThroughHostileTarget = castThroughHostileTarget
 
@@ -3423,12 +3421,6 @@ local function getActiveTargetRequiredCastingId()
     if not isCastingOrStarting() then return nil end
 
     if castTracker and castTracker.targetRequired and castTracker.activeTargetId and castTracker.activeTargetId > 0 then
-        if castTracker.activeTargetId == mq.TLO.Me.ID() then
-            local tid = mq.TLO.Target.ID() or 0
-            if tid > 0 and isHostileTarget and isHostileTarget(tid) then
-                return nil
-            end
-        end
         return castTracker.activeTargetId
     end
 
@@ -16176,7 +16168,8 @@ function runtime.isDetrimentalAction(name, targetToken, entry)
     return isDetrimentalSpell(name, nil, k, targetToken)
 end
 
--- Returns true if an action (spell, AA, disc, skill, clickie) is a healing action.
+-- Returns true if an action is eligible for reactive healing/cure priority,
+-- not necessarily safe to cast through a hostile target.
 -- Memoized: called for every gem every tick (and again per entry in
 -- processHealPriority). The answer depends only on name / target / kind /
 -- when plus static spell data, and the uncached path scans all of
@@ -16266,6 +16259,31 @@ function runtime.isHealAction(name, targetToken, entry)
     res = ok and (res == true) or false
     runtime.healActionCache[key] = res
     return res
+end
+
+function runtime.isRedirectableHeal(name, entry, spell)
+    if entry and (entry.kind == 'cure' or entry.when == 'has Poison'
+        or entry.when == 'has Disease' or entry.when == 'has Poison/Disease'
+        or entry.when == 'has Curse' or entry.when == 'has Corruption') then
+        return false
+    end
+
+    local ok, beneficial, targetType = pcall(function()
+        spell = spell or mq.TLO.Spell(name)
+        if not spell or not spell() then return false end
+        return spell.Beneficial() == true, tostring(spell.TargetType() or ''):lower()
+    end)
+    if not ok or not beneficial or targetType ~= 'single' then return false end
+
+    -- Cure counters can share the Heals category, or accompany an HP heal.
+    if checkHasSPA(spell, nil, nil, 35) or checkHasSPA(spell, nil, nil, 36)
+        or checkHasSPA(spell, nil, nil, 116) or checkHasSPA(spell, nil, nil, 369) then
+        return false
+    end
+    -- Current HP, instant HP, HoT, complete heal, and percentage heal effects.
+    return checkHasSPA(spell, nil, nil, 0) or checkHasSPA(spell, nil, nil, 79)
+        or checkHasSPA(spell, nil, nil, 100) or checkHasSPA(spell, nil, nil, 101)
+        or checkHasSPA(spell, nil, nil, 147)
 end
 
 function runtime.isTargetInRange(name, targetId)
@@ -17879,7 +17897,7 @@ function runtime.castGem(i, g, id)
     local orig = mq.TLO.Target.ID() or 0
     local wasAttacking = mq.TLO.Me.Combat()
     local hostileTarget = (orig > 0 and isHostileTarget and isHostileTarget(orig)) == true
-    local keepHostile = castThroughHostileTarget(selfCast, hostileTarget, isHeal)
+    local keepHostile = castThroughHostileTarget(selfCast, hostileTarget, runtime.isRedirectableHeal(g.spell, g, sp))
     local needsTarget = (orig ~= id) and not keepHostile
     if needsTarget and not runtime.setTarget(id) then return false end
 
@@ -18022,7 +18040,7 @@ function runtime.fireAA(name, a, id)
     local orig = mq.TLO.Target.ID() or 0
     local wasAttacking = mq.TLO.Me.Combat()
     local hostileTarget = (orig > 0 and isHostileTarget and isHostileTarget(orig)) == true
-    local keepHostile = castThroughHostileTarget(selfCast, hostileTarget, runtime.isHealAction(name, a and a.target, a))
+    local keepHostile = castThroughHostileTarget(selfCast, hostileTarget, runtime.isRedirectableHeal(name, a, ok and sp or nil))
     local needsTarget = (orig ~= id) and not keepHostile
     if needsTarget and not runtime.setTarget(id) then return false end
     clearCursor()
@@ -18053,7 +18071,7 @@ function runtime.fireAA(name, a, id)
     if keepHostile then
         castTracker.targetRequired = false
     else
-        castTracker.targetRequired = isDet or isTargetRequiredSpell(name) or selfCast
+        castTracker.targetRequired = isDet or isTargetRequiredSpell(ok and sp or name) or selfCast
     end
     castTracker.castStartTime  = now
     mq.cmdf('/alt act %d', aa.ID())
@@ -18524,7 +18542,7 @@ runtime.useClickie = function(c, id)
     local orig = mq.TLO.Target.ID() or 0
     local wasAttacking = mq.TLO.Me.Combat()
     local hostileTarget = (orig > 0 and isHostileTarget and isHostileTarget(orig)) == true
-    local keepHostile = castThroughHostileTarget(selfCast, hostileTarget, runtime.isHealAction(effName, c.target, c))
+    local keepHostile = castThroughHostileTarget(selfCast, hostileTarget, runtime.isRedirectableHeal(effName, c))
     local needsTarget = (orig ~= id) and not keepHostile
     if needsTarget and not runtime.setTarget(id) then return false end
 
