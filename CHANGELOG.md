@@ -1,5 +1,11 @@
 # Triune AutoCombat Change Log
 
+## 2026-10-11
+
+- Fix ordered group cures to read each member's actual buff cache or shared counters instead of relying on caster-only counter fields. Missing or stale buff data triggers a short, nonblocking target inspection, then restores the previous target; emergency heals can preempt inspection, and unavailable cures do not trigger it.
+
+---
+
 ## 2026-10-10
 
 - Fix in-combat cures using **Me, then Group** or **Group, then Me** to target the afflicted character, hold that target through the cast, and restore the previous target. Cure priority and ordered selection stay intact; gems, AAs, and clickies only cast through a hostile target for metadata-confirmed single-target HP heals.

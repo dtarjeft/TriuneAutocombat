@@ -4608,6 +4608,7 @@ do
             Member = function(i) return groupMembers[i] end,
         } } },
         runtime = anyGroupRuntime,
+        AFFLICTION_MEMBERS = {},
         baseTok = function(token) return token:gsub('^[FE]:%s*', '') end,
         isSpawnAlive = function() return true end,
     })
@@ -5006,7 +5007,7 @@ end
 print('--- Ordered Cure Targeting With Real Runtime Logic ---')
 do
 (function()
-    local meId, allyId, mobId = 1001, 2002, 9009
+    local meId, allyId, otherAllyId, mobId = 1001, 2002, 3003, 9009
     local world = { clock = 100, target = mobId, counters = {}, hp = {}, castMs = 2500 }
     local runtime = { healActionCache = {}, lastCast = {} }
     local ctrl = { running = true, mode = 'Assist', medbreak_enabled = false }
@@ -5044,6 +5045,7 @@ do
         })
     end
     for _, cure in ipairs(cures) do addSpell(cure.spell, { [cure.spa] = true }) end
+    for _, cure in ipairs(cures) do addSpell('Affliction ' .. cure.key, { [cure.spa] = true }, 'Single', false) end
     addSpell('Counter Remedy', { [35] = true, [36] = true })
     addSpell('Greater Healing', { [0] = true })
     addSpell('Group Healing', { [0] = true }, 'Group v1')
@@ -5054,7 +5056,7 @@ do
         return (world.counters[id] and world.counters[id][key]) or 0
     end
     local spawns = {}
-    for _, id in ipairs({ meId, allyId, mobId }) do
+    for _, id in ipairs({ meId, allyId, otherAllyId, mobId }) do
         spawns[id] = callable({
             ID = function() return id end,
             CleanName = function() return 'Character' .. id end,
@@ -5065,17 +5067,18 @@ do
             OtherZone = no,
             Offline = no,
             PctHPs = function() return world.hp[id] or 100 end,
-            CountersPoison = function() return counter(id, 'poison') end,
-            CountersDisease = function() return counter(id, 'disease') end,
-            CountersCurse = function() return counter(id, 'curse') end,
-            CountersCorruption = function() return counter(id, 'corruption') end,
         })
     end
     local me = spawns[meId]
+    me.CountersPoison = function() return counter(meId, 'poison') end
+    me.CountersDisease = function() return counter(meId, 'disease') end
+    me.CountersCurse = function() return counter(meId, 'curse') end
+    me.CountersCorruption = function() return counter(meId, 'corruption') end
     me.Combat = function() return world.attacking end
     me.Sitting, me.Ducking, me.Moving, me.Feigning = no, no, no, no
     me.PctMana = function() return 100 end
-    me.CurrentMana, me.CurrentEndurance = me.PctMana, me.PctMana
+    me.CurrentMana = function() return world.mana or 100 end
+    me.CurrentEndurance = me.PctMana
     me.CountBuffs = function() return 0 end
     me.Class = { ShortName = function() return 'CLR' end }
     me.Pet = { ID = function() return 0 end }
@@ -5083,8 +5086,9 @@ do
         ID = function() return world.casting and 123 or 0 end,
         TargetType = function() return spells[world.casting].TargetType() end,
     }, function() return world.casting ~= nil end)
-    me.ItemReady, me.SpellReady, me.AltAbilityReady = function() return callable({}) end,
-        function() return callable({}) end, function() return callable({}) end
+    me.ItemReady = function() return callable({}, function() return world.itemReady ~= false end) end
+    me.SpellReady = function() return callable({}, function() return world.spellReady ~= false end) end
+    me.AltAbilityReady = function() return callable({}, function() return world.aaReady ~= false end) end
     me.Gem = function() return callable({}, function() return 1 end) end
     local function aa()
         return callable({
@@ -5095,21 +5099,67 @@ do
         })
     end
     me.AltAbility = aa
+    local function cachedBuffs(id)
+        local list = {}
+        if world.cacheReadyAt and world.target == id and world.clock >= world.cacheReadyAt then
+            world.cached[id] = {}
+            for key, count in pairs(world.counters[id] or {}) do world.cached[id][key] = count end
+            world.cachedAt[id] = world.clock
+            world.cacheAge = 0
+        end
+        if world.cached[id] and not world.cachedAt[id] then world.cachedAt[id] = world.clock end
+        for key, count in pairs(world.cached and world.cached[id] or {}) do
+            if count > 0 then list[#list + 1] = spells['Affliction ' .. key] end
+        end
+        for _, spell in ipairs(world.extraBuffs or {}) do list[#list + 1] = spell end
+        return list
+    end
+    for _, id in ipairs({ allyId, otherAllyId, mobId }) do
+        spawns[id].CachedBuffCount = function()
+            if not world.cached or not world.cached[id] then return -1 end
+            return #cachedBuffs(id)
+        end
+        spawns[id].Buff = function(index)
+            local spell = cachedBuffs(id)[index]
+            return callable({
+                Spell = spell,
+                Staleness = { TotalSeconds = function()
+                    return (world.cacheAge or 0) + world.clock - (world.cachedAt[id] or world.clock)
+                end },
+            }, function() return spell and spell.Name() or nil end)
+        end
+    end
+    runtime.pluginManager = { coreApi = { boxnet = {
+        available = yes,
+        peerCounters = function(name)
+            if not world.feed then return nil end
+            local id = tonumber(name:match('Character(%d+)'))
+            return world.counters[id] or { poison = 0, disease = 0, curse = 0, corruption = 0 }
+        end,
+    } } }
     local mockMq = {
         TLO = {
             Me = me,
-            Target = { ID = function() return world.target end },
+            Target = {
+                ID = function() return world.target end,
+                BuffsPopulated = function()
+                    local ready = world.cacheReadyAt and world.clock >= world.cacheReadyAt
+                    if ready then cachedBuffs(world.target) end
+                    return ready == true
+                end,
+            },
             Spawn = function(id) return spawns[id] or callable({}, no) end,
             Spell = function(name) return spells[name] or callable({}, no) end,
             Group = {
-                Members = function() return 1 end,
-                Member = function(i) return i == 0 and me or spawns[allyId] end,
+                Members = function() return world.groupSize or 1 end,
+                Member = function(i) return i == 0 and me or spawns[i == 1 and allyId or otherAllyId] end,
             },
             NetBots = function() return callable({}, no) end,
             FindItem = function()
+                if world.hasItem == false then return callable({}, no) end
                 return callable({
                     CastTime = function() return world.castMs end,
-                    TimerReady = function() return 0 end,
+                    TimerReady = function() return world.itemReady == false and 60 or 0 end,
                 })
             end,
             AltAbility = aa,
@@ -5124,6 +5174,7 @@ do
         local target = command:match('^/target id (%d+)$')
         if target then
             world.target = tonumber(target)
+            world.cacheReadyAt = world.clock + (world.cacheDelay or 0.05)
         elseif command == '/target clear' then
             world.target = 0
         elseif command == '/attack on' then
@@ -5140,17 +5191,21 @@ do
     local env = {
         mq = mockMq, runtime = runtime, ctrl = ctrl, loadout = loadout, castTracker = tracker,
         os = setmetatable({ clock = function() return world.clock end }, { __index = os }),
-        print = noop, clearCursor = noop, updatePetTracking = noop,
+        print = function(message) world.messages[#world.messages + 1] = message end,
+        clearCursor = noop, updatePetTracking = noop,
         isSitting = no, isDucking = no, isMoveActive = no, navLoaded = no, stickLoaded = no,
         isHostileTarget = function(id) return id == mobId end,
         isSpawnAlive = function(id) return spawns[id] ~= nil end,
         isIgnored = no, isSpawnMyPet = no, isAnyPet = no,
         isCombat = yes, buffActive = no, bardKeepSinging = no,
-        hasSpellReagents = yes, isGemMatching = yes,
-        distToId = function(id) return id == meId and 0 or 20 end,
+        hasSpellReagents = function() return world.reagents ~= false end,
+        isGemMatching = function() return world.memmed ~= false end,
+        distToId = function(id) return id == meId and 0 or (world.distances[id] or 20) end,
         AFFLICTION_MEMBERS = {
-            Poison = { flag = 'Poisoned', counter = 'CountersPoison', boxnet = 'poison' },
-            Disease = { flag = 'Diseased', counter = 'CountersDisease', boxnet = 'disease' },
+            Poison = { flag = 'Poisoned', counter = 'CountersPoison', boxnet = 'poison', spa = 36 },
+            Disease = { flag = 'Diseased', counter = 'CountersDisease', boxnet = 'disease', spa = 35 },
+            Curse = { flag = 'Cursed', counter = 'CountersCurse', boxnet = 'curse', spa = 116 },
+            Corruption = { flag = 'Corrupted', counter = 'CountersCorruption', boxnet = 'corruption', spa = 369 },
         },
     }
     local function real(name) return loadFunc(src, name, env) end
@@ -5162,6 +5217,9 @@ do
     runtime.computeIsHealAction = real('computeIsHealAction')
     runtime.isHealAction = real('isHealAction')
     runtime.isRedirectableHeal = real('isRedirectableHeal')
+    runtime.boxnetApi = real('boxnetApi')
+    runtime.boxnetCounters = real('boxnetCounters')
+    runtime.boxnetHasCounter = real('boxnetHasCounter')
     env.castThroughHostileTarget = real('castThroughHostileTarget')
     env.isTargetRequiredSpell = real('isTargetRequiredSpell')
     env.isCasting = real('isCasting')
@@ -5179,12 +5237,19 @@ do
     env.isCorrupted = real('isCorrupted')
     runtime.conditionMet = real('conditionMet')
     runtime.isTargetInRange = real('isTargetInRange')
+    runtime.cachedAfflictionStatus = real('cachedAfflictionStatus')
+    runtime.groupAfflictionStatus = real('groupAfflictionStatus')
+    runtime.groupCureNeedsProbe = real('groupCureNeedsProbe')
+    runtime.isGroupCureProbeReady = real('isGroupCureProbeReady')
+    runtime.finishGroupCureProbe = real('finishGroupCureProbe')
+    runtime.processGroupCureProbe = real('processGroupCureProbe')
     runtime.anyGroupMemberId = real('anyGroupMemberId')
     runtime.resolveTargetId = real('resolveTargetId')
     runtime.stopMovementForCast, runtime.noteAAEffectStarted = noop, noop
     runtime.checkStuck, runtime.checkCombatStall, runtime.checkGemMemSync, runtime.decayZoneHazards = noop, noop, noop, noop
     runtime.wpBeginTick = noop
     runtime.isMoveActive, runtime.aaGroupBusy = no, no
+    runtime.isClickieReady = real('isClickieReady')
     runtime.useClickie = real('useClickie')
     runtime.castGem = real('castGem')
     runtime.fireAA = real('fireAA')
@@ -5194,12 +5259,18 @@ do
     local function reset(entry, original, castMs)
         world.clock, world.target = 100, original == nil and mobId or original
         world.counters, world.hp = {}, {}
+        world.cached, world.cachedAt, world.cacheAge, world.feed = {}, {}, 0, true
+        world.cacheReadyAt, world.cacheDelay, world.extraBuffs, world.messages = nil, nil, nil, {}
+        world.itemReady, world.spellReady, world.aaReady, world.hasItem = true, true, true, true
+        world.mana, world.memmed, world.reagents, world.groupSize, world.distances = 100, true, true, 1, {}
         world.castMs = castMs == nil and 2500 or castMs
         world.casting, world.firedTarget, world.firedCommand, world.onDelay = nil, nil, nil, nil
         world.attacking, world.itemSpell, world.aaSpell = true, entry.spell, entry.spell
         runtime.lastCast, runtime.healActionCache = {}, {}
         runtime.npcCastCounts, runtime.npcSpellLastCast = {}, {}
         runtime.restoreTargetId = nil
+        runtime.groupCureProbe, runtime.groupCureObserved, runtime.groupCureRetryAt = nil, nil, nil
+        runtime.nextGroupCureWarningAt = nil
         tracker.activeSpell, tracker.activeTargetId, tracker.activeKind, tracker.targetRequired = nil, nil, nil, nil
         tracker.wasCasting, tracker.failed, tracker.castStartTime = false, false, 0
         loadout.gems, loadout.aas, loadout.actions, loadout.discs = nil, nil, nil, nil
@@ -5260,6 +5331,39 @@ do
             local first = selector == 'F: Me, then Group' and meId or allyId
             assert_eq(runtime.resolveTargetId(selector, 'ALL', entry.when, entry.spell, 100, entry), first,
                 label .. ': configured order preserved when both characters are afflicted')
+            assert_true(runtime.processHealPriority(), label .. ': first afflicted character cured')
+            combatTick()
+            world.counters[first] = {}
+            finishCast()
+            local nextId = first == meId and allyId or meId
+            assert_eq(runtime.resolveTargetId(selector, 'ALL', entry.when, entry.spell, 100, entry), nextId,
+                label .. ': selection advances after the first character is cured')
+            assert_true(runtime.processHealPriority(), label .. ': next afflicted character cured')
+            checkHeldAndRestored(nextId, label .. ' next')
+
+            reset(entry)
+            world.feed = false
+            world.counters[allyId], world.cached[allyId] = { [cure.key] = 3 }, { [cure.key] = 3 }
+            assert_nil(spawns[allyId].CountersCurse, label .. ': group spawn has no Me-only counter members')
+            assert_nil(spawns[allyId].Cursed, label .. ': group spawn has no Target-only affliction members')
+            assert_eq(runtime.resolveTargetId(selector, 'ALL', entry.when, entry.spell, 100, entry), allyId,
+                label .. ': cached group debuff identifies the recipient without a network feed')
+            local dispatched = runtime.processHealPriority()
+            assert_true(dispatched, label .. ': cached group cure dispatched')
+            if dispatched then checkHeldAndRestored(allyId, label .. ' cached group') end
+
+            reset(entry)
+            world.feed = false
+            world.counters[allyId] = { [cure.key] = 3 }
+            assert_nil(runtime.resolveTargetId(selector, 'ALL', entry.when, entry.spell, 100, entry),
+                label .. ': missing group buff data is not mistaken for an affliction')
+            assert_true(runtime.processHealPriority(), label .. ': missing group data starts inspection')
+            assert_eq(world.target, allyId, label .. ': inspection requests the group member buffs')
+            assert_nil(world.firedCommand, label .. ': inspection does not blindly fire a cure')
+            assert_nil(tracker.activeSpell, label .. ': inspection is not a phantom cast')
+            world.clock = world.clock + 0.1
+            assert_true(runtime.processHealPriority(), label .. ': populated group data dispatches its cure')
+            checkHeldAndRestored(allyId, label .. ' inspected group')
         end
 
         local heal = { name = 'Healing Clickie', spell = 'Greater Healing', target = selector, when = 'HP <=', pct = 75 }
@@ -5342,6 +5446,154 @@ do
     world.onDelay = function(ms) if ms == 60 then world.target = allyId end end
     assert_true(runtime.useClickie(cure, meId), 'instant cure with an external target change fires')
     assert_eq(world.target, allyId, 'instant cure without an original target does not clear a newly selected character')
+
+    for _, original in ipairs({ mobId, 0 }) do
+        reset(cure, original)
+        world.feed = false
+        assert_true(runtime.processHealPriority(), 'clean group member with unknown buffs is inspected')
+        assert_eq(world.target, allyId, 'inspection temporarily selects the group member')
+        world.clock = world.clock + 0.1
+        assert_eq(runtime.processHealPriority(), false, 'clean populated group member is not cured')
+        assert_eq(world.target, original, 'inspection restores the original hostile or empty target')
+        assert_nil(world.firedCommand, 'clean group inspection never uses the item')
+        assert_nil(runtime.groupCureProbe, 'completed inspection releases its pending state')
+    end
+
+    reset(cure)
+    world.feed, world.cacheAge = false, 10
+    world.cached[allyId] = { curse = 3 }
+    assert_true(runtime.processHealPriority(), 'stale cached curse starts inspection instead of casting')
+    assert_nil(world.firedCommand, 'stale cache does not cause a blind cure')
+    world.clock = world.clock + 0.1
+    assert_eq(runtime.processHealPriority(), false, 'inspection sees that the old curse was already removed')
+    assert_eq(world.target, mobId, 'stale-cache inspection restores the combat target')
+
+    reset(cure)
+    world.feed, world.cacheDelay = false, 10
+    assert_true(runtime.processHealPriority(), 'slow group buff population starts a nonblocking inspection')
+    world.clock = world.clock + 0.6
+    assert_eq(runtime.processHealPriority(), false, 'inspection times out without a cast')
+    assert_eq(world.target, mobId, 'timed-out inspection restores the hostile')
+    assert_nil(runtime.groupCureProbe, 'timed-out inspection is released')
+    assert_true(table.concat(world.messages):find('inspection timed out', 1, true),
+        'failed buff inspection reports the data problem')
+    assert_eq(runtime.processHealPriority(), false, 'timed-out member is throttled rather than immediately retargeted')
+
+    reset(cure)
+    world.feed, world.cacheDelay = false, 10
+    assert_true(runtime.processHealPriority(), 'inspection starts before an external target change')
+    world.target = 0
+    assert_eq(runtime.processHealPriority(), false, 'external retarget cancels the inspection')
+    assert_eq(world.target, 0, 'inspection does not overwrite the externally selected target')
+
+    reset(cure)
+    world.feed, world.cacheDelay = false, 10
+    local emergencyHeal = { name = 'Healing Clickie', spell = 'Greater Healing',
+        target = 'F: Myself', when = 'HP <=', pct = 75 }
+    loadout.clickies = { cure, emergencyHeal }
+    assert_true(runtime.processHealPriority(), 'inspection can wait without blocking the coroutine')
+    world.hp[meId], world.itemSpell = 30, emergencyHeal.spell
+    assert_true(runtime.processHealPriority(), 'an emergency heal preempts pending group inspection')
+    assert_eq(world.firedTarget, mobId, 'preempting self-heal uses the restored hostile, not the inspected ally')
+    assert_eq(tracker.activeTargetId, meId, 'preempting heal retains the caster as its recipient')
+    assert_nil(runtime.groupCureProbe, 'emergency heal cancels inspection state')
+    assert_nil(runtime.restoreTargetId, 'preempting self-heal does not restore the inspected ally')
+
+    reset(cure)
+    world.feed = false
+    world.cached[allyId] = {}
+    world.extraBuffs = { spells['Cure Curse'] }
+    assert_eq(runtime.resolveTargetId(cure.target, 'ALL', cure.when, cure.spell, 100, cure), nil,
+        'a beneficial spell containing the cure-counter SPA is not itself an affliction')
+
+    reset(cure)
+    world.cached[allyId] = { curse = 3 }
+    assert_nil(runtime.resolveTargetId(cure.target, 'ALL', cure.when, cure.spell, 100, cure),
+        'fresh zero network counters override an old cached curse')
+    assert_nil(runtime.groupCureProbe, 'known-clean network member does not need inspection')
+
+    reset(cure)
+    world.feed = false
+    world.counters[allyId], world.cached[allyId] = { curse = 3 }, { curse = 3 }
+    local noNetBots = mockMq.TLO.NetBots
+    mockMq.TLO.NetBots = function()
+        return callable({ Cursed = function() return 0 end, Detrimental = function() return '' end })
+    end
+    assert_eq(runtime.resolveTargetId(cure.target, 'ALL', cure.when, cure.spell, 100, cure), allyId,
+        'a zero NetBots flag does not hide a curse in fresh target buff data')
+    mockMq.TLO.NetBots = noNetBots
+
+    for _, surface in ipairs({ 'clickie', 'gem', 'aa' }) do
+        reset(cure)
+        world.feed = false
+        world.counters[allyId] = { curse = 3 }
+        local entry = { spell = cure.spell, target = cure.target, when = cure.when,
+            pct = 100, enabled = true, cls = 'Clr', gem = 1 }
+        if surface == 'clickie' then
+            world.itemReady = false
+        else
+            loadout.clickies = {}
+            if surface == 'gem' then loadout.gems, world.spellReady = { entry }, false
+            else loadout.aas, world.aaReady = { ['Purifying AA'] = entry }, false end
+        end
+        assert_eq(runtime.processHealPriority(), false, surface .. ': unavailable cure does not start group inspection')
+        assert_eq(world.target, mobId, surface .. ': unavailable cure preserves the hostile')
+        assert_nil(runtime.groupCureProbe, surface .. ': unavailable cure leaves no pending probe')
+        world.itemReady, world.spellReady, world.aaReady = true, true, true
+        assert_true(runtime.processHealPriority(), surface .. ': ready cure can inspect missing group data')
+        world.clock = world.clock + 0.1
+        assert_true(runtime.processHealPriority(), surface .. ': ready cure dispatches after inspection')
+        checkHeldAndRestored(allyId, surface .. ' inspected group')
+    end
+
+    reset(cure)
+    world.feed, world.hasItem = false, false
+    assert_eq(runtime.processHealPriority(), false, 'missing cure item does not trigger target inspection')
+    assert_eq(world.target, mobId, 'missing cure item preserves the hostile target')
+
+    reset(cure)
+    world.feed = false
+    runtime.lastCast['c_' .. cure.name] = world.clock - 0.5
+    assert_eq(runtime.processHealPriority(), false, 'clickie retry throttle also prevents unnecessary inspection')
+    assert_eq(world.target, mobId, 'throttled clickie does not change combat targeting')
+
+    reset(cure)
+    world.feed, world.cacheDelay = false, 10
+    assert_true(runtime.processHealPriority(), 'configured cure starts its inspection')
+    loadout.clickies = {}
+    assert_eq(runtime.processHealPriority(), false, 'removing the configured cure cancels inspection')
+    assert_eq(world.target, mobId, 'removing the cure restores the pre-inspection target')
+
+    reset(cure)
+    world.feed, world.groupSize = false, 2
+    world.counters[meId], world.counters[allyId], world.counters[otherAllyId] =
+        { curse = 3 }, { curse = 3 }, { curse = 3 }
+    local cured = {}
+    for _ = 1, 20 do
+        runtime.processHealPriority()
+        if world.casting then
+            cured[#cured + 1] = tracker.activeTargetId
+            world.counters[tracker.activeTargetId] = {}
+            combatTick()
+            finishCast()
+            if #cured == 3 then break end
+        else
+            world.clock = world.clock + 0.1
+        end
+    end
+    assert_eq(cured[1], meId, 'Me, then Group cures the caster first without network data')
+    assert_eq(cured[2], allyId, 'Me, then Group advances to the first afflicted group member')
+    assert_eq(cured[3], otherAllyId, 'Me, then Group advances to the next afflicted group member')
+    assert_eq(world.target, mobId, 'full caster/group cure sequence restores combat targeting')
+
+    local loopSource = extractFunction(src, 'runMainLoop')
+    assert_true(loopSource:find('elseif not ctrl.running then%s+runtime.finishGroupCureProbe%('),
+        'paused cleanup runs in the main coroutine, not the non-yieldable UI callback')
+    local zoneSource = extractFunction(src, 'onZoned')
+    assert_true(zoneSource:find('runtime.groupCureProbe = nil', 1, true), 'zoning drops the old-zone pending inspection')
+    assert_true(zoneSource:find('runtime.groupCureObserved = nil', 1, true), 'zoning drops old spawn buff observations')
+    assert_true(src:find('error%(runtime%.lastCrash, 0%) end%s+runtime%.finishGroupCureProbe%(%)'),
+        'normal script exit restores an unfinished inspection target')
 end)()
 end
 
@@ -12550,13 +12802,19 @@ do
         Target = { ID = function() return 0 end },
         Group = { Members = function() return 1 end, Member = function() return memberObj() end },
     }
-    local hasAffliction = loadFunc(src, 'hasAffliction', {
+    local afflictionEnv = {
         mq = { TLO = mockTLO },
+        runtime = {},
         AFFLICTION_MEMBERS = {
-            Poison  = { flag = 'Poisoned', counter = 'CountersPoison' },
-            Disease = { flag = 'Diseased', counter = 'CountersDisease' },
+            Poison  = { flag = 'Poisoned', counter = 'CountersPoison', boxnet = 'poison', spa = 36 },
+            Disease = { flag = 'Diseased', counter = 'CountersDisease', boxnet = 'disease', spa = 35 },
         },
-    })
+    }
+    afflictionEnv.runtime.boxnetCounters = loadFunc(src, 'boxnetCounters', afflictionEnv)
+    afflictionEnv.runtime.boxnetApi = loadFunc(src, 'boxnetApi', afflictionEnv)
+    afflictionEnv.runtime.cachedAfflictionStatus = loadFunc(src, 'cachedAfflictionStatus', afflictionEnv)
+    afflictionEnv.runtime.groupAfflictionStatus = loadFunc(src, 'groupAfflictionStatus', afflictionEnv)
+    local hasAffliction = loadFunc(src, 'hasAffliction', afflictionEnv)
 
     -- A. Clean character: neither fires
     assert_eq(hasAffliction(1, 'Poison'), false, 'Suite 93: clean Me is not poisoned')
@@ -12583,7 +12841,7 @@ do
 
     -- E. Guards
     assert_eq(hasAffliction(nil, 'Poison'), false, 'Suite 93: nil target is false')
-    assert_eq(hasAffliction(1, 'Curse'), false, 'Suite 93: unknown affliction kind is false')
+    assert_eq(hasAffliction(1, 'Unknown'), false, 'Suite 93: unknown affliction kind is false')
 
     -- F. conditionMet routes each trigger to its own checker (single target and Whole Group)
     local calls = {}
@@ -14630,18 +14888,22 @@ end)()
     assert_eq(boxnetHasCounter('', 'poison'), false, 'Suite 96: empty name -> false')
     S.counters = nil
     assert_eq(boxnetHasCounter('Boxer', 'poison'), false, 'Suite 96: no feed -> false')
-    local hasAffliction = loadFunc(src, 'hasAffliction', {
-        mq = mockMq, AFFLICTION_MEMBERS = { Poison = { flag = 'Poisoned', counter = 'CountersPoison', boxnet = 'poison' } },
-        boxnetHasCounter = boxnetHasCounter, boxnetCounters = boxnetCounters,
-    })
+    env.AFFLICTION_MEMBERS = {
+        Poison = { flag = 'Poisoned', counter = 'CountersPoison', boxnet = 'poison', spa = 36 },
+        Curse = { flag = 'Cursed', counter = 'CountersCurse', boxnet = 'curse', spa = 116 },
+        Corruption = { flag = 'Corrupted', counter = 'CountersCorruption', boxnet = 'corruption', spa = 369 },
+    }
+    env.cachedAfflictionStatus = loadFunc(src, 'cachedAfflictionStatus', env)
+    env.groupAfflictionStatus = loadFunc(src, 'groupAfflictionStatus', env)
+    local hasAffliction = loadFunc(src, 'hasAffliction', env)
     S.counters = { poison = 1 }
     assert_eq(hasAffliction(900, 'Poison'), true, 'Suite 96: hasAffliction is true from Box Network counters alone (no NetBots)')
     S.counters = { poison = 0 }
     assert_eq(hasAffliction(900, 'Poison'), false, 'Suite 96: hasAffliction false when the box reports no counters')
-    local isCursed = loadFunc(src, 'isCursed', { mq = mockMq, boxnetHasCounter = boxnetHasCounter })
+    local isCursed = loadFunc(src, 'isCursed', env)
     S.counters = { curse = 4 }
     assert_eq(isCursed(900), true, 'Suite 96: isCursed from Box Network counters')
-    local isCorrupted = loadFunc(src, 'isCorrupted', { mq = mockMq, boxnetHasCounter = boxnetHasCounter })
+    local isCorrupted = loadFunc(src, 'isCorrupted', env)
     S.counters = { corruption = 1 }
     assert_eq(isCorrupted(900), true, 'Suite 96: isCorrupted from Box Network counters')
 end)()
