@@ -627,6 +627,11 @@ local runtime = {
     npcCastCounts = {},
     npcSpellApplied = {},
     npcSpellLastCast = {},
+    -- Revision of each spell record: [mobId][spell] = the generation assigned when the record was last written.
+    -- spellRecordGen is process-wide and never reset (not by zoning, a table reset or a plugin reload), so a
+    -- revision cannot match a later record, a record after a reset, or a different mob that reuses a spawn id.
+    npcSpellRevision = {},
+    spellRecordGen = 0,
     lastNpcCastPruneAt = 0,
     trackStartTime = nil,
     startAA = nil,
@@ -5758,6 +5763,9 @@ runtime.apiManifest = {
     unregisterTargetSelector = { kind = 'registry', tier = 'experimental', since = '1.0' },
     serverTag                = { kind = 'function', tier = 'experimental', since = '1.0' },
     configFilePath           = { kind = 'function', tier = 'experimental', since = '1.0' },
+    spellRecord              = { kind = 'function', tier = 'experimental', since = '1.0' },
+    reportSpellEnded         = { kind = 'function', tier = 'experimental', since = '1.0' },
+    onSpellRecordChanged     = { kind = 'event',    tier = 'experimental', since = '1.0' },
 }
 
 function runtime.apiVersionInfo()
@@ -5771,6 +5779,50 @@ function runtime.apiAtLeast(major, minor)
     if not major or not minor then return false end
     local v = runtime.apiVersionInfo()
     return v.major > major or (v.major == major and v.minor >= minor)
+end
+
+-- ----------------------------------------------------------------------------
+-- Spell records (docs/HOOKS.md, section 5): plugins read copies and report observations; core owns the
+-- shared tables. A record is what TAC wrote when a cast was issued: npcSpellApplied[mob][spell] (expiry) and
+-- npcSpellLastCast[mob][spell] (cast time), plus the revision below.
+-- ----------------------------------------------------------------------------
+runtime.SPELL_END_REASONS = { failed = true, woke = true, faded = true }
+
+-- Called wherever core writes or replaces a record. Returns the new revision.
+function runtime.touchSpellRecord(mobId, spell)
+    runtime.spellRecordGen = (runtime.spellRecordGen or 0) + 1
+    runtime.npcSpellRevision = runtime.npcSpellRevision or {}
+    local per = runtime.npcSpellRevision[mobId]
+    if not per then per = {}; runtime.npcSpellRevision[mobId] = per end
+    per[spell] = runtime.spellRecordGen
+    return runtime.spellRecordGen
+end
+
+-- A COPY of the record for this mob and spell: { castAt, expiresAt, revision }, or nil when none is recorded.
+-- `revision` is opaque: keep it and hand it back to reportSpellEnded; do not interpret or compare it.
+function runtime.spellRecord(mobId, spell)
+    local applied = runtime.npcSpellApplied and runtime.npcSpellApplied[mobId]
+    local expiresAt = applied and applied[spell]
+    if not tonumber(expiresAt) then return nil end
+    local last = runtime.npcSpellLastCast and runtime.npcSpellLastCast[mobId]
+    local rev = runtime.npcSpellRevision and runtime.npcSpellRevision[mobId]
+    return { castAt = last and last[spell] or nil, expiresAt = expiresAt, revision = rev and rev[spell] or nil }
+end
+
+-- A plugin reports that a spell on a mob ended early or is over. Returns true when core cleared the record, else
+-- false and why ('bad reason', 'bad arguments', 'no record', 'stale'). A report whose revision is not the current
+-- record's is ignored (it describes an older cast) and emits nothing. `detail` is an optional string.
+function runtime.reportSpellEnded(mobId, spell, reason, revision, detail)
+    if not runtime.SPELL_END_REASONS[reason] then return false, 'bad reason' end
+    mobId = tonumber(mobId)
+    if not mobId or type(spell) ~= 'string' or spell == '' then return false, 'bad arguments' end
+    local old = runtime.spellRecord(mobId, spell)
+    if not old then return false, 'no record' end
+    if revision == nil or old.revision ~= revision then return false, 'stale' end
+    runtime.npcSpellApplied[mobId][spell] = nil
+    local pm = runtime.pluginManager
+    if pm and pm.onSpellRecordChanged then pm.onSpellRecordChanged(mobId, spell, reason, old, nil, detail) end
+    return true
 end
 
 -- Server name for per-server config files. MacroQuest.Server() is what other MacroQuest
@@ -7393,6 +7445,9 @@ function runtime.initPluginManager()
             apiVersionInfo           = runtime.apiVersionInfo and runtime.apiVersionInfo() or nil,
             apiAtLeast               = runtime.apiAtLeast,
             api                      = runtime.apiManifest,
+            -- Spell records: copies in, observations out (docs/HOOKS.md section 5).
+            spellRecord              = runtime.spellRecord,
+            reportSpellEnded         = runtime.reportSpellEnded,
             addZoneIgnore         = runtime.addZoneIgnore,
             -- Extended Target window per-spawn overrides (see runtime.setXtForce)
             setXtForce            = runtime.setXtForce,
@@ -7522,6 +7577,7 @@ function runtime.initPluginManager()
     local PLUGIN_HOOKS = {
         'onInit', 'onDestroy', 'onTick', 'onDrawUI', 'onDrawSettings', 'onCombatTick', 'onZoned',
         'onLoadoutSaved', 'onSaveSettings', 'onLoadSettings', 'wantsCombatHold', 'onBetweenPulls', 'onCommand',
+        'onSpellRecordChanged',
     }
 
     -- Lower-case filenames in lua/tac/ that are core library modules, not
@@ -8261,6 +8317,19 @@ function runtime.initPluginManager()
 
     -- Fired after the loadout file has been written.
     function pm.onLoadoutSaved() dispatch('onLoadoutSaved', false) end
+
+    -- Fired by runtime.reportSpellEnded after core commits a change. Every plugin gets its own COPIES of the old and
+    -- new records (new is nil when the record is gone), so one plugin cannot alter what another sees.
+    function pm.onSpellRecordChanged(mobId, spell, reason, old, new, detail)
+        local function copy(t) if type(t) ~= "table" then return t end local c = {} for k, v in pairs(t) do c[k] = v end return c end
+        for _, id in ipairs(pm.pluginOrder) do
+            local p = pm.plugins[id]
+            if p and p.enabled and p.status ~= "Error" and p.instance.onSpellRecordChanged then
+                local ok, err = xpcall(p.instance.onSpellRecordChanged, debug.traceback, mobId, spell, reason, copy(old), copy(new), detail)
+                if not ok then pm.reportError(p, "onSpellRecordChanged", err) end
+            end
+        end
+    end
 
     -- ------------------------------------------------------------------
     -- Plugin windows. A plugin that owns a toggleable window declares
@@ -18749,6 +18818,7 @@ function runtime.castGem(i, g, id)
         runtime.npcSpellLastCast = runtime.npcSpellLastCast or {}
         runtime.npcSpellLastCast[id] = runtime.npcSpellLastCast[id] or {}
         runtime.npcSpellLastCast[id][g.spell] = os.clock()
+        runtime.touchSpellRecord(id, g.spell)
 
         local durSec = 0
         pcall(function()
@@ -19406,6 +19476,7 @@ runtime.useClickie = function(c, id)
             runtime.npcSpellLastCast = runtime.npcSpellLastCast or {}
             runtime.npcSpellLastCast[id] = runtime.npcSpellLastCast[id] or {}
             runtime.npcSpellLastCast[id][effSpell] = os.clock()
+            runtime.touchSpellRecord(id, effSpell)
 
             local durSec = 0
             pcall(function()
@@ -23175,6 +23246,7 @@ runtime.onZoned = function()
     end
     runtime.npcSpellApplied = {}
     runtime.npcSpellLastCast = {}
+    runtime.npcSpellRevision = {}
     runtime.aaEffectUntil = {}
     pursuit.unreachableIds = {}
     pursuit.id = 0
@@ -23607,6 +23679,7 @@ local function combatTick()
             runtime.npcCastCounts = {}
             runtime.npcSpellApplied = {}
             runtime.npcSpellLastCast = {}
+            runtime.npcSpellRevision = {}
             runtime.discExpires = {}
             runtime.discCooldown = {}
             runtime.aaEffectUntil = {}
