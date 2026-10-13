@@ -20827,6 +20827,65 @@ do
     assert_true(text:find('copy(old), copy(new), detail', 1, true) ~= nil, 'Suite 117: each plugin receives its own copies of the old and new record')
 end
 
+-- ---------------------------------------------------------------------------
+-- Suite 118: tools/api_probe.lua (the throwaway in-game probe) still loads and its commands run
+-- ---------------------------------------------------------------------------
+do
+    print('--- Suite 118: API probe plugin ---')
+    local lines = {}
+    local chunk = assert(loadfile('tools/api_probe.lua'))
+    setfenv(chunk, setmetatable({ print = function(...) lines[#lines + 1] = table.concat({ ... }, ' ') end }, { __index = _G }))
+    local probe = chunk()
+    assert_eq(probe.id, 'api_probe', 'Suite 118: the probe has an id')
+    assert_eq(probe.defaultEnabled, false, 'Suite 118: the probe is off by default')
+
+    local registered, record = nil, { castAt = 100, expiresAt = 160, revision = 7 }
+    local reported = {}
+    local core = {
+        apiVersion = '1.0', apiVersionInfo = { major = 1, minor = 0 },
+        api = { a = { tier = 'stable' }, b = { tier = 'experimental' } },
+        apiAtLeast = function(ma, mi) return ma == 1 and (mi or 0) <= 0 end,
+        hasCapability = function(name) return name ~= 'notAThing' end,
+        registerTargetSelector = function(spec) registered = spec; return true end,
+        spellRecord = function(mob, spell) return record end,
+        reportSpellEnded = function(mob, spell, reason, rev, detail) reported[#reported + 1] = { rev = rev, detail = detail }; return rev == 7, rev ~= 7 and 'stale' or nil end,
+        runtime = { npcSpellApplied = { [5] = { Mesmerize = 160 } } },
+        mq = { TLO = { Target = { ID = function() return 5 end } } },
+        ImGui = { TextWrapped = function() end },
+    }
+    probe.onInit(core)
+    assert_true(registered ~= nil and registered.owner == 'api_probe' and registered.label == 'Probe Target', 'Suite 118: onInit registers E: Probe Target for its owner')
+    assert_nil(registered.resolve(), 'Suite 118: the probe selector never picks a target')
+
+    local function run(...) return probe.onCommand('probe', { 'probe', ... }) end
+    assert_eq(probe.onCommand('other', { 'other' }), false, 'Suite 118: other commands are left alone')
+    for _, sub in ipairs({ 'help', 'version', 'status', 'bogus' }) do
+        assert_eq(run(sub), true, 'Suite 118: probe ' .. sub .. ' is handled')
+    end
+    lines = {}
+    run('record')
+    local joined = table.concat(lines, '\n')
+    assert_true(joined:find('Mesmerize on #5', 1, true) and joined:find('revision=7', 1, true), 'Suite 118: "probe record" lists the target\'s records')
+    run('report', 'stale')
+    run('report', 'current')
+    assert_eq(reported[1].rev, -1, 'Suite 118: "report stale" sends a revision that cannot match')
+    assert_eq(reported[2].rev, 7, 'Suite 118: "report current" sends the current revision')
+
+    -- failure modes
+    run('fail')
+    assert_true(not pcall(probe.onTick), 'Suite 118: "probe fail" makes onTick throw')
+    run('flaky')
+    local thrown = 0
+    for _ = 1, 12 do if not pcall(probe.onTick) then thrown = thrown + 1 end end
+    assert_eq(thrown, 8, 'Suite 118: "probe flaky" fails two ticks in three for twelve ticks')
+    assert_true(pcall(probe.onTick), 'Suite 118: ...and stops by itself')
+    run('drawfail')
+    assert_true(not pcall(probe.onDrawUI), 'Suite 118: "probe drawfail" makes onDrawUI throw once')
+    assert_true(pcall(probe.onDrawUI), 'Suite 118: ...only once')
+    probe.onSpellRecordChanged(5, 'Mesmerize', 'woke', record, nil, 'x')
+    probe.onDrawSettings()
+end
+
 print(string.format('\n=== Results: %d passed, %d failed ===', pass, fail))
 if fail > 0 then
     print('\nFailures:')
