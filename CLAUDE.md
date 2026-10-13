@@ -81,8 +81,17 @@ existing table, never to a new top-level local.
 
 Ask first. Then: back up what you replace into `C:\Users\legal\TAC-backup-<timestamp>\` (never into MacroQuest), copy the changed files, check each
 matches the repo, and tell the owner what to restart. Changes to `triune.lua` need a **TAC restart**. A changed plugin needs **Reload** on the
-Plugins tab. Once something is approved for `main`, delete the older backups you made (keep the latest) after listing them.
-The loadout, Chat, DPS and log files are per server (`triune_<kind>_<server>_<Name>`); the old shared files stay as backups.
+Plugins tab.
+
+**Backups must not pile up** (the owner does not want the disk cluttered). Backups made while installing (folders named
+`C:\Users\legal\TAC-backup-<timestamp>\`, and files such as `mez.lua.bak-<timestamp>` for the plugin repo) are **yours to clean up**:
+**once something is approved to be pushed into `main`, delete the backups you created and keep only the most recent one.** List what
+you are about to delete first. Delete only backups you made, nothing else. Until then they stay, so put new ones in the same place with a
+timestamp so they are easy to find: `ls -d /c/Users/legal/TAC-backup-* /c/Users/legal/*.bak-*`.
+
+The loadout, Chat, DPS and log files are per server (`triune_<kind>_<server>_<Name>`, for example `triune_loadout_ratquest_<Name>.lua`).
+The first time a server needs one it is copied from the old shared file, which is **left in place as a fallback. It is not a backup of
+yours, so the cleanup rule above never applies to it.**
 
 ## Environment gotchas
 
