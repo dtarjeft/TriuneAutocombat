@@ -119,3 +119,19 @@ Not yet decided from the kit review: whether the ledger gets a Dependencies sect
 **Addendum to DL-002, 2026-10-13 — third live observation (16:37).** The developer switched on "Log to file" for a chat tab. `Logs\TAC\tac_chat_Kylaeris_All_20261013.txt` exists (5.7 KB and growing) and no `tac_chat_*` file exists anywhere else under the MacroQuest folder (searched to depth 3). So the Chat plugin's tab logs go to `Logs\TAC\` in the running game, which also shows the plugin took the folder from `core.logDir` rather than falling back to `MacroQuest.Path('logs')` (the fallback would have written to flat `Logs\`). Observed for the main log, dump files and chat tab logs. Not observed: the chat draw trace and capture files (they need `/tacchat trace on` plus a draw error, and the capture command). Still unverified: that folder creation did not stall the client, rotation to `.old` inside `Logs\TAC`, and extraction of the placeholder from a release zip.
 
 **Addendum to DL-002, 2026-10-13 — closed; merged into `dev`.** The developer said the live check is done and told Claude to merge ("The live check is done, merge it into dev"). Merged into local `dev` with a merge commit; the branch `feat/log-folder` is deleted. Not pushed (code needs a push request). What the developer accepted as not observed live: the chat draw trace and capture files, a stall measurement, rotation to `.old` inside `Logs\TAC`, and extraction of the placeholder from a release zip. The installed test build `v3.2.0-log-folder-1` stays in MacroQuest for now.
+
+### DL-003 — Priority ordering for `onCommand` and `onBetweenPulls`
+
+- **Status:** In progress, 2026-10-13. Requirement confirmed; design open; nothing built. This entry lives on branch `feat/hook-priority` until the feature merges.
+- **Story:** the plugin manager (`pm.dispatch` in `TAC/lua/triune.lua`) runs the first-handled hooks `onCommand` and `onBetweenPulls` in load order (`pm.pluginOrder`) and stops at the first truthy answer. `docs/HOOKS.md` section 3.2 already decides that these two are ordered by an explicit `priority` instead, with an alphabetical tie rule, and lists the name, range and documentation of the field as still open (section 9). Known from the code: only `auto_aa` implements `onBetweenPulls`; about 20 plugins implement `onCommand`. Not checked: whether any two shipped plugins claim the same command.
+- **Requirement:**
+  1. (Already decided, `docs/HOOKS.md` 3.2, section 9 item 2.) `priority` is a number per plugin, higher first, default 0; equal priorities are ordered by plugin id, alphabetically; load order is not used for these two hooks.
+  2. (Developer, 2026-10-13, in their own words.) This is groundwork for plugin authors and is a requirement. The developer has not seen two plugins conflict. It is built without an observed failure, on the developer's decision.
+- **Design choices:** none agreed yet.
+- **Implementation choices:** none.
+- **Open:** the name and place of the field and its range (HOOKS.md section 9, "Still open"); how it is documented for plugin authors; whether `core.hasCapability` advertises it (not asked for, not decided); behaviour for a missing or non-numeric value; how a changed priority takes effect on reload; whether any shipped plugins claim the same command today. Not yet verified: everything above except what is stated under Story.
+- **Shares a seam with:** DL-001 (version naming for any test build). `docs/HOOKS.md` sections 3.2, 9 and 10 must be brought in line when this is built.
+- **Supersedes:** nothing. It implements a decided item of `docs/HOOKS.md` section 3.2.
+- **Source:** `docs/HOOKS.md` sections 3.2, 9, 10; `pm.dispatch` in `TAC/lua/triune.lua`; developer statements in chat, 2026-10-13.
+
+---
