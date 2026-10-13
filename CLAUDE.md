@@ -10,7 +10,8 @@ These notes record how the owner works and what was agreed, so a new session doe
    done, and what may be asked of the owner. It governs how this file's other rules are applied. Agreed so far for this project:
    test builds are named `v3.2.0-<feature>-<N>` (base version, feature, then a counter that goes up with each build of that feature);
    the decision log and project ledger it requires do not exist yet and must be created; the owner will keep the sibling-project list
-   in `docs/sibling-project.txt` (section 21 of the protocol); new logs go in the MacroQuest `Logs` folder, not `config`.
+   in `docs/sibling-project.txt` (section 21 of the protocol); new logs go in the MacroQuest `Logs` folder, not `config`;
+   the owner decides when a session ends (section 22), and before that point the ledger and decision log must be current.
 3. `docs/HOOKS.md`: the plugin API contract (tiers, events, decisions, registries, failure handling) and, in section 10, what is
    implemented and what is not.
 4. `README.md` and `CHANGELOG.md`.
