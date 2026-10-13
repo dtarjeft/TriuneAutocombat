@@ -78,7 +78,7 @@ compare versions as Lua numbers: `1.10` and `1.1` are the same number.
 A single table, for example `core.api`, listing every supported entry with its kind (hook, event, decision, registry,
 function), tier and the version that introduced it. It is the source for:
 
-- `core.hasCapability(name)` (covers hooks and functions; `hasHook` stays as the narrower form),
+- `core.hasCapability(name)` (covers hooks, events, registries and functions; there is no separate `hasHook`),
 - the generated API reference, and
 - the generated "what changed" summary (additions and tier changes only).
 
@@ -278,14 +278,14 @@ The first inventory pass counted only top-level assignments and missed the neste
 - **Mutating** shared state (targeting, casting, cooldown and cast records) is not safe for plugins to do directly,
   because it can undermine coordination between plugins. It is not blocked, and it is not documented as supported.
 - **Plugins report observations; core owns shared record changes.** A plugin that learns something calls a supported
-  function (for example `core.reportSpellEnded(mobId, spell, reason, castAt)`, with reasons such as `failed`, `woke`,
-  `faded`). Core decides what to clear and tells other plugins. This is the supported route for what the mez plugin does
-  by hand.
-- **Reports must not clear a newer cast.** A delayed `failed` or `faded` report for an older cast could otherwise erase
-  the record of a later cast of the same spell on the same mob. `castAt` is the cast time the reporter observed (the
-  value of `npcSpellLastCast[mobId][spell]` it read). Core ignores the report if the current record has a different
-  cast time. A cast identifier or a record revision would serve the same purpose; core picks which. Today the mez
-  plugin approximates this by matching the failed cast's time to a record within 3 seconds, which is a heuristic.
+  function, `core.reportSpellEnded(mobId, spell, reason, revision, detail)`, with reasons such as `failed`, `woke`,
+  `faded`. `revision` is the opaque revision the reporter read from `core.spellRecord`; `detail` is an **optional
+  last argument**, a short string for logs. Core decides what to clear and tells other plugins. This is the supported
+  route for what the mez plugin does by hand. The argument order is **[PROPOSED]** and not final (section 9, "Still open").
+- **Reports must not clear a newer record.** A delayed `failed` or `faded` report for an older cast could otherwise erase
+  the record that replaced it. Core ignores a report whose `revision` does not match the current record (see the
+  revision guarantee below). Today the mez plugin approximates this by matching the failed cast's time to a record within
+  3 seconds, which is a heuristic that this contract replaces.
 
 **[DECIDED]** The revision check. `core.spellRecord(mobId, spell)` returns a copy that includes a `revision` field, and
 **`revision` is an opaque token**. Reports must include the revision the reporter observed, and core ignores a report
@@ -307,6 +307,10 @@ Otherwise it must use a generation counter. **[DECIDED]** the target implementat
 increasing generation counter assigned whenever core writes or replaces a spell record, because it provides the
 guarantee by construction. The cast time stays available as the separate, informational `castAt` field.
 
+**The generation counter is never reset** by zoning, by a wholesale reset of the spell tables, or by a plugin reload
+or reload of all plugins. It starts at its initial value only when the TAC process starts, which is also when every
+record disappears, so no revision can outlive the counter that issued it.
+
 Today (**[CURRENT]**) no record carries a revision at all; only the cast time exists, so implementing this means a
 change at the two write sites and at the two reset sites.
 
@@ -325,9 +329,11 @@ What was verified about using the cast time as the revision (`runtime.npcSpellLa
   are **replaced wholesale** on a zone or reset (`runtime.npcSpellApplied = {}`), so a report about a record that no
   longer exists is a no-op.
 
-**[DECIDED]** `onSpellRecordChanged(mobId, spell, reason, old, new)` is an experimental event that fires **after core
-commits an actual change**, with **copies** of the old and new records and the reason. Rejected, stale and no-op reports
-do not emit it. Reasons: `failed`, `woke`, `faded`, with an optional detail string.
+**[DECIDED]** `onSpellRecordChanged(mobId, spell, reason, old, new, detail)` is an experimental event that fires
+**after core commits an actual change**, with **copies** of the old and new records (each including its `revision`), the
+reason, and the optional `detail` string as the **last argument**, passed through from the report (nil when the
+report had none). Rejected, stale and no-op reports do not emit it. Reasons: `failed`, `woke`, `faded`. The argument
+order is **[PROPOSED]** and not final (section 9, "Still open").
 - **A plugin's own tracking stays private.** The mez plugin's landing-confirmation table is its own and needs no API.
 
 Nothing here is implemented. `reportSpellEnded` does not exist yet.
@@ -383,7 +389,7 @@ through `reportSpellEnded` (section 5.2), which is new.**
 
 **Accessors return values, not live tables [PROPOSED].** Returning a raw table would keep the nested-write problem
 (a plugin could write into it). Point queries return a copy, for example `core.spellRecord(mobId, spell)` giving
-`{ castAt, expiresAt }`; any list-returning accessor returns a snapshot. The raw tables stay internal-tier.
+`{ castAt, expiresAt, revision }`; any list-returning accessor returns a snapshot. The raw tables stay internal-tier.
 **[DECIDED]** Hot paths use point queries or small result sets. A snapshot of a whole table every tick is too
 expensive to be a supported accessor.
 
@@ -395,7 +401,7 @@ not promised: they drive the combat engine and are the riskiest to commit to. Re
 
 ### 7.6 Plugin discovery (today `pluginManager` reads)
 
-Seven plugins read `runtime.pluginManager` (`uses`, `usedBy`, window lists). **Proposed: a small stable read-only view**
+Seven plugins read `runtime.pluginManager` (`uses`, `usedBy`, window lists). **A small read-only view**
 (`core.plugins.list()`, `core.plugins.usedBy(id)`, `core.plugins.state(id)`), **[DECIDED]** experimental; the exact
 return shapes are still open (section 9).
 
@@ -473,6 +479,8 @@ implemented. **Deferred** items are intentionally left until a plugin needs them
 - The `priority` field: its name and range, and how it is documented for plugin authors.
 - The exact `core.plugins` and `core.spellRecord` return shapes.
 - Which hooks count as non-fatal for the three-strikes rule beyond the list in section 4.4.
+- The final argument order of `core.reportSpellEnded` and `onSpellRecordChanged` (including a single table argument
+  instead of positional ones, which would make later additions easier).
 
 ---
 
