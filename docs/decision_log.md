@@ -137,3 +137,10 @@ Not yet decided from the kit review: whether the ledger gets a Dependencies sect
 - **Source:** `docs/HOOKS.md` sections 3.2, 9, 10; `pm.dispatch` in `TAC/lua/triune.lua`; developer statements in chat, 2026-10-13.
 
 ---
+
+**Addendum to DL-003, 2026-10-13 — design choice 1 approved (HANDOFF Step 1 / Decision 1 / Revision 0; REVIEW OF the same, ChatGPT, 2026-10-13; developer's approval: "I approve as reached by consensus.").**
+- **Decision:** a plugin declares its priority as a number field named `priority` on the table its file returns. Core reads it when it loads the plugin (like `tickInterval`); a missing value means 0. There is no runtime setter.
+- **Why:** it follows the existing plugin format, needs no new API entry, and nothing requires changing the value while running. The name stays `priority`, as in `docs/HOOKS.md` section 3.2. The core already uses `priority` for action settings (1 to 99, lowest first, `table.sort` with `<`), which is the opposite direction to the plugin field (highest first); the reviewer's view, which Claude accepted, is that they belong to different objects, so the name is kept and the difference is handled in the documentation.
+- **Consequence recorded as a requirement on the documentation:** the plugin documentation must carry a worked example of two plugins with different priorities and the order they run in, and must say that action priorities run lowest first.
+- **Correction accepted from the review:** the earlier wording "nothing breaks" was too broad. What is established: changing a plugin's declared value does not affect an already-loaded plugin immediately. Whether a reload applies it is a separate, undecided item.
+- **Not decided here (each its own decision):** range and invalid values; whether `core.hasCapability` advertises the feature; how a changed value takes effect on reload; how the sorted order is kept; the documentation text. Nothing built.
