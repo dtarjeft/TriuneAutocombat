@@ -20520,6 +20520,88 @@ do
     assert_true(resolveCode:find('id = mq.TLO.Target.ID()', 1, true), 'resolve: other values keep the current-target fallback')
 end
 
+-- ---------------------------------------------------------------------------
+-- Suite 115: Per-server config files -- the same character on two servers must not share one file
+-- ---------------------------------------------------------------------------
+do
+    print('--- Suite 115: Per-server config files ---')
+    local text = readFile('TAC/lua/triune.lua'):gsub('\r\n', '\n')
+    local a = assert(text:find('-- Server name for per-server config files.', 1, true), 'missing serverTag block')
+    local b = assert(text:find('function runtime.loadAll()', a, true), 'missing loadAll')
+    local code = text:sub(a, b - 1)
+    local dir = (os.getenv('TMPDIR') or '/tmp') .. '/triune_junk_plugins'
+    os.execute('mkdir -p "' .. dir .. '"')
+
+    local function value(v) return function() return v end end
+    local function world(src)
+        local mq = { configDir = dir, TLO = {
+            MacroQuest = { Server = src.mqFails and function() error('no MacroQuest.Server') end or value(src.mq) },
+            EverQuest = { ServerName = value(src.eq) },
+            Zone = { Server = value(src.zone) },
+        } }
+        local env = setmetatable({ runtime = {}, mq = mq, myName = 'Kylaeris' }, { __index = _G })
+        local chunk = assert(loadstring(code))
+        setfenv(chunk, env)
+        chunk()
+        return env.runtime
+    end
+    local function put(path, body) local fh = assert(io.open(path, 'wb')); fh:write(body); fh:close() end
+    local function get(path) local fh = io.open(path, 'rb'); if not fh then return nil end; local d = fh:read('*a'); fh:close(); return d end
+
+    -- the tag
+    assert_eq(world({ mq = 'ratquest', eq = '', zone = '' }).serverTag(), 'ratquest', 'Suite 115: serverTag reads MacroQuest.Server()')
+    assert_eq(world({ mq = '', eq = 'Some Server', zone = '' }).serverTag(), 'Some_Server', 'Suite 115: ...falls back to EverQuest.ServerName() and sanitizes it')
+    assert_eq(world({ mq = '', eq = '', zone = 'zsrv' }).serverTag(), 'zsrv', 'Suite 115: ...then Zone.Server()')
+    assert_eq(world({ mqFails = true, eq = 'eqsrv', zone = '' }).serverTag(), 'eqsrv', 'Suite 115: a probe that throws is skipped')
+    assert_eq(world({ mq = 'NULL', eq = '', zone = '' }).serverTag(), '', 'Suite 115: NULL counts as unknown')
+    assert_eq(world({ mq = '', eq = '', zone = '' }).serverTag(), '', 'Suite 115: no source knows the server -> empty')
+
+    -- plugin config paths
+    local legacyChat = dir .. '/triune_chat_Kylaeris.lua'
+    local ratChat = dir .. '/triune_chat_ratquest_Kylaeris.lua'
+    os.remove(legacyChat); os.remove(ratChat)
+    assert_eq(world({ mq = '', eq = '', zone = '' }).configFilePath('triune_chat', 'Kylaeris', 'lua'), legacyChat, 'Suite 115: unknown server keeps the old file name')
+    local rt = world({ mq = 'ratquest', eq = '', zone = '' })
+    assert_eq(rt.configFilePath('triune_chat', 'Kylaeris', 'lua'), ratChat, 'Suite 115: a known server puts the server in the file name')
+    assert_nil(get(ratChat), 'Suite 115: no old file -> nothing is created')
+    put(legacyChat, 'LEGACY')
+    assert_eq(rt.configFilePath('triune_chat', 'Kylaeris', 'lua'), ratChat, 'Suite 115: same path with an old file present')
+    assert_eq(get(ratChat), 'LEGACY', 'Suite 115: the old file is copied to the per-server name on first use')
+    assert_eq(get(legacyChat), 'LEGACY', 'Suite 115: ...and left in place')
+    put(ratChat, 'RATQUEST EDIT')
+    rt.configFilePath('triune_chat', 'Kylaeris', 'lua')
+    assert_eq(get(ratChat), 'RATQUEST EDIT', 'Suite 115: an existing per-server file is never overwritten')
+    put(legacyChat, 'LEGACY CHANGED')
+    assert_eq(get(ratChat), 'RATQUEST EDIT', 'Suite 115: later changes to the old file do not leak in')
+    local trio = dir .. '/triune_chat_multiclass_Kylaeris.lua'
+    os.remove(trio)
+    world({ mq = 'multiclass', eq = '', zone = '' }).configFilePath('triune_chat', 'Kylaeris', 'lua')
+    assert_eq(get(trio), 'LEGACY CHANGED', 'Suite 115: another server gets its own copy, so the two servers diverge')
+    os.remove(legacyChat); os.remove(ratChat); os.remove(trio)
+
+    -- the loadout file
+    local legacyLoad = dir .. '/triune_loadout__Kylaeris.lua'
+    local ratLoad = dir .. '/triune_loadout_ratquest_Kylaeris.lua'
+    os.remove(legacyLoad); os.remove(ratLoad)
+    assert_eq(world({ mq = '', eq = '', zone = '' }).loadoutFilePath(), legacyLoad, 'Suite 115: loadout with an unknown server keeps triune_loadout__<char>.lua')
+    put(legacyLoad, 'return { Kylaeris = {} }')
+    assert_eq(world({ mq = 'ratquest', eq = '', zone = '' }).loadoutFilePath(), ratLoad, 'Suite 115: loadout path carries the server')
+    assert_eq(get(ratLoad), 'return { Kylaeris = {} }', 'Suite 115: the loadout is copied from the shared file on first use')
+    put(ratLoad, 'return { Kylaeris = { changed = true } }')
+    world({ mq = 'ratquest', eq = '', zone = '' }).loadoutFilePath()
+    assert_eq(get(ratLoad), 'return { Kylaeris = { changed = true } }', 'Suite 115: ...and never overwritten afterwards')
+    assert_eq(world({ mq = '', eq = 'ratquest', zone = '' }).loadoutFilePath(), ratLoad, 'Suite 115: a server known only from EverQuest.ServerName() gives the same path')
+    os.remove(legacyLoad); os.remove(ratLoad)
+
+    -- wiring
+    local api = text:match('serverTag%s*=%s*runtime%.serverTag')
+    assert_true(api ~= nil and text:find('configFilePath           = runtime.configFilePath', 1, true) ~= nil, 'Suite 115: the plugin core API exposes serverTag and configFilePath')
+    for _, p in ipairs({ 'TAC/lua/tac/chat.lua', 'TAC/lua/tac/dps.lua' }) do
+        local ptxt = readFile(p)
+        assert_true(ptxt:find('core.configFilePath(', 1, true) ~= nil, 'Suite 115: ' .. p .. ' builds its config path through the core')
+    end
+end
+
 print(string.format('\n=== Results: %d passed, %d failed ===', pass, fail))
 if fail > 0 then
     print('\nFailures:')

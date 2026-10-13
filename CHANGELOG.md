@@ -2,6 +2,8 @@
 
 ## Unreleased (after 3.2)
 
+- **Per-server config files (`TAC/lua/triune.lua`, `TAC/lua/tac/chat.lua`, `TAC/lua/tac/dps.lua`, `tests/test_pure_logic.lua`).** The loadout, Chat settings, Chat history and DPS settings of a character are now kept per server, so the same character name on two servers no longer shares one file. The server name comes from `MacroQuest.Server()` (the same source the inventory plugin and other MacroQuest tools use); `EverQuest.ServerName()` and `Zone.Server()` come back empty on some servers, which is why every server used to share `triune_loadout__<Name>.lua`. The first time a server needs a file it is **copied** from the old shared file, which is left in place, so each server starts from what the character had and then diverges. When no source knows the server the old file names are used unchanged. The TAC log file is per server too. Plugins get `core.serverTag()` and `core.configFilePath(prefix, name, ext)`.
+
 - Audit class-dependent spell gems, activated AAs, disciplines, abilities, cooldowns, and spellbook lists for fourth-class support. Refresh Auto AA's scan when selected classes change, and clear stale spellbook selections and caster tabs when classes are changed or removed. Rename the spellbook header to **Active Classes** and add regression coverage for the fourth class's spells, AA eligibility and scans, disciplines, skills, and spellbook tabs and spell lists.
 
 - Support servers with four classes per character while retaining single-class and three-class setups. Add a fourth manual class selector and color, show every class in the status badges and window title, and include the fourth class's pet in pet controls and HUDs. Rename Box Network class labels and widen its class column to fit four abbreviations.

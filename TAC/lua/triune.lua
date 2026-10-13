@@ -5177,10 +5177,7 @@ tlog.init({
     getFileEnabled = function() return ctrl and ctrl.log_to_file == true end,
     getDebug       = function() return ctrl and ctrl.debug_mode == true end,
     identity       = function()
-        local serverName = ''
-        pcall(function() serverName = mq.TLO.EverQuest.ServerName() or '' end)
-        if serverName == '' then pcall(function() serverName = mq.TLO.Zone.Server() or '' end) end
-        return serverName, myName or ''
+        return (runtime.serverTag and runtime.serverTag()) or '', myName or ''
     end,
     headerInfo     = function()
         local cls, lvl, zone = '?', '?', '?'
@@ -5742,17 +5739,77 @@ local function splitByChar(s, sep)
     return out
 end
 
+-- Server name for per-server config files. MacroQuest.Server() is what other MacroQuest
+-- tools and the inventory plugin use; EverQuest.ServerName() and Zone.Server() come back
+-- empty on some servers, which made every server share one file per character. '' when
+-- no source knows the server (the files then keep their old, server-less names).
+function runtime.serverTag()
+    local probes = {
+        function() return mq.TLO.MacroQuest.Server() end,
+        function() return mq.TLO.EverQuest.ServerName() end,
+        function() return mq.TLO.Zone.Server() end,
+    }
+    for _, probe in ipairs(probes) do
+        local ok, v = pcall(probe)
+        v = (ok and v ~= nil) and tostring(v) or ''
+        if v ~= '' and v ~= 'NULL' then return (v:gsub('[^%w_%-]', '_')) end
+    end
+    return ''
+end
+
+-- Copy (never move) an older config file to its per-server name the first time that name
+-- is needed, so each server starts from what the character had and then diverges. Does
+-- nothing when the new file exists, the old one does not, or both are the same path.
+-- Returns true when a copy was made.
+function runtime.migrateConfigFile(newPath, oldPath)
+    if not newPath or not oldPath or newPath == oldPath then return false end
+    local existing = io.open(newPath, 'rb')
+    if existing then existing:close(); return false end
+    local src = io.open(oldPath, 'rb')
+    if not src then return false end
+    local data = src:read('*a')
+    src:close()
+    local dst = io.open(newPath, 'wb')
+    if not dst then return false end
+    dst:write(data)
+    dst:close()
+    return true
+end
+
+-- <configDir>/<prefix>_<server>_<name>.<ext> for plugins and core, copying the old
+-- <prefix>_<name>.<ext> across on first use. With no known server it is the old name.
+function runtime.configFilePath(prefix, name, ext)
+    local dir = (tostring(mq.configDir or 'config'):gsub('[/\\]+$', ''))
+    local plain = string.format('%s/%s_%s.%s', dir, prefix, name, ext)
+    local server = runtime.serverTag()
+    if server == '' then return plain end
+    local path = string.format('%s/%s_%s_%s.%s', dir, prefix, server, name, ext)
+    runtime.migrateConfigFile(path, plain)
+    return path
+end
+
 -- Per-character loadout file path (multibox-safe). Each client writes ONLY its
 -- own triune_loadout_<server>_<char>.lua, so different characters never share
 -- (and never overwrite each other's) settings, ignore/pull lists, or zone data.
+-- The same character on another server has its own file; the first time a server
+-- needs one it is copied from the file the character had before (see above).
 function runtime.loadoutFilePath()
-    local serverName = ''
-    pcall(function() serverName = mq.TLO.EverQuest.ServerName() or '' end)
-    if not serverName or serverName == '' then
-        pcall(function() serverName = mq.TLO.Zone.Server() or '' end)
+    -- the name this file had before the server tag was reliable ("triune_loadout__<char>.lua"
+    -- when the server was unknown)
+    local legacyServer = ''
+    pcall(function() legacyServer = mq.TLO.EverQuest.ServerName() or '' end)
+    if not legacyServer or legacyServer == '' then
+        pcall(function() legacyServer = mq.TLO.Zone.Server() or '' end)
     end
-    local tag = (tostring(serverName or '') .. '_' .. tostring(myName or 'unknown')):gsub('[^%w%_-]', '_')
-    return mq.configDir .. '/triune_loadout_' .. tag .. '.lua'
+    local char = tostring(myName or 'unknown')
+    local legacyTag = (tostring(legacyServer or '') .. '_' .. char):gsub('[^%w%_-]', '_')
+    local legacy = mq.configDir .. '/triune_loadout_' .. legacyTag .. '.lua'
+    local server = runtime.serverTag()
+    if server == '' then return legacy end
+    local tag = (server .. '_' .. char):gsub('[^%w%_-]', '_')
+    local path = mq.configDir .. '/triune_loadout_' .. tag .. '.lua'
+    runtime.migrateConfigFile(path, legacy)
+    return path
 end
 
 function runtime.loadAll()
@@ -7291,6 +7348,11 @@ function runtime.initPluginManager()
             -- See the comment above runtime.registerTargetSelector.
             registerTargetSelector   = function(spec) return runtime.registerTargetSelector(spec) end,
             unregisterTargetSelector = function(label, owner) return runtime.unregisterTargetSelector(label, owner) end,
+            -- Per-server config files: core.serverTag() is '' when the server is unknown;
+            -- core.configFilePath(prefix, name, ext) is the per-server path (the old file is
+            -- copied across on first use).
+            serverTag                = runtime.serverTag,
+            configFilePath           = runtime.configFilePath,
             addZoneIgnore         = runtime.addZoneIgnore,
             -- Extended Target window per-spawn overrides (see runtime.setXtForce)
             setXtForce            = runtime.setXtForce,

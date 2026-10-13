@@ -858,7 +858,8 @@ local function configPath()
         local n = mq.TLO.Me.CleanName()
         if n and n ~= '' then name = tostring(n) end
     end)
-    rt.configPath = string.format('%s/triune_chat_%s.lua', (mq and mq.configDir) or 'config', name)
+    rt.configPath = (core and core.configFilePath and core.configFilePath('triune_chat', name, 'lua'))
+        or string.format('%s/triune_chat_%s.lua', (mq and mq.configDir) or 'config', name)
     return rt.configPath
 end
 
@@ -1961,7 +1962,9 @@ local registeredEvents = {}
 H.FIELDS = 7
 
 function H.path()
-    return string.format('%s/triune_chat_history_%s.txt', ((mq and mq.configDir) or 'config'):gsub('[/\\]+$', ''), safeFileName(myName()))
+    local name = safeFileName(myName())
+    if core and core.configFilePath then return core.configFilePath('triune_chat_history', name, 'txt') end
+    return string.format('%s/triune_chat_history_%s.txt', ((mq and mq.configDir) or 'config'):gsub('[/\\]+$', ''), name)
 end
 
 -- Fields are tab-separated; a backslash and every control byte (the \x12 of
