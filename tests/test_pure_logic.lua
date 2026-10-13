@@ -20602,6 +20602,70 @@ do
     end
 end
 
+-- ---------------------------------------------------------------------------
+-- Suite 116: Plugin API version and capability manifest
+-- ---------------------------------------------------------------------------
+do
+    print('--- Suite 116: Plugin API version and capabilities ---')
+    local text = readFile('TAC/lua/triune.lua'):gsub('\r\n', '\n')
+    local a = assert(text:find('-- Plugin API version and capability manifest', 1, true), 'missing manifest block')
+    local b = assert(text:find('-- Server name for per-server config files.', a, true), 'missing end of manifest block')
+    local code = text:sub(a, b - 1)
+    local function world()
+        local env = setmetatable({ runtime = {} }, { __index = _G })
+        local chunk = assert(loadstring(code))
+        setfenv(chunk, env)
+        chunk()
+        return env.runtime
+    end
+
+    local rt = world()
+    assert_eq(type(rt.API_VERSION), 'string', 'Suite 116: the API version is a string')
+    assert_true(rt.API_VERSION:match('^%d+%.%d+$') ~= nil, 'Suite 116: ...of the form MAJOR.MINOR')
+    local info = rt.apiVersionInfo()
+    assert_true(info.major >= 1, 'Suite 116: apiVersionInfo gives the numeric major')
+
+    -- 1.10 is newer than 1.9 and is not the same as 1.1 (as numbers they would be)
+    rt.API_VERSION = '1.10'
+    info = rt.apiVersionInfo()
+    assert_true(info.major == 1 and info.minor == 10, 'Suite 116: "1.10" parses as major 1, minor 10')
+    assert_eq(rt.apiAtLeast(1, 9), true, 'Suite 116: 1.10 is at least 1.9')
+    assert_eq(rt.apiAtLeast(1, 10), true, 'Suite 116: 1.10 is at least 1.10')
+    assert_eq(rt.apiAtLeast(1, 11), false, 'Suite 116: 1.10 is not at least 1.11')
+    assert_eq(rt.apiAtLeast(2, 0), false, 'Suite 116: 1.10 is not at least 2.0')
+    assert_eq(rt.apiAtLeast(1), true, 'Suite 116: the minor defaults to 0')
+    assert_eq(rt.apiAtLeast(0, 99), true, 'Suite 116: an older major is always satisfied')
+    rt.API_VERSION = '1.1'
+    assert_eq(rt.apiAtLeast(1, 10), false, 'Suite 116: 1.1 is not at least 1.10')
+    assert_eq(rt.apiAtLeast('x', 1), false, 'Suite 116: a non-number is never satisfied')
+    assert_eq(rt.apiAtLeast(nil, nil), false, 'Suite 116: nil is never satisfied')
+
+    -- the manifest
+    local valid = { stable = true, experimental = true }
+    local kinds = { value = true, ['function'] = true, registry = true, event = true, hook = true }
+    local count = 0
+    for name, e in pairs(rt.apiManifest) do
+        count = count + 1
+        assert_true(valid[e.tier] == true, 'Suite 116: manifest tier for ' .. name)
+        assert_true(kinds[e.kind] == true, 'Suite 116: manifest kind for ' .. name)
+        assert_true(type(e.since) == 'string' and e.since:match('^%d+%.%d+$') ~= nil, 'Suite 116: manifest version for ' .. name)
+    end
+    assert_true(count >= 9, 'Suite 116: the manifest lists the first entries')
+    assert_eq(rt.apiManifest.registerTargetSelector.tier, 'experimental', 'Suite 116: the target registry is experimental')
+    assert_eq(rt.apiManifest.hasCapability.tier, 'stable', 'Suite 116: the capability check itself is stable')
+
+    -- every non-event entry has a key in the core API table, and hasCapability is wired
+    local ga = assert(text:find('function pm.getCoreApi()', 1, true), 'missing getCoreApi')
+    local gb = assert(text:find('setmetatable(api, {', ga, true), 'missing end of getCoreApi table')
+    local apiText = text:sub(ga, gb)
+    for name, e in pairs(rt.apiManifest) do
+        if e.kind ~= 'event' and e.kind ~= 'hook' and name ~= 'hasCapability' then
+            assert_true(apiText:find('\n%s+' .. name .. '%s*=') ~= nil, 'Suite 116: the core API table has ' .. name)
+        end
+    end
+    assert_true(apiText:find('api.hasCapability = function(name)', 1, true) ~= nil, 'Suite 116: the core API table gets hasCapability')
+end
+
 print(string.format('\n=== Results: %d passed, %d failed ===', pass, fail))
 if fail > 0 then
     print('\nFailures:')

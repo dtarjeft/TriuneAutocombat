@@ -5739,6 +5739,40 @@ local function splitByChar(s, sep)
     return out
 end
 
+-- ============================================================================
+-- Plugin API version and capability manifest (see docs/HOOKS.md)
+-- ============================================================================
+-- core.apiVersion is the string "MAJOR.MINOR". Never compare it as a number: 1.10 and 1.1 are the
+-- same Lua number. Use core.apiVersionInfo ({ major, minor }) or core.apiAtLeast(major, minor).
+-- The compatibility promise covers entries whose tier is 'stable'; 'experimental' entries may change in a
+-- minor release (called out in the release notes); anything not listed here is internal. The tiers below
+-- are provisional until docs/HOOKS.md is approved. A new entry is added here when it is added to the core API.
+runtime.API_VERSION = '1.0'
+runtime.apiManifest = {
+    apiVersion               = { kind = 'value',    tier = 'stable',       since = '1.0' },
+    apiVersionInfo           = { kind = 'value',    tier = 'stable',       since = '1.0' },
+    apiAtLeast               = { kind = 'function', tier = 'stable',       since = '1.0' },
+    hasCapability            = { kind = 'function', tier = 'stable',       since = '1.0' },
+    api                      = { kind = 'value',    tier = 'stable',       since = '1.0' },
+    registerTargetSelector   = { kind = 'registry', tier = 'experimental', since = '1.0' },
+    unregisterTargetSelector = { kind = 'registry', tier = 'experimental', since = '1.0' },
+    serverTag                = { kind = 'function', tier = 'experimental', since = '1.0' },
+    configFilePath           = { kind = 'function', tier = 'experimental', since = '1.0' },
+}
+
+function runtime.apiVersionInfo()
+    local major, minor = tostring(runtime.API_VERSION):match('^(%d+)%.(%d+)$')
+    return { major = tonumber(major) or 0, minor = tonumber(minor) or 0 }
+end
+
+-- True when this build's API is at least MAJOR.MINOR (minor defaults to 0). False for anything that is not a number.
+function runtime.apiAtLeast(major, minor)
+    major, minor = tonumber(major), tonumber(minor or 0)
+    if not major or not minor then return false end
+    local v = runtime.apiVersionInfo()
+    return v.major > major or (v.major == major and v.minor >= minor)
+end
+
 -- Server name for per-server config files. MacroQuest.Server() is what other MacroQuest
 -- tools and the inventory plugin use; EverQuest.ServerName() and Zone.Server() come back
 -- empty on some servers, which made every server share one file per character. '' when
@@ -7353,6 +7387,12 @@ function runtime.initPluginManager()
             -- copied across on first use).
             serverTag                = runtime.serverTag,
             configFilePath           = runtime.configFilePath,
+            -- API version and capability manifest (docs/HOOKS.md): core.apiVersion is a string,
+            -- core.hasCapability(name) says whether this build offers a documented entry.
+            apiVersion               = runtime.API_VERSION,
+            apiVersionInfo           = runtime.apiVersionInfo and runtime.apiVersionInfo() or nil,
+            apiAtLeast               = runtime.apiAtLeast,
+            api                      = runtime.apiManifest,
             addZoneIgnore         = runtime.addZoneIgnore,
             -- Extended Target window per-spawn overrides (see runtime.setXtForce)
             setXtForce            = runtime.setXtForce,
@@ -7387,6 +7427,12 @@ function runtime.initPluginManager()
             -- runtime function directly from onDrawUI.
             defer                 = function(label, fn) return pm.defer(label, fn) end,
         }
+        -- True for a manifest entry this build really offers: a function or value present in this table, or an
+        -- event or hook name (which has no key here).
+        api.hasCapability = function(name)
+            local entry = (runtime.apiManifest or {})[name]
+            return entry ~= nil and (entry.kind == "event" or rawget(api, name) ~= nil)
+        end
         setmetatable(api, {
             __index = function(_, k)
                 local getter = live[k]
