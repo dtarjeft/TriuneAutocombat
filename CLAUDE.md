@@ -32,8 +32,11 @@ These notes record how the owner works and what was agreed, so a new session doe
   Unfinished work stays on its branch, never on `dev`.
 - **`main` is only for releases.** Never push to it unless the owner says it is a release. A release is `dev` fast-forwarded into `main`,
   with the version bumped in `triune.lua` and `README.md` (they must match), a `## <version>` entry in `RELEASES.md`, and a tag.
-- **Do not push anything unless asked.** Committing to a local branch is fine. Pushing, opening PRs, creating or deleting repos, and
-  installing into MacroQuest all need an explicit request.
+- **Docs-only changes** (for example CLAUDE.md, README, `docs/`) may be committed and pushed **directly to `dev`, without a feature branch
+  and without asking**, but only if the change is *just* docs. Exception: docs written about a feature that is still on a feature branch stay
+  on that branch until the feature is merged.
+- **Otherwise, do not push anything unless asked.** Committing to a local branch is fine. Pushing, opening PRs, creating or deleting repos,
+  and installing into MacroQuest all need an explicit request.
 - Commit messages end with the `Co-Authored-By` line from the session's attribution instruction, when one is given.
 - No Git LFS (see AGENTS.md).
 
@@ -52,6 +55,8 @@ existing table, never to a new top-level local.
   means do not build.
 - **Do not infer from labels or assume.** Read the code and cite it (function names; line numbers drift). If something is a guess or a
   heuristic, say so in the answer and in the code comment. Verify, then claim.
+- **Read the MacroQuest docs; do not guess how MacroQuest works.** The documentation is at https://github.com/macroquest/docs. If you are
+  unsure how a MacroQuest TLO, command, event, Lua API or ImGui binding behaves, read the docs before writing code or making a claim.
 - **Report faithfully.** If tests fail, say which and why. Say when a check was weaker than it sounds, and what could not be verified.
 - **No unrequested scope.** No extra features, settings or "improvements" that were not agreed. Do not widen a change to other files.
 - **Ask before doing anything outward-facing** (see Git rules).
