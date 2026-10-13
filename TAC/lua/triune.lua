@@ -70,7 +70,7 @@ local MQSHORT = {
     BERSERKER = 'Ber', BER = 'Ber', BERSERKERS = 'Ber',
 }
 
--- the character's gestalt trio (editable). Declared here, before classColor,
+-- the character's gestalt classes (editable). Declared here, before classColor,
 -- so slot colors below can be looked up by position in this list.
 local myClasses         = {}
 
@@ -950,6 +950,7 @@ local function classColor(abbr)
         { 0.30, 0.70, 1.00 }, -- slot 1: Arcane Blue
         { 1.00, 0.55, 0.30 }, -- slot 2: Ember Gold
         { 0.37, 0.88, 0.64 }, -- slot 3: Jade Green
+        { 0.75, 0.55, 1.00 }, -- slot 4: Violet
     }
     for i, c in ipairs(myClasses) do
         if c == abbr then
@@ -1454,8 +1455,8 @@ local function isSpawnAlive(id)
 end
 
 -- ============================================================================
--- Multi-pet tracking (this server lets each pet class of the trio keep its own
--- pet, so up to three at once). The single source of truth is
+-- Multi-pet tracking (multi-class servers let each pet class keep its own
+-- pet, including a fourth class's pet). The single source of truth is
 -- petState.myPets[cls] = spawnId with two invariants that every writer below
 -- keeps: an ID is tracked under at most one class, and every tracked ID is a
 -- living spawn that belongs to us. Pet names are unique per player here, so a
@@ -1811,7 +1812,7 @@ local function reconcilePets(quiet)
     end
 end
 
--- One entry per trio slot ({ slotNum, cls, scope, isPetCls, petId }) plus the
+-- One entry per class slot ({ slotNum, cls, scope, isPetCls, petId }) plus the
 -- IDs of any living pet of ours that no slot owns (swarm pets, familiars).
 -- A pet never appears in two slots: IDs and names are deduplicated.
 local function getMultiPetList()
@@ -1824,8 +1825,7 @@ local function getMultiPetList()
     local mePetId = 0
     pcall(function() mePetId = mq.TLO.Me.Pet.ID() or 0 end)
 
-    for i = 1, 3 do
-        local cls = myClasses[i]
+    for i, cls in ipairs(myClasses) do
         if cls then
             local isPetCls = petState.PET_CLASSES[cls] == true
             local petId = petState.myPets[cls]
@@ -9036,7 +9036,7 @@ function UI.drawClassPicker()
         'Wiz', 'Mag', 'Enc', 'Bst', 'Ber' }
     if ImGui.CollapsingHeader('Character Classes & Loadout', ImGuiTreeNodeFlags.DefaultOpen) then
         ImGui.TextDisabled('Auto-detected from Inventory Window on login; adjust manually if needed:')
-        for i = 1, 3 do
+        for i = 1, 4 do
             ImGui.SetNextItemWidth(UI.px(95))
             local currentVal = myClasses[i]
             local currentIdx = 1
@@ -9051,13 +9051,16 @@ function UI.drawClassPicker()
             local newIdx = ImGui.Combo('##cls' .. i, currentIdx, CLASS_PICKER_OPTIONS)
             if newIdx ~= currentIdx then
                 -- Rebuild without holes: every consumer walks myClasses with
-                -- ipairs, so a nil in slot 1 or 2 silently hid the later classes.
+                -- ipairs, so an empty earlier slot must not hide later classes.
                 local picked = {}
-                for j = 1, 3 do
-                    local v = (j == i) and (newIdx ~= 1 and CLASS_PICKER_OPTIONS[newIdx] or nil) or myClasses[j]
+                for j = 1, 4 do
+                    local v = myClasses[j]
+                    if j == i then
+                        v = newIdx ~= 1 and CLASS_PICKER_OPTIONS[newIdx] or nil
+                    end
                     if v then picked[#picked + 1] = v end
                 end
-                for j = 1, 3 do myClasses[j] = picked[j] end
+                for j = 1, 4 do myClasses[j] = picked[j] end
                 runtime.saveLoadout()
             end
             ImGui.SameLine()
@@ -11446,8 +11449,8 @@ function UI.drawStatusTab()
     end
 
 
-    -- 3. Player, Gestalt Trio & Pet Vitals Card
-    if UI.drawCollapsingStatusHeader('vitals', 'Player, Gestalt Trio & Pet Vitals', 'statusVitals') then
+    -- 3. Player, Classes & Pet Vitals Card
+    if UI.drawCollapsingStatusHeader('vitals', 'Player, Classes & Pet Vitals', 'statusVitals') then
         local myHpPct, myCurHp, myMaxHp, myManaPct, myCurMana, myMaxMana, myEndPct, myCurEnd, myMaxEnd
         local isDuck, isSit, isFeign, isLev
         pcall(function()
@@ -11488,10 +11491,9 @@ function UI.drawStatusTab()
             UI.drawStatusProgressBar((myEndPct or 0) / 100.0, -1, UI.px(14), endStr, 0.95, 0.60, 0.25, 1.0)
         end
 
-        -- Status flags & Trio class badges
-        accent(GOLD, 'Gestalt Trio:')
-        for i = 1, 3 do
-            local cls = myClasses[i]
+        -- Status flags & class badges
+        accent(GOLD, 'Gestalt Classes:')
+        for i, cls in ipairs(myClasses) do
             if cls and cls ~= '' and cls ~= '-- None --' then
                 ImGui.SameLine()
                 local cr, cg, cb = classColor(cls)
@@ -13431,7 +13433,7 @@ function UI.drawPetControlTab()
     ImGui.Separator()
 
     -- 2. Trio Pet Telemetry & Individual Cards
-    accent(GOLD, 'Active Trio Pet Telemetry')
+    accent(GOLD, 'Active Pet Telemetry')
     for _, slot in ipairs(petSlots) do
         local slotHeader = string.format('Slot %d: [%s] ', slot.slotNum, slot.cls)
         local info = getPetSpawnInfo(slot.petId)
@@ -13653,7 +13655,7 @@ function UI.drawPetControlTab()
             accent(ARC, 'Identity & Position:')
             ImGui.Text(string.format('Clean Name: %s', pinfo.cleanName))
             ImGui.Text(string.format('Full Name: %s', pinfo.name))
-            ImGui.Text(string.format('Trio Class: %s (Scope: %s)', slot.cls, slot.scope or 'all'))
+            ImGui.Text(string.format('Class: %s (Scope: %s)', slot.cls, slot.scope or 'all'))
             ImGui.Text(string.format('Race / Model: %s', pinfo.race))
             ImGui.Text(string.format('Spawn Class: %s', pinfo.class))
             ImGui.Text(string.format('Level: %d', pinfo.level))
@@ -15859,8 +15861,7 @@ function UI.drawFullGui()
     local winFlags = ImGuiWindowFlags and ImGuiWindowFlags.HorizontalScrollbar or 0
     local show
     local clsList = {}
-    for i = 1, 3 do
-        local c = myClasses and myClasses[i]
+    for _, c in ipairs(myClasses or {}) do
         if c and c ~= '' and c ~= '-- None --' then
             table.insert(clsList, c)
         end
@@ -25074,7 +25075,7 @@ local function triuneCommand(...)
             for _, hl in ipairs(runtime.pluginManager.helpLines()) do print(hl) end
         end
         print('  \ag/ac pet <verb> [scope]\ax - Dispatch server #petcmd (attack, back, follow, hold on, taunt off, etc.)')
-        print('  \ag/ac pet status\ax - Print active pet status for all trio classes')
+        print('  \ag/ac pet status\ax - Print active pet status for all character classes')
         print('  \ag/ac petscan\ax - Re-scan zone for active pets belonging to player')
         print('  \ag/ac pethold [on|off]\ax - Toggle automatic out-of-combat Pet Hold')
         print('  \ag/ac petassist [1-100]\ax - Set mob HP % threshold for sending pets to attack')

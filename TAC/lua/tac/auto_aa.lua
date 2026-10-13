@@ -54,6 +54,7 @@ local function resetState()
     AA.pendingFireworksSummon = nil
     AA.scannedAAs = nil
     AA.scannedAAMap = nil
+    AA.classSig = nil
     AA.lastAAScanAt = 0
     AA.filteredSortedAAs = nil
     AA.aaFilterDirty = true
@@ -2886,6 +2887,12 @@ end
 function AA.tick()
     ctrl = core.ctrl
     rt = core.runtime
+    local classSig = table.concat(core.myClasses or {}, '/')
+    if classSig ~= AA.classSig then
+        AA.classSig = classSig
+        AA.aaFilterDirty = true
+        AA.requestScan(0) -- class edits and character swaps need a fresh ability list
+    end
     if AA.pendingAATrain and AA.processAATrainWorkflow then
         AA.processAATrainWorkflow()
     end
@@ -3050,6 +3057,7 @@ function plugin.onInit(coreApi)
     WARN = colors.WARN or { 1.0, 0.72, 0.30, 1 }
     ERR  = colors.ERR  or { 0.95, 0.35, 0.35, 1 }
     resetState()
+    AA.classSig = table.concat(core.myClasses or {}, '/')
     if ctrl and ctrl.show_auto_aa == nil then ctrl.show_auto_aa = false end
     if rt and not rt.cachedAAData then rt.cachedAAData = {} end
 

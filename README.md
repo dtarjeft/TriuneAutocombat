@@ -2,7 +2,7 @@
 
 A combat bot and set of in-game tools for the **[Project Triune](https://nms.bestemu.com/)** EverQuest server, running on [MacroQuest](https://macroquest.org/).
 
-On Project Triune every character is three classes at once. Triune AutoCombat runs all three for you: it casts your spells, fires your AAs and discs, pulls mobs, controls your pets, keeps your boxes together, and sits to med when it is safe. Everything is set up from one in-game window - no macros to write.
+On Project Triune every character is three classes at once. Triune AutoCombat also supports servers with up to four classes per character: it casts your spells, fires your AAs and discs, pulls mobs, controls your pets, keeps your boxes together, and sits to med when it is safe. Everything is set up from one in-game window - no macros to write.
 
 ---
 
@@ -23,7 +23,7 @@ Triune opens by itself when you log in. If you close it, type `/ac` or `/lua run
 
 ## First run
 
-1. **Check your classes.** The main window shows the three classes it detected. Click **Re-detect** if they are wrong.
+1. **Check your classes.** The main window shows the classes it detected from your Inventory Window. Click **Re-detect** if they are wrong, or adjust the four class selectors manually. Leave unused selectors at **-- None --** on servers with fewer classes. Your class selection is saved with your loadout.
 2. **Set up what to cast.** Go through the tabs: **Spell Gems** (spells), **Abilities** (kick, bash, backstab...), **AAs**, **Disciplines** and **Clickies**. Each entry gets a simple rule for when to fire it, such as *Target HP < 90%*, *My HP < 40%*, *Missing Buff* or *Always*. **Import Bar** fills the spell list from whatever you have memorized.
 3. In **Spell Gems**, mark emergency heals, lifetaps, or other spells **High Priority** to check them after Abilities and Disciplines but before Clickies. Other spells remain after Clickies; the overall action-category order stays fixed.
 4. **Pick a mode** on the **Control** tab and click **Start** (or type `/ac run`).
@@ -60,14 +60,14 @@ Everything below is built in. Open them from the buttons on the main window's he
 | Window | Command | What it is |
 |---|---|---|
 | Status | main window tab | Live view of what the bot is doing, your target, pets and XTarget threats. |
-| Pets | main window tab | Control up to three pets: attack, back off, hold, taunt, and the server's `#petcmd` commands. |
+| Pets | main window tab | Control a pet for each of up to four classes: attack, back off, hold, taunt, and the server's `#petcmd` commands. |
 | Target & Player HUD | `/ac hud` | Compact unit frames for you, your target and your pets. |
 | Group | `/ac group` | Replacement group window with vitals, roles and click-to-target. |
 | XTarget | `/ac xtar` | Replacement extended target window with HP, aggro and distance. |
 | Effects & Songs | `/ac eff` | Your buffs and songs with time left. |
 | Spell Gem Bar | `/ac gems` | Replacement spell bar with recast timers and spell sets. |
 | Cooldowns | `/ac cd` | Every ability, AA and disc timer in one place. |
-| Spellbook | `/ac spellbook` | Browse and search the spells of all three classes; mem to a gem from here. |
+| Spellbook | `/ac spellbook` | Browse and search the spells of all your classes; mem to a gem from here. |
 | Map | `/ac map` | 2D zone map, Norrath atlas and an NPC tracker (`/ac track`). Camp, waypoints and hazards are drawn on it. |
 | Chat Windows | `/tacchat` | Chat window replacement: tabs, filters, colours, highlights, a Tells window, item links, NPC dialogue links (click to answer), logging. |
 | Game Database | `/ac db` | Offline copy of the server's item, NPC and spell database. `/ac item`, `/ac npc`, `/ac spell` search it. |
