@@ -57,6 +57,8 @@ Entries that supersede a specification item are listed here, so the supersession
 
 Not yet decided from the kit review: whether the ledger gets a Dependencies section, and whether TAC needs a single check command. Not verified: that conversational stories carry enough evidence for the decision log; revisit after the first one is done.
 
+**Addendum to DL-001, 2026-10-13 — an independent reviewer (ChatGPT) is adopted.** The developer pasted a description of a review process and, asked whether to adopt it, answered "I want you to use this process." It is recorded in `CLAUDE.md` ("Review process"). In short: ChatGPT reviews design decisions and has no write permissions; Claude brings each new decision to review before implementing it, with `HANDOFF` and `REVIEW OF` labels; ChatGPT answers Approve or Request changes, with a *For Claude* and a *For Shane* section; Claude weighs the review on its merits; technical consensus is not the developer's approval, and only the developer's own words approve. It adds to Protocol section 17 (one decision per handoff). Not yet verified: how well the relay works in practice; no review folder exists, so material is supplied inline or as files the developer provides. Applies from DL-003 onward; DL-001 and DL-002 were not reviewed this way.
+
 ---
 
 ### DL-002 — TAC logs move to `Logs\TAC\`
