@@ -35,7 +35,7 @@ local mq                = require('mq')
 local ImGui             = require('ImGui')
 local scriptDir         = debug.getinfo(1, "S").source:match("@?(.*[/\\])") or "./"
 package.path            = scriptDir .. "?.lua;" .. package.path
-local VERSION           = '3.1'
+local VERSION           = '3.2'
 local open              = true
 -- File-backed diagnostic logger. Hooked into print() right away so every
 -- chat line from here on (core and plugins) is captured in its ring buffer;
@@ -250,6 +250,7 @@ local function sanitizeModeConfig(c)
     if c.show_gamedb == nil then c.show_gamedb = false end
     if c.show_parcels == nil then c.show_parcels = false end
     if c.show_nmsloot == nil then c.show_nmsloot = false end
+    if c.show_gm_commands == nil then c.show_gm_commands = false end
     if c.cooldown_alpha == nil then c.cooldown_alpha = 0.90 end
     if c.cooldown_locked == nil then c.cooldown_locked = false end
     if c.cooldown_view_mode == nil then c.cooldown_view_mode = 'table' end
@@ -445,6 +446,7 @@ local function defaultCtrl()
         show_gamedb              = false,
         show_parcels             = false,
         show_nmsloot             = false,
+        show_gm_commands         = false,
         cooldown_alpha           = 0.90,
         cooldown_locked          = false,
         cooldown_view_mode       = 'table',
@@ -634,6 +636,10 @@ local runtime = {
     pendingCursorClearAt = nil,
     ignoreList = {},
     pullList = {},
+    -- Per-zone additions to the two lists above (keyed by zone short name,
+    -- shared across characters). Effective list = universal + current zone.
+    zoneIgnore = {},
+    zonePull = {},
     -- Per-spawn XTarget overrides set from the Extended Target window
     -- (session-only: spawn ids are transient). xtForceId is the one mob the
     -- engine stays on until it dies; xtIgnoreIds is a set of spawn ids the
@@ -856,53 +862,70 @@ local function normalizeSpellName(name)
     return s
 end
 
----@return table
-function runtime.getScribedSpellSet()
+-- One shared spellbook snapshot for isScribed() and getSpellbookMap()/
+-- getSpellBookSlot(): a full 720-slot Me.Book scan is expensive, so it is
+-- rebuilt at most every 30 s, or sooner when Me.BookCount or Me.Level
+-- changes (a scribe / level-up), checked at most once a second. When a
+-- rebuild finds the same book, the old tables are kept so caches keyed on
+-- their identity (isScribed's negative cache) survive.
+function runtime.getBookSnapshot()
     local now = os.clock()
-    if runtime.spellbookSetCache and (now - (runtime.lastSpellbookCacheTime or 0)) < 3.0 then
-        return runtime.spellbookSetCache
+    local snap = runtime.bookSnapshot
+    if snap and (now - (snap.checkedAt or 0)) < 1.0 then return snap end
+    local lvl, cnt
+    pcall(function() lvl = mq.TLO.Me.Level() end)
+    pcall(function() cnt = tonumber(tostring(mq.TLO.Me.BookCount() or '')) end)
+    if snap and (now - (snap.builtAt or 0)) < 30.0 and snap.level == lvl and snap.count == cnt then
+        snap.checkedAt = now
+        return snap
     end
 
     local set = {}
-    pcall(function()
-        local count = 720
-        pcall(function()
-            local c = mq.TLO.Me.BookCount()
-            if c then
-                local num = tonumber(tostring(c))
-                if num and num > 0 then
-                    count = math.floor(num)
-                end
-            end
-        end)
-
-        for slot = 1, count do
+    local map = { exact = {}, norm = {}, list = {} }
+    local sigParts = {}
+    for slot = 1, 720 do
+        local bName = nil
+        pcall(function() bName = mq.TLO.Me.Book(slot).Name() end)
+        if not bName or bName == '' or bName == 'NULL' then
             pcall(function()
-                local spellObj = mq.TLO.Me.Book(slot)
-                if spellObj then
-                    local id = spellObj.ID()
-                    if id and tonumber(tostring(id)) and tonumber(tostring(id)) > 0 then
-                        local rawName = spellObj.Name() or spellObj()
-                        if rawName then
-                            local bName = tostring(rawName)
-                            if bName ~= "" and bName ~= "NULL" and bName ~= "nil" then
-                                set[bName] = true
-                                set[bName:lower()] = true
-                                local cleaned = cleanSpellName(bName):lower()
-                                if cleaned ~= "" then set[cleaned] = true end
-                                local norm = normalizeSpellName(bName)
-                                if norm ~= "" then set[norm] = true end
-                            end
-                        end
-                    end
-                end
+                local res = mq.TLO.Me.Book(slot)()
+                if type(res) == 'string' and res ~= '' and res ~= 'NULL' then bName = res end
             end)
         end
-    end)
+        if bName and bName ~= '' and bName ~= 'NULL' and bName ~= 'nil' then
+            bName = tostring(bName)
+            local lowerName = bName:lower()
+            local cleaned = cleanSpellName(bName):lower()
+            local norm = normalizeSpellName(bName)
+            set[bName] = true
+            set[lowerName] = true
+            if cleaned ~= '' then set[cleaned] = true end
+            if norm ~= '' then set[norm] = true end
+            map.exact[lowerName] = slot
+            map.exact[cleaned] = slot
+            if norm ~= '' then map.norm[norm] = slot end
+            map.list[#map.list + 1] = { slot = slot, name = bName, norm = norm }
+            sigParts[#sigParts + 1] = slot .. '=' .. bName
+        end
+    end
+    local sig = table.concat(sigParts, '|')
+    if snap and snap.sig == sig then
+        snap.builtAt, snap.checkedAt, snap.level, snap.count = now, now, lvl, cnt
+        return snap
+    end
+    snap = { set = set, map = map, sig = sig, builtAt = now, checkedAt = now, level = lvl, count = cnt }
+    runtime.bookSnapshot = snap
+    return snap
+end
 
-    runtime.spellbookSetCache = set
-    runtime.lastSpellbookCacheTime = now
-    return set
+-- Drops the snapshot so the next lookup rescans (e.g. after scribing).
+function runtime.invalidateBookSnapshot()
+    runtime.bookSnapshot = nil
+end
+
+---@return table
+function runtime.getScribedSpellSet()
+    return runtime.getBookSnapshot().set
 end
 
 local function isScribed(nm)
@@ -1478,8 +1501,8 @@ local function getAllMyPets()
 
     local pets = {}
     local seen = {}
-    local function addPet(id)
-        if id and id > 0 and not seen[id] and isSpawnAlive(id) and isSpawnMyPet(id) then
+    local function addPet(id, knownMine)
+        if id and id > 0 and not seen[id] and isSpawnAlive(id) and (knownMine or isSpawnMyPet(id)) then
             seen[id] = true
             pets[#pets + 1] = id
         end
@@ -1500,13 +1523,25 @@ local function getAllMyPets()
         end
     end
 
+    local myId = 0
+    pcall(function() myId = mq.TLO.Me.ID() or 0 end)
     pcall(function()
         local count = mq.TLO.SpawnCount('pet radius 150')() or 0
         for i = 1, count do
             local s = mq.TLO.NearestSpawn(i, 'pet radius 150')
             if s and s() then
                 local sid = s.ID() or 0
-                if sid > 0 then addPet(sid) end
+                -- Cheap master check first: in a group/raid most nearby pets
+                -- have a resolved master that is someone else -- skip them
+                -- before the alive + ownership checks (~12 TLO calls each);
+                -- a resolved master of us needs no ownership check at all.
+                local mid = 0
+                if sid > 0 and not seen[sid] then
+                    pcall(function() mid = s.Master.ID() or 0 end)
+                end
+                if sid > 0 and not (mid > 0 and myId > 0 and mid ~= myId) then
+                    addPet(sid, mid > 0 and mid == myId)
+                end
             end
         end
     end)
@@ -1567,6 +1602,25 @@ function runtime.detectPetClassFromSpawn(s)
     return nil
 end
 
+-- May untracked pet `pid` become `cls`'s primary pet? Only when it is Me.Pet,
+-- its learned name / archetype says it is that class's, or that class has a
+-- summon in flight that this spawn is new since. Anything else (swarm pets,
+-- familiars, a pet of an unknown archetype) stays an extra pet rather than
+-- being pinned to whichever class happens to have no pet.
+function runtime.petEligibleForCls(pid, cls, mePetId)
+    if not pid or pid <= 0 or not cls then return false end
+    if mePetId and mePetId > 0 and pid == mePetId then return true end
+    local det = nil
+    pcall(function()
+        local s = mq.TLO.Spawn(pid)
+        if s and s() then det = runtime.detectPetClassFromSpawn(s) end
+    end)
+    if det then return det == cls end
+    local sp = petState.summonPending
+    if sp and sp.cls == cls and not (sp.snapshot and sp.snapshot[pid]) then return true end
+    return false
+end
+
 -- Maps every living pet of ours that is not tracked yet onto a pet class that
 -- has none. `quiet` is the per-tick form used by the gem evaluator: throttled
 -- and silent. The explicit form (startup, zone, Re-Scan button) always runs
@@ -1609,11 +1663,15 @@ local function reconcilePets(quiet)
         end
     end
 
-    -- Pass 2: hand the remaining pets to the remaining pet classes in slot order
+    -- Pass 2: hand the remaining pets to the remaining pet classes in slot
+    -- order -- but only pets that qualify (Me.Pet / in-flight summon); see
+    -- runtime.petEligibleForCls.
+    local mePetId = 0
+    pcall(function() mePetId = mq.TLO.Me.Pet.ID() or 0 end)
     for _, pid in ipairs(untracked) do
         if not petTrackedCls(pid) then
             for _, c in ipairs(petClassList) do
-                if not petState.myPets[c] then
+                if not petState.myPets[c] and runtime.petEligibleForCls(pid, c, mePetId) then
                     trackPet(c, pid, false)
                     assigned = assigned + 1
                     break
@@ -1637,6 +1695,8 @@ local function getMultiPetList()
 
     prunePetTracking(true)
     local allLivingPets = getAllMyPets()
+    local mePetId = 0
+    pcall(function() mePetId = mq.TLO.Me.Pet.ID() or 0 end)
 
     for i = 1, 3 do
         local cls = myClasses[i]
@@ -1659,7 +1719,7 @@ local function getMultiPetList()
 
             if isPetCls and not petId then
                 for _, pid in ipairs(allLivingPets) do
-                    if not seenIds[pid] and not petTrackedCls(pid) then
+                    if not seenIds[pid] and not petTrackedCls(pid) and runtime.petEligibleForCls(pid, cls, mePetId) then
                         local nm = string.lower(spawnCleanName(pid))
                         if nm == '' or not seenNames[nm] then
                             petId = pid
@@ -2017,7 +2077,7 @@ local function getPetSpawnInfo(petId)
                             if bName and bName ~= '' and bName ~= 'NONE' then
                                 local durSec = 0
                                 pcall(function()
-                                    local dur = mq.TLO.Me.Pet.BuffDuration(b) or 0
+                                    local dur = mq.TLO.Me.Pet.BuffDuration(b)() or 0 -- ms
                                     if type(dur) == 'number' then
                                         durSec = math.floor(dur / 1000)
                                     end
@@ -2230,16 +2290,15 @@ local function bardKeepSinging(g)
         and (g.keep_singing == true or g.when == 'twist while fighting')
 end
 
--- sungBuffs[key] is `true` for a buff applied this life. For a bard song it
--- is a record { at, seen, missingSince } so bardSongDropped can watch it and
--- release the mark once the song is seen to fall off.
+-- sungBuffs[key] marks a buff applied this life. It is a record
+-- { at, seen, missingSince, other } so bardSongDropped can watch it and
+-- release the mark once the effect is seen to fall off (bard songs and other
+-- classes' buffs alike -- a non-bard mark that was never released kept an
+-- expired buff on someone else from ever being recast). `other` only picks
+-- the chat wording.
 local function markSung(key, cls)
-    if cls == 'Brd' then
-        if type(runtime.sungBuffs[key]) ~= 'table' then
-            runtime.sungBuffs[key] = { at = os.clock(), seen = false }
-        end
-    else
-        runtime.sungBuffs[key] = true
+    if type(runtime.sungBuffs[key]) ~= 'table' then
+        runtime.sungBuffs[key] = { at = os.clock(), seen = false, other = (cls ~= 'Brd') or nil }
     end
 end
 
@@ -2452,13 +2511,68 @@ end
 
 -- ignore-list helpers: applies only to Hunter/Puller AUTO-targeting (see findRoamTarget
 -- below); Assist and anything you target yourself are never filtered.
+-- Current zone short name, cached ~1s (list checks run per spawn per scan).
+function runtime.curZoneShort()
+    local now = os.clock()
+    if not runtime.zoneShortAt or (now - runtime.zoneShortAt) >= 1.0 then
+        local zs, zn
+        pcall(function() zs = mq.TLO.Zone.ShortName() end)
+        pcall(function() zn = mq.TLO.Zone.Name() end)
+        runtime.zoneShortCached = (zs and zs ~= '' and zs ~= 'NULL') and zs or nil
+        runtime.zoneNameCached = (zn and zn ~= '' and zn ~= 'NULL') and zn or nil
+        runtime.zoneShortAt = now
+    end
+    return runtime.zoneShortCached
+end
+
+-- This zone's list from `store` (runtime.zoneIgnore / runtime.zonePull).
+-- Returns nil when the zone has none unless `create` is set.
+function runtime.zoneListFor(store, create)
+    local zs = runtime.curZoneShort()
+    if not zs or not store then return nil end
+    if not store[zs] and create then store[zs] = {} end
+    return store[zs]
+end
+
+-- Unique NPC names currently spawned in this zone, as a sorted array of
+-- { name =, count = }. Cached ~1.5s and dropped on zone change: the sweep is one
+-- NearestSpawn lookup per NPC, so it only runs while the picker popup is open.
+function runtime.zoneNpcNames()
+    local now = os.clock()
+    local zs = runtime.curZoneShort()
+    local c = runtime.zoneNpcCache
+    if c and c.zone == zs and (now - c.at) < 1.5 then return c.list end
+    local counts, list = {}, {}
+    local n = 0
+    pcall(function() n = mq.TLO.SpawnCount('npc')() or 0 end)
+    for i = 1, math.min(n, 800) do
+        local nm
+        pcall(function() nm = mq.TLO.NearestSpawn(i, 'npc').CleanName() end)
+        if nm and nm ~= '' and nm ~= 'NULL' then
+            if not counts[nm] then
+                counts[nm] = { name = nm, count = 0 }
+                list[#list + 1] = counts[nm]
+            end
+            counts[nm].count = counts[nm].count + 1
+        end
+    end
+    table.sort(list, function(a, b) return a.name:lower() < b.name:lower() end)
+    runtime.zoneNpcCache = { zone = zs, at = now, list = list }
+    return list
+end
+
 local function isIgnored(name)
     if not name then return false end
     local cleanName = tostring(name)
     if cleanName == '' then return false end
-    if not runtime.ignoreList then return false end
-    for _, n in ipairs(runtime.ignoreList) do
+    for _, n in ipairs(runtime.ignoreList or {}) do
         if tostring(n) == cleanName then return true end
+    end
+    local zl = runtime.zoneListFor(runtime.zoneIgnore)
+    if zl then
+        for _, n in ipairs(zl) do
+            if tostring(n) == cleanName then return true end
+        end
     end
     return false
 end
@@ -2962,54 +3076,53 @@ local function isDetrimentalSpell(name, targetId, kind, targetToken)
     if isBene == true then return false end
     if isBene == false then return true end
 
+    -- Past this point the answer is a guess (spell not known to the client
+    -- yet, or a custom name): the second return value 'soft' tells the
+    -- memoizing front not to remember it for good.
+
     -- 4. Check database (DATA.spells) if loaded
     if DATA and DATA.spells then
         for _, list in pairs(DATA.spells) do
             if type(list) == 'table' then
                 for _, it in ipairs(list) do
                     if it[1] == name then
-                        if it[3] == 1 then return false end
-                        if it[3] == 0 then return true end
+                        if it[3] == 1 then return false, 'soft' end
+                        if it[3] == 0 then return true, 'soft' end
                         local sKind = it[4]
-                        if sKind == 'heal' or sKind == 'buff' or sKind == 'pet' or sKind == 'cure' or sKind == 'util' then return false end
-                        if sKind == 'dd' or sKind == 'dot' or sKind == 'debuff' then return true end
+                        if sKind == 'heal' or sKind == 'buff' or sKind == 'pet' or sKind == 'cure' or sKind == 'util' then return false, 'soft' end
+                        if sKind == 'dd' or sKind == 'dot' or sKind == 'debuff' then return true, 'soft' end
                     end
                 end
             end
         end
     end
 
-    -- 5. Fallback name heuristics (for unit tests, custom items, or offline sandbox)
+    -- 5. Fallback name heuristics (for unit tests, custom items, or offline sandbox).
+    -- Stems only match at the start of a word, so 'rot' does not fire on
+    -- "Protection", 'ice' on "Justice" or 'pet' on "Trumpet".
     local lowerName = name:lower()
-    if lowerName:find('heal') or lowerName:find('buff') or lowerName:find('skin') or lowerName:find('spirit')
-        or lowerName:find('aegis') or lowerName:find('breeze') or lowerName:find('clarity') or lowerName:find('haste')
-        or lowerName:find('focus') or lowerName:find('valor') or lowerName:find('canni') or lowerName:find('gate')
-        or lowerName:find('cure') or lowerName:find('summon') or lowerName:find('pet') or lowerName:find('resurrect')
-        or lowerName:find('revive') or lowerName:find('regeneration') or lowerName:find('chloroplast')
-        or lowerName:find('alacrity') or lowerName:find('symbol') or lowerName:find('armor') or lowerName:find('shield')
-        or lowerName:find('rune') or lowerName:find('pact') or lowerName:find('infusion') then
+    local function hasWord(list)
+        for _, stem in ipairs(list) do
+            if lowerName:find('%f[%a]' .. stem) then return true end
+        end
         return false
     end
-
-    if lowerName:find('kick') or lowerName:find('bash') or lowerName:find('backstab') or lowerName:find('frenzy')
-        or lowerName:find('slam') or lowerName:find('strike') or lowerName:find('taunt') or lowerName:find('disarm')
-        or lowerName:find('dragon punch') or lowerName:find('eagle strike') or lowerName:find('round kick') or lowerName:find('tiger claw')
-        or lowerName:find('nuke') or lowerName:find('dot') or lowerName:find('debuff') or lowerName:find('slow')
-        or lowerName:find('tash') or lowerName:find('malo') or lowerName:find('snare') or lowerName:find('root')
-        or lowerName:find('mez') or lowerName:find('comet') or lowerName:find('bolt') or lowerName:find('blast')
-        or lowerName:find('shock') or lowerName:find('poison') or lowerName:find('disease') or lowerName:find('lifetap')
-        or lowerName:find('lifedraw') or lowerName:find('lifespike') or lowerName:find('siphon life')
-        or lowerName:find('drain') or lowerName:find('scourge') or lowerName:find('torment') or lowerName:find('burn')
-        or lowerName:find('fire') or lowerName:find('frost') or lowerName:find('ice') or lowerName:find('chill')
-        or lowerName:find('flame') or lowerName:find('ignite') or lowerName:find('sear') or lowerName:find('doom')
-        or lowerName:find('enstill') or lowerName:find('immobil') or lowerName:find('paralyz') or lowerName:find('blind')
-        or lowerName:find('fear') or lowerName:find('charm') or lowerName:find('stun') or lowerName:find('drowsy')
-        or lowerName:find('curse') or lowerName:find('rot') or lowerName:find('decay') or lowerName:find('pox')
-        or lowerName:find('fever') or lowerName:find('plague') or lowerName:find('rend') or lowerName:find('bite') then
-        return true
+    if hasWord({ 'heal', 'buff', 'skin', 'spirit', 'aegis', 'breeze', 'clarity', 'haste', 'focus', 'valor',
+            'canni', 'gate', 'cure', 'summon', 'pet', 'resurrect', 'revive', 'regeneration', 'chloroplast',
+            'alacrity', 'symbol', 'armor', 'shield', 'rune', 'pact', 'infusion' }) then
+        return false, 'soft'
     end
 
-    return false
+    if hasWord({ 'kick', 'bash', 'backstab', 'frenzy', 'slam', 'strike', 'taunt', 'disarm', 'dragon punch',
+            'eagle strike', 'round kick', 'tiger claw', 'nuke', 'dot', 'debuff', 'slow', 'tash', 'malo', 'snare',
+            'root', 'mez', 'comet', 'bolt', 'blast', 'shock', 'poison', 'disease', 'lifetap', 'lifedraw',
+            'lifespike', 'siphon life', 'drain', 'scourge', 'torment', 'burn', 'fire', 'frost', 'ice', 'chill',
+            'flame', 'ignite', 'sear', 'doom', 'enstill', 'immobil', 'paralyz', 'blind', 'fear', 'charm', 'stun',
+            'drowsy', 'curse', 'rot', 'decay', 'pox', 'fever', 'plague', 'rend', 'bite' }) then
+        return true, 'soft'
+    end
+
+    return false, 'soft'
 end
 
 -- Memoized front. The uncached path does 3 TLO lookups, walks every class
@@ -3020,6 +3133,7 @@ end
 -- local is rebound here so every caller, including createCastTracker, gets
 -- the memoized version transparently.
 runtime.detrimentalCache = {}
+runtime.detrimentalSoftCache = {}
 do
     local uncached = isDetrimentalSpell
     isDetrimentalSpell = function(name, targetId, kind, targetToken)
@@ -3027,9 +3141,20 @@ do
         local key = tostring(name) .. '|' .. tostring(kind or '') .. '|' .. tostring(targetToken or '')
         local cached = runtime.detrimentalCache[key]
         if cached ~= nil then return cached end
-        local ok, res = pcall(uncached, name, targetId, kind, targetToken)
+        -- Guesses (DB / name heuristics, i.e. the client did not resolve the
+        -- spell) are only remembered for 30 s so a later authoritative TLO
+        -- answer replaces them.
+        local soft = runtime.detrimentalSoftCache[key]
+        local now = os.clock()
+        if soft and now < soft.untilAt then return soft.v end
+        local ok, res, tier = pcall(uncached, name, targetId, kind, targetToken)
         res = ok and (res == true) or false
-        runtime.detrimentalCache[key] = res
+        if ok and tier ~= 'soft' then
+            runtime.detrimentalCache[key] = res
+            runtime.detrimentalSoftCache[key] = nil
+        else
+            runtime.detrimentalSoftCache[key] = { v = res, untilAt = now + 30.0 }
+        end
         return res
     end
 end
@@ -3038,10 +3163,43 @@ local function createCastTracker()
     local failureCount     = {} -- [spellName] = { count = N, lastFail = timestamp }
     local lockouts         = {} -- [spellName] = untilTimestamp (global lockouts)
     local targetLockouts   = {} -- [targetId] = { [spellName] = untilTimestamp } (target-specific backoffs)
-    local targetImmunities = {} -- [targetId] = { [spellName] = true } (permanent target immunities)
-    local dbChecked        = {} -- [targetId] = { [spellName] = reason | false } (Game Database consulted)
+    local targetImmunities = {} -- [targetId] = { name = cleanName, spells = { [spellName] = true } } (permanent target immunities)
+    local dbChecked        = {} -- [targetId] = { name = cleanName, spells = { [spellName] = reason | false } } (Game Database consulted)
 
     local tracker = {}
+
+    -- EQ reuses spawn IDs, so per-spawn entries carry the spawn's clean name
+    -- and an entry whose name no longer matches the spawn now holding that
+    -- ID is stale: it is dropped and treated as absent. Names are looked up
+    -- at most every 0.25 s per ID (isLockedOut runs per gem per tick).
+    local nameCache = {}
+    local function spawnNameOf(tid)
+        local now = os.clock()
+        local c = nameCache[tid]
+        if c and (now - c.at) < 0.25 then return c.name end
+        local nm = ''
+        pcall(function()
+            local sp = mq.TLO.Spawn(tid)
+            if sp and sp() then nm = sp.CleanName() or '' end
+        end)
+        nameCache[tid] = { name = nm, at = now }
+        return nm
+    end
+    -- Returns the live per-spawn spell map of `tbl` for `tid` (creating it
+    -- when `create`), or nil when absent / stale.
+    local function spawnEntry(tbl, tid, create)
+        local e = tbl[tid]
+        local nm = (e or create) and spawnNameOf(tid) or ''
+        if e and e.name ~= nm then
+            tbl[tid] = nil
+            e = nil
+        end
+        if not e and create then
+            e = { name = nm, spells = {} }
+            tbl[tid] = e
+        end
+        return e and e.spells or nil
+    end
 
     local function getFailCount(spellName)
         if not spellName then return 0 end
@@ -3077,9 +3235,10 @@ local function createCastTracker()
 
         local tid = tonumber(targetId)
 
-        -- 1. Target Immunity check (permanent for this spawn ID)
-        if tid and tid > 0 and targetImmunities[tid] and targetImmunities[tid][spellName] then
-            return true, 'Immune', 9999
+        -- 1. Target Immunity check (permanent for this spawn)
+        if tid and tid > 0 and targetImmunities[tid] then
+            local imm = spawnEntry(targetImmunities, tid, false)
+            if imm and imm[spellName] then return true, 'Immune', 9999 end
         end
 
         -- 1b. Known immunity from the Game Database plugin (NPC special
@@ -3088,17 +3247,12 @@ local function createCastTracker()
         -- tracker.knownImmunity(spellName, spawnId, kind) -> reason | nil is
         -- installed by the plugin; nothing happens without it.
         if tid and tid > 0 and tracker.knownImmunity then
-            local checked = dbChecked[tid]
-            if not checked then
-                checked = {}
-                dbChecked[tid] = checked
-            end
+            local checked = spawnEntry(dbChecked, tid, true)
             if checked[spellName] == nil then
                 local ok, why = pcall(tracker.knownImmunity, spellName, tid, kind)
                 checked[spellName] = (ok and why) or false
                 if ok and why then
-                    targetImmunities[tid] = targetImmunities[tid] or {}
-                    targetImmunities[tid][spellName] = true
+                    spawnEntry(targetImmunities, tid, true)[spellName] = true
                     local tName = 'Target'
                     pcall(function()
                         local sp = mq.TLO.Spawn(tid)
@@ -3143,7 +3297,9 @@ local function createCastTracker()
         local lSec
         local k = kind
 
-        if type(targetId) == 'number' and (type(reason) == 'string' or reason == nil) then
+        if (type(targetId) == 'number' and (type(reason) == 'string' or reason == nil))
+            or (targetId == nil and type(reason) == 'string') then
+            -- (no target resolved: still the (spell, target, reason, ...) form)
             tid = targetId
             r = reason or 'generic'
             mRetries = tonumber(maxRetries) or 2
@@ -3174,8 +3330,7 @@ local function createCastTracker()
         if rLow == 'target immune' or rLow == 'immune' then
             -- Mob Immunity: Record permanently for this target ID (0 retries wasted). Does NOT lock globally.
             if tid and tid > 0 then
-                targetImmunities[tid] = targetImmunities[tid] or {}
-                targetImmunities[tid][spellName] = true
+                spawnEntry(targetImmunities, tid, true)[spellName] = true
                 resetFailCount(spellName)
                 local tName = 'Target'
                 pcall(function()
@@ -3283,6 +3438,10 @@ local function createCastTracker()
     local function onFailureEvent(reason, maxRetries, lockoutSec, eventSpell, eventTargetId)
         local now = os.clock()
         local isCastRecent = (now - (tonumber(tracker.castStartTime) or 0)) <= 1.5
+        -- A resist / immune line can land just after the cast-end bookkeeping
+        -- cleared active*: the last* values it saved stand in for them.
+        local endedRecently = (now - (tonumber(tracker.lastEndAt) or -100)) <= 1.5
+        if endedRecently then isCastRecent = true end
         local castingId = nil
         pcall(function() castingId = mq.TLO.Me.Casting.ID() end)
         local isActivelyCasting = (castingId ~= nil and castingId > 0)
@@ -3305,14 +3464,19 @@ local function createCastTracker()
 
         if castingName and castingName ~= '' then
             local tid = eventTargetId or tracker.activeTargetId
+            if (not tid or tid <= 0) and not tracker.activeSpell and endedRecently then
+                tid = tracker.lastTargetId
+            end
             if not tid or tid <= 0 then
                 pcall(function() tid = mq.TLO.Target.ID() end)
             end
+            local kind = tracker.activeKind
+            if kind == nil and not tracker.activeSpell and endedRecently then kind = tracker.lastKind end
 
             -- Only casted detrimental spells incur failure tracking or lockouts
-            if isDetrimentalSpell(castingName, tid, tracker.activeKind) then
+            if isDetrimentalSpell(castingName, tid, kind) then
                 tracker.failed = true
-                recordFailure(castingName, tid, reason, maxRetries, lockoutSec, tracker.activeKind)
+                recordFailure(castingName, tid, reason, maxRetries, lockoutSec, kind)
             else
                 tracker.failed = false
             end
@@ -3325,12 +3489,14 @@ local function createCastTracker()
             targetLockouts[tid] = nil
             targetImmunities[tid] = nil
             dbChecked[tid] = nil
+            nameCache[tid] = nil
         else
             failureCount     = {}
             lockouts         = {}
             targetLockouts   = {}
             targetImmunities = {}
             dbChecked        = {}
+            nameCache        = {}
         end
     end
 
@@ -3345,8 +3511,8 @@ local function createCastTracker()
                 if now < (tonumber(t) or 0) then count = count + 1 end
             end
         end
-        for _, immMap in pairs(targetImmunities) do
-            for _, _ in pairs(immMap) do count = count + 1 end
+        for _, imm in pairs(targetImmunities) do
+            for _, _ in pairs(imm.spells) do count = count + 1 end
         end
         return count
     end
@@ -3365,6 +3531,9 @@ local function createCastTracker()
     tracker.activeKind     = nil
     tracker.castStartTime  = 0
     tracker.lastSpell      = nil
+    tracker.lastTargetId   = nil
+    tracker.lastKind       = nil
+    tracker.lastEndAt      = nil
     tracker.wasCasting     = false
 
     return tracker
@@ -3520,37 +3689,7 @@ function runtime.checkBook(name)
 end
 
 function runtime.getSpellbookMap()
-    local now = os.time()
-    if runtime.spellbookMapCache and (now - (runtime.lastSpellbookMapCacheTime or 0)) < 3 then
-        return runtime.spellbookMapCache
-    end
-
-    local map = { exact = {}, norm = {}, list = {} }
-
-    for s = 1, 720 do
-        local bName = nil
-        pcall(function() bName = mq.TLO.Me.Book(s).Name() end)
-        if not bName or bName == "" or bName == "NULL" then
-            pcall(function()
-                local res = mq.TLO.Me.Book(s)()
-                if type(res) == "string" and res ~= "" and res ~= "NULL" then bName = res end
-            end)
-        end
-
-        if bName and bName ~= "" and bName ~= "NULL" then
-            local lowerName = bName:lower()
-            local cleanName = cleanSpellName(bName):lower()
-            local normName = normalizeSpellName(bName)
-
-            map.exact[lowerName] = s
-            map.exact[cleanName] = s
-            if normName ~= "" then map.norm[normName] = s end
-            table.insert(map.list, { slot = s, name = bName, norm = normName })
-        end
-    end
-    runtime.spellbookMapCache = map
-    runtime.lastSpellbookMapCacheTime = now
-    return map
+    return runtime.getBookSnapshot().map
 end
 
 function runtime.getSpellBookSlot(spellName)
@@ -3630,6 +3769,20 @@ function runtime.tryMem(slot, spellName, bypassCheck)
         return true
     end
 
+    -- 0. Locate the spell in the book BEFORE touching any gem: an unscribed
+    -- spell must not cost the player whatever was memorized. bypassCheck only
+    -- skips the scribed pre-check in callers; without a book slot there is
+    -- nothing to click, so it aborts here too.
+    local bookSlot = runtime.getSpellBookSlot(spellName)
+    if not bookSlot then
+        if bypassCheck then
+            print(string.format('\ay[Triune]\ax Could not find "%s" in your spellbook -- nothing memorized.', cleanName))
+        else
+            print(string.format('\ay[Triune]\ax "%s" is not scribed in your spellbook -- scribe it first.', cleanName))
+        end
+        return false
+    end
+
     -- 1. Unmemorize duplicate instances of this spell in other gem slots first
     for s = 1, getNumGems() do
         if s ~= slot and (isGemMatching(s, cleanName) or isGemMatching(s, spellName)) then
@@ -3645,13 +3798,7 @@ function runtime.tryMem(slot, spellName, bypassCheck)
         runtime.unmemGem(slot)
     end
 
-    -- 3. Verify scribed in spellbook and locate book slot
-    local bookSlot = runtime.getSpellBookSlot(spellName)
-    if not bookSlot and not bypassCheck then
-        print(string.format('\ay[Triune]\ax "%s" is not scribed in your spellbook -- scribe it first.', cleanName))
-        return false
-    end
-    bookSlot = bookSlot or 1
+    -- 3. (book slot resolved in step 0)
 
     -- 4. Stand up if sitting or ducking
     local isDucked = false
@@ -3825,6 +3972,31 @@ local function isDisciplineSpell(abbr, spellName)
     if not abbr or not spellName or spellName == "" then return false end
     if runtime.PURE_MELEE[abbr] or runtime.PURE_MELEE[abbr:upper()] then return true end
 
+    -- Memoized per class+name -- filteredSpells calls this for every DB row
+    -- on every rebuild. The static tiers (disc DB rows, Spell.IsSkill) never
+    -- change; the known-disc tier is re-asked after 60 s (or when
+    -- scanKnownDiscs() replaces the set) so a newly trained disc shows up.
+    local now = os.clock()
+    local memo = runtime.isDiscSpellMemo
+    if not memo or memo.known ~= runtime.knownDiscSet or (now - memo.at) > 60.0 then
+        memo = { known = runtime.knownDiscSet, at = now, static = (memo and memo.static) or {}, v = {} }
+        runtime.isDiscSpellMemo = memo
+    end
+    local key = abbr .. '|' .. spellName
+    local hit = memo.v[key]
+    if hit ~= nil then return hit end
+    local static = memo.static[key]
+    if static == nil then
+        static = runtime.isDisciplineSpellStatic(abbr, spellName)
+        memo.static[key] = static
+    end
+    local res = static or isDiscKnown(spellName)
+    memo.v[key] = res
+    return res
+end
+
+function runtime.isDisciplineSpellStatic(abbr, spellName)
+
     if DATA and DATA.discs then
         local alt = (DATA.ALIAS_CLASS_MAP and DATA.ALIAS_CLASS_MAP[abbr:upper()]) or abbr
         local discList = DATA.discs[abbr] or DATA.discs[abbr:upper()] or DATA.discs[alt]
@@ -3844,9 +4016,7 @@ local function isDisciplineSpell(abbr, spellName)
             isSkill = true
         end
     end)
-    if isSkill then return true end
-
-    return isDiscKnown(spellName)
+    return isSkill
 end
 
 local function checkHasSPA(tloSpell, name, sp, spaId)
@@ -5450,12 +5620,21 @@ function runtime.loadoutFilePath()
 end
 
 function runtime.loadAll()
+    -- Start clean: a character with no saved file must not inherit the
+    -- previous character's data (and save it under its own name).
+    ALLDATA = {}
+    runtime.ignoreList = {}
+    runtime.pullList = {}
     local t = nil
     if myName then
-        local fn = loadfile(runtime.loadoutFilePath())
-        if fn then
-            local ok, t2 = pcall(fn)
-            if ok and type(t2) == 'table' then t = t2 end
+        local path = runtime.loadoutFilePath()
+        -- A save whose final rename failed leaves the only good copy in .tmp.
+        for _, p in ipairs({ path, path .. '.tmp' }) do
+            local fn = loadfile(p)
+            if fn then
+                local ok, t2 = pcall(fn)
+                if ok and type(t2) == 'table' then t = t2; break end
+            end
         end
     end
     if not t then
@@ -5470,6 +5649,8 @@ function runtime.loadAll()
     ALLDATA = t
     if type(ALLDATA.__ignore) == 'table' then runtime.ignoreList = ALLDATA.__ignore end
     if type(ALLDATA.__pullList) == 'table' then runtime.pullList = ALLDATA.__pullList end
+    if type(ALLDATA.__zoneIgnore) == 'table' then runtime.zoneIgnore = ALLDATA.__zoneIgnore end
+    if type(ALLDATA.__zonePull) == 'table' then runtime.zonePull = ALLDATA.__zonePull end
     if type(ALLDATA.__zoneHazards) == 'table' then ctrl.zone_hazards = ALLDATA.__zoneHazards end
     if type(ALLDATA.__zoneWaypoints) == 'table' then ctrl.zone_waypoints = ALLDATA.__zoneWaypoints end
     if type(ALLDATA.__zoneWaypointPresets) == 'table' then ctrl.zone_waypoint_presets = ALLDATA.__zoneWaypointPresets end
@@ -5483,6 +5664,11 @@ function runtime.syncCurrentZoneWaypoints()
     local zs
     pcall(function() zs = mq.TLO.Zone.ShortName() end)
     if not zs or zs == '' then return end
+    -- Only snapshot a route that belongs to this zone. runtime.waypointsZone is
+    -- set by loadZoneWaypoints() (first zone detection, every zone change,
+    -- character switch); until then -- or in the moment between zoning and the
+    -- reload -- the live list is another zone's and must not be saved here.
+    if runtime.waypointsZone ~= zs then return end
     if not ctrl.zone_waypoints then ctrl.zone_waypoints = {} end
     ctrl.zone_waypoints[zs] = {
         waypoints            = copyWaypointList(ctrl.waypoints),
@@ -5514,6 +5700,8 @@ runtime.saveLoadout = function(silent, force)
     if myName then ALLDATA[myName] = runtime.collectEntry() end
     ALLDATA.__ignore = runtime.ignoreList
     ALLDATA.__pullList = runtime.pullList
+    ALLDATA.__zoneIgnore = runtime.zoneIgnore
+    ALLDATA.__zonePull = runtime.zonePull
     ALLDATA.__zoneHazards = ctrl.zone_hazards
     runtime.syncCurrentZoneWaypoints()
     ALLDATA.__zoneWaypoints = ctrl.zone_waypoints
@@ -5522,8 +5710,11 @@ runtime.saveLoadout = function(silent, force)
     -- or a crash mid-write can never leave a truncated loadout behind.
     local path = runtime.loadoutFilePath()
     local tmpPath = path .. '.tmp'
-    local f = io.open(tmpPath, 'w')
-    if not f then return end
+    local f, oerr = io.open(tmpPath, 'w')
+    if not f then
+        print('\ar[Triune]\ax failed to save loadout (cannot open ' .. tostring(tmpPath) .. '): ' .. tostring(oerr))
+        return
+    end
     local okWrite, werr = pcall(function()
         f:write('return '); serialize(ALLDATA, f, 1)
     end)
@@ -5547,50 +5738,69 @@ runtime.saveLoadout = function(silent, force)
     if not silent then print('\ag[Triune]\ax saved loadout for ' .. tostring(myName or '?') .. '.') end
 end
 
-function runtime.addIgnore(name)
-    if not name or name == '' or isIgnored(name) then return end
-    table.insert(runtime.ignoreList, name)
-    table.sort(runtime.ignoreList)
-    runtime.saveLoadout(true)
-    print('\ag[Triune]\ax added to ignore list: ' .. name)
+local function listHas(list, name)
+    for _, n in ipairs(list or {}) do if n == name then return true end end
+    return false
 end
-function runtime.removeIgnore(name)
-    for i, n in ipairs(runtime.ignoreList) do
-        if n == name then
-            table.remove(runtime.ignoreList, i); break
-        end
+local function listRemove(list, name)
+    for i, n in ipairs(list or {}) do
+        if n == name then table.remove(list, i); return end
     end
+end
+
+-- `zone` true targets the current zone's list instead of the universal one.
+function runtime.addIgnore(name, zone)
+    if not name or name == '' then return end
+    local list, label = runtime.ignoreList, 'ignore list'
+    if zone then
+        list = runtime.zoneListFor(runtime.zoneIgnore, true)
+        if not list then return end
+        label = 'zone ignore list (' .. runtime.curZoneShort() .. ')'
+    end
+    if listHas(list, name) then return end
+    table.insert(list, name)
+    table.sort(list)
     runtime.saveLoadout(true)
-    print('\ag[Triune]\ax removed from ignore list: ' .. name)
+    print('\ag[Triune]\ax added to ' .. label .. ': ' .. name)
+end
+function runtime.addZoneIgnore(name) runtime.addIgnore(name, true) end
+function runtime.removeIgnore(name, zone)
+    listRemove(zone and runtime.zoneListFor(runtime.zoneIgnore) or runtime.ignoreList, name)
+    runtime.saveLoadout(true)
+    print('\ag[Triune]\ax removed from ' .. (zone and 'zone ' or '') .. 'ignore list: ' .. name)
 end
 
 -- pull-list (include-list) helpers for Puller mode:
-function runtime.isPullListed(name)
+function runtime.isPullListed(name, zone)
     if not name or name == '' then return false end
-    for _, n in ipairs(runtime.pullList) do if n == name then return true end end
-    return false
+    if zone then return listHas(runtime.zoneListFor(runtime.zonePull), name) end
+    return listHas(runtime.pullList, name)
 end
-function runtime.addPull(name)
-    if not name or name == '' or runtime.isPullListed(name) then return end
-    table.insert(runtime.pullList, name)
-    table.sort(runtime.pullList)
-    runtime.saveLoadout(true)
-    print('\ag[Triune]\ax added to pull list: ' .. name)
-end
-function runtime.removePull(name)
-    for i, n in ipairs(runtime.pullList) do
-        if n == name then
-            table.remove(runtime.pullList, i); break
-        end
+function runtime.addPull(name, zone)
+    if not name or name == '' or runtime.isPullListed(name, zone) then return end
+    local list, label = runtime.pullList, 'pull list'
+    if zone then
+        list = runtime.zoneListFor(runtime.zonePull, true)
+        if not list then return end
+        label = 'zone pull list (' .. runtime.curZoneShort() .. ')'
     end
+    table.insert(list, name)
+    table.sort(list)
     runtime.saveLoadout(true)
-    print('\ag[Triune]\ax removed from pull list: ' .. name)
+    print('\ag[Triune]\ax added to ' .. label .. ': ' .. name)
+end
+function runtime.removePull(name, zone)
+    listRemove(zone and runtime.zoneListFor(runtime.zonePull) or runtime.pullList, name)
+    runtime.saveLoadout(true)
+    print('\ag[Triune]\ax removed from ' .. (zone and 'zone ' or '') .. 'pull list: ' .. name)
 end
 
 -- Auto-Accept (group / trade / dzadd) lives in the auto_accept plugin (lua/tac/auto_accept.lua).
 
 -- Waypoint Patrol helpers for Puller mode (attached to runtime table to respect 200 local limit)
 function runtime.getMapsDirectory()
+    -- Probed once (a create/delete per candidate), then cached for the session.
+    if runtime.mapsDirCache ~= nil then return runtime.mapsDirCache or nil end
     local candidates = {
         'maps',
         '../maps',
@@ -5610,9 +5820,11 @@ function runtime.getMapsDirectory()
         if f then
             f:close()
             os.remove(testFile)
+            runtime.mapsDirCache = dir
             return dir
         end
     end
+    runtime.mapsDirCache = false
     return nil
 end
 
@@ -5637,20 +5849,26 @@ function runtime.syncWaypointMapLines(zoneShort, forceSync)
 
     local mapFilePath = string.format('%s/%s_3.txt', mapsDir, zoneShort)
     local existingLines = {}
+    local oldSection = {}
     local fRead = io.open(mapFilePath, 'r')
     if fRead then
         local inTriuneSection = false
         for line in fRead:lines() do
             if string.find(line, '^# TRIUNE_WAYPOINTS_START') then
                 inTriuneSection = true
+                oldSection[#oldSection + 1] = line
             elseif string.find(line, '^# TRIUNE_WAYPOINTS_END') then
                 inTriuneSection = false
+                oldSection[#oldSection + 1] = line
             elseif not inTriuneSection then
                 existingLines[#existingLines + 1] = line
+            else
+                oldSection[#oldSection + 1] = line
             end
         end
         fRead:close()
     end
+    local baseCount = #existingLines
 
     if #wps > 0 then
         existingLines[#existingLines + 1] = '# TRIUNE_WAYPOINTS_START'
@@ -5673,13 +5891,38 @@ function runtime.syncWaypointMapLines(zoneShort, forceSync)
         existingLines[#existingLines + 1] = '# TRIUNE_WAYPOINTS_END'
     end
 
-    local fWrite = io.open(mapFilePath, 'w')
-    if fWrite then
-        for _, line in ipairs(existingLines) do
-            fWrite:write(line .. '\n')
-        end
-        fWrite:close()
+    -- Triune section unchanged: leave the map file alone.
+    local newSection = {}
+    for i = baseCount + 1, #existingLines do newSection[#newSection + 1] = existingLines[i] end
+    if table.concat(oldSection, '\n') == table.concat(newSection, '\n') then
         runtime.lastSyncedMapWpsKey = syncKey
+        return
+    end
+
+    -- Temp file + rename so a failed write never truncates the zone map.
+    local tmpPath = mapFilePath .. '.triune_tmp'
+    local fWrite = io.open(tmpPath, 'w')
+    if fWrite then
+        local okWrite = pcall(function()
+            for _, line in ipairs(existingLines) do
+                fWrite:write(line .. '\n')
+            end
+        end)
+        fWrite:close()
+        if not okWrite then os.remove(tmpPath); return end
+        os.remove(mapFilePath) -- os.rename won't overwrite on Windows
+        if os.rename(tmpPath, mapFilePath) then
+            runtime.lastSyncedMapWpsKey = syncKey
+        else
+            -- Rename refused: fall back to writing in place so the map isn't lost.
+            local fDirect = io.open(mapFilePath, 'w')
+            if fDirect then
+                for _, line in ipairs(existingLines) do fDirect:write(line .. '\n') end
+                fDirect:close()
+                runtime.lastSyncedMapWpsKey = syncKey
+            end
+            os.remove(tmpPath)
+        end
     end
 end
 
@@ -5803,12 +6046,25 @@ function runtime.getZoneDisplayName(zs)
 end
 
 -- Applies the zone's auto-saved "Current" route (if any) into the live
--- ctrl.waypoints/settings. No-op if nothing has been saved for this zone yet
--- -- whatever's already loaded is left alone rather than cleared.
+-- ctrl.waypoints/settings and marks the live route as this zone's
+-- (runtime.waypointsZone). With nothing saved for this zone the live route is
+-- cleared: waypoints are positions in one zone, and keeping the previous
+-- zone's list would patrol it here and auto-save it into this zone's slot.
 function runtime.loadZoneWaypoints(zs)
     zs = zs or runtime.getCurrentZoneShortName()
+    if not zs or zs == '' then return false end
+    runtime.waypointsZone = zs
     local saved = ctrl.zone_waypoints and ctrl.zone_waypoints[zs]
-    if not saved then return false end
+    if type(saved) ~= 'table' then
+        if ctrl.waypoints and #ctrl.waypoints > 0 then
+            ctrl.waypoints            = {}
+            ctrl.current_waypoint_idx = 1
+            ctrl.waypoint_direction   = 1
+            runtime.wpSelectedPreset  = nil
+        end
+        runtime.syncWaypointMapLines(zs)
+        return false
+    end
     ctrl.waypoints            = copyWaypointList(saved.waypoints)
     ctrl.waypoint_radius      = saved.waypoint_radius or ctrl.waypoint_radius
     ctrl.waypoint_scan_radius = saved.waypoint_scan_radius or ctrl.waypoint_scan_radius
@@ -5874,6 +6130,7 @@ function runtime.wpPresetLoad(name)
             runtime.wpReset(true)
             ctrl.current_waypoint_idx = 1
             ctrl.waypoint_direction   = 1
+            runtime.waypointsZone     = zs -- presets are per zone: this is now the zone's live route
             runtime.syncWaypointMapLines(zs, true)
             runtime.saveLoadout(true) -- also refreshes this zone's "Current" snapshot to match
             return true
@@ -6054,20 +6311,26 @@ function runtime.isPullAllowed(name)
     local cleanName = tostring(name)
     if cleanName == '' then return false end
     if isIgnored(cleanName) then return false end
-    if not runtime.pullList or #runtime.pullList == 0 then return true end
+    -- Effective include list = universal + this zone's additions.
+    local zl = runtime.zoneListFor(runtime.zonePull)
+    local nUni = runtime.pullList and #runtime.pullList or 0
+    if nUni == 0 and (not zl or #zl == 0) then return true end
     local lowerName = cleanName:lower()
-    for _, n in ipairs(runtime.pullList) do
-        local strN = tostring(n)
-        if strN ~= '' then
-            local ln = strN:lower()
-            -- exact, or the listed text followed by a word boundary ("a rat"
-            -- matches "a rat" and "a rat king" but not "a ratman")
-            if lowerName == ln or (lowerName:sub(1, #ln) == ln and lowerName:sub(#ln + 1, #ln + 1):match('^[%s%p]?$')) then
-                return true
+    local function matches(list)
+        for _, n in ipairs(list or {}) do
+            local strN = tostring(n)
+            if strN ~= '' then
+                local ln = strN:lower()
+                -- exact, or the listed text followed by a word boundary ("a rat"
+                -- matches "a rat" and "a rat king" but not "a ratman")
+                if lowerName == ln or (lowerName:sub(1, #ln) == ln and lowerName:sub(#ln + 1, #ln + 1):match('^[%s%p]?$')) then
+                    return true
+                end
             end
         end
+        return false
     end
-    return false
+    return matches(runtime.pullList) or matches(zl)
 end
 
 function runtime.extractConName(line)
@@ -6203,6 +6466,8 @@ local function loadoutSig()
                     '~' ..
                     tostring(g.burn_only) ..
                     '~' ..
+                    tostring(g.boss_only) ..
+                    '~' ..
                     tostring(g.keep_singing)
             end
         end
@@ -6230,6 +6495,7 @@ local function loadoutSig()
                 '~' ..
                 tostring(d.enabled) .. '~' .. tostring(d.target) .. '~' .. tostring(d.when) .. '~' .. tostring(d.pct)
                 .. '~' .. tostring(d.boss_only) .. '~' .. tostring(d.burn_only) .. '~' .. tostring(d.priority)
+                .. '~' .. tostring(d.min_xtar)
         end
     end
     local actkeys = {}
@@ -6242,6 +6508,16 @@ local function loadoutSig()
                 '~' ..
                 tostring(act.enabled) .. '~' .. tostring(act.autoskill) .. '~' .. tostring(act.target) .. '~' .. tostring(act.when) .. '~' .. tostring(act.pct)
                 .. '~' .. tostring(act.boss_only) .. '~' .. tostring(act.burn_only) .. '~' .. tostring(act.priority)
+                .. '~' .. tostring(act.min_xtar)
+        end
+    end
+    -- Clickies are an ordered list (priority = position), so walk it in order.
+    if loadout.clickies then
+        for i, c in ipairs(loadout.clickies) do
+            if type(c) == 'table' then
+                p[#p + 1] = 'clk' .. tostring(i) .. '~' .. tostring(c.name) .. '~' .. tostring(c.enabled) .. '~' .. tostring(c.target)
+                    .. '~' .. tostring(c.when) .. '~' .. tostring(c.pct) .. '~' .. tostring(c.min_xtar) .. '~' .. tostring(c.burn_only)
+            end
         end
     end
     local ckeys = {}
@@ -6276,6 +6552,14 @@ local function loadoutSig()
     p[#p + 1] = table.concat(ctrlParts, '~')
     if runtime.ignoreList then p[#p + 1] = 'ignore:' .. table.concat(runtime.ignoreList, ',') end
     if runtime.pullList then p[#p + 1] = 'pull:' .. table.concat(runtime.pullList, ',') end
+    for _, pair in ipairs({ { 'zignore:', runtime.zoneIgnore }, { 'zpull:', runtime.zonePull } }) do
+        local zkeys = {}
+        for zs in pairs(pair[2] or {}) do zkeys[#zkeys + 1] = zs end
+        table.sort(zkeys)
+        for _, zs in ipairs(zkeys) do
+            p[#p + 1] = pair[1] .. zs .. '=' .. table.concat(pair[2][zs], ',')
+        end
+    end
     return table.concat(p, '|')
 end
 
@@ -6839,6 +7123,7 @@ function runtime.initPluginManager()
             getPetSpawnInfo       = runtime.getPetSpawnInfo or getPetSpawnInfo,
             isSpawnAlive          = runtime.isSpawnAlive or isSpawnAlive,
             addIgnore             = runtime.addIgnore,
+            addZoneIgnore         = runtime.addZoneIgnore,
             -- Extended Target window per-spawn overrides (see runtime.setXtForce)
             setXtForce            = runtime.setXtForce,
             setXtIgnore           = runtime.setXtIgnore,
@@ -7494,6 +7779,7 @@ function runtime.initPluginManager()
             'parcels.lua',
             'nmsloot.lua',
             'nms_looter_handoff.lua',
+            'gm_commands.lua',
         }
         for _, f in ipairs(known) do
             if not fileSet[f:lower()] then
@@ -8520,7 +8806,7 @@ function UI.drawHeaderBar()
     -- Which plugins get a button here is chosen per plugin on Settings -> Plugins.
     -- initPluginManager runs plugin chunks / onInit and must never execute on
     -- the render thread; it is always initialised before the first frame.
-    if not runtime.pluginManager then return end
+    -- (No early return here: it would skip the PopStyleVar below.)
     local pm = runtime.pluginManager
     if pm and type(pm.drawHeaderButtons) == 'function' then
         -- Compact Mode already occupies the first slot of the first row; the
@@ -8654,6 +8940,7 @@ UI.HELP_COMMANDS = (function() return {
         { cmd = '/ac inv find <text>',                desc = 'Search every box\'s inventory snapshot for an item (inventory plugin)' },
         { cmd = '/ac parcels [collect|stop|status]',  desc = 'Toggle the Parcel Helper window; collect retrieves every parcel at the open parcel merchant (parcels plugin)' },
         { cmd = '/ac dps / /dps',                     desc = 'Toggle the DPS Parser window (dps plugin)' },
+        { cmd = '/ac gm [<#command args>]',           desc = 'Toggle the GM Commands window, or run a server # command line (gm_commands plugin; off by default)' },
         { cmd = '/ac net [all|zone|group|Name] [command]', desc = 'Toggle the Box Network window, or run an /ac command on your other boxes (boxnet plugin)' },
         { cmd = '/ac btn [n|new|exec <set> <index>|import bm]', desc = 'Toggle the Hot Buttons hotbars, show/hide hotbar n, or fire a button (buttons plugin; also /btn, /btnexec)' },
         { cmd = '/dps compact',                       desc = 'Toggle DPS parser auto-resizing compact mode' },
@@ -9142,6 +9429,16 @@ function UI.drawGemList(gemsTable, idPrefix, isActiveSet, allowBurn)
                         end
 
                         ImGui.SameLine()
+                        local gbossVal = ImGui.Checkbox('Boss##gbo', g.boss_only or false)
+                        if gbossVal ~= (g.boss_only or false) then
+                            g.boss_only = gbossVal
+                            runtime.saveLoadout(true)
+                        end
+                        if ImGui.IsItemHovered() then
+                            ImGui.SetTooltip('Only cast if the resolved target is a Named mob.')
+                        end
+
+                        ImGui.SameLine()
                         local boVal = ImGui.Checkbox('Burn##bo', g.burn_only or false)
                         if boVal ~= (g.burn_only or false) then
                             g.burn_only = boVal
@@ -9598,7 +9895,11 @@ function UI.drawAbilitiesTab()
                 if not ctrl.action_trained_only or isTrained then
                     anyAction = true
                     ImGui.PushID('act_' .. tostring(cls) .. '_' .. tostring(nm))
-                local entry = loadout.actions[nm]
+                -- Unsaved rows use a throwaway default, stored only once a
+                -- control a disabled row shows (enable / Auto) is changed.
+                local stored = loadout.actions[nm]
+                local rowChanged = false
+                local entry = stored
                 if not entry then
                     entry = defaultActionEntry(nm, cls)
                 else
@@ -9630,6 +9931,7 @@ function UI.drawAbilitiesTab()
                 if isAutoskillEligible(nm) then
                     ImGui.SameLine()
                     local asVal = ImGui.Checkbox('Auto##as', entry.autoskill or false)
+                    if asVal ~= (entry.autoskill or false) then rowChanged = true end
                     entry.autoskill = asVal
                     if ImGui.IsItemHovered() then
                         ImGui.SetTooltip('Autoskill: Automatically fire this ability continuously on cooldown during combat against hostile targets in melee range.')
@@ -9715,7 +10017,7 @@ function UI.drawAbilitiesTab()
                         end
                     end
                 end
-                loadout.actions[nm] = entry
+                if not stored and (entry.enabled or rowChanged) then loadout.actions[nm] = entry end
                 ImGui.PopID()
             end
         end
@@ -9733,6 +10035,43 @@ function UI.drawAbilitiesTab()
 end
 
 -- UI: activated AAs tab
+-- Exclusion-group state for the AAs tab, built once per main-loop pass
+-- (runtime.tickSerial; 0.25 s when the loop has not stamped one) instead of
+-- calling runtime.aaGroupBusy per row, which rescans every AA (O(n^2) a frame).
+-- Same rule as runtime.aaGroupBusy: only enabled, grouped AAs count.
+function runtime.aaGroupSnapshot()
+    local now = os.clock()
+    local tick = runtime.tickSerial
+    local snap = runtime.aaGroupSnap
+    if snap and ((tick and snap.tick == tick) or (not tick and (now - snap.at) < 0.25)) then return snap end
+    local active, running = {}, {}
+    for rawName, a in pairs(loadout.aas or {}) do
+        if type(a) == 'table' and a.enabled and a.excl and a.excl ~= '' and a.excl ~= '-' then
+            local oname = type(rawName) == 'string' and rawName:match('^%s*(.-)%s*$') or rawName
+            if runtime.isAAEffectActive(oname) then
+                active[a.excl] = active[a.excl] or {}
+                active[a.excl][oname] = true
+                running[oname] = true
+            end
+        end
+    end
+    snap = { tick = tick, at = now, active = active, running = running }
+    runtime.aaGroupSnap = snap
+    return snap
+end
+
+-- Snapshot-backed runtime.aaGroupBusy for UI rows.
+function runtime.aaGroupBusyCached(name, a)
+    local grp = a and a.excl
+    if not grp or grp == '' or grp == '-' then return false end
+    local members = runtime.aaGroupSnapshot().active[grp]
+    if not members then return false end
+    for oname in pairs(members) do
+        if oname ~= name then return true end
+    end
+    return false
+end
+
 function UI.drawAATab()
     if not ImGui.BeginTabItem('AAs') then return end
     ImGui.TextWrapped('Activated Alternate Advancements (each has its own timer -- all fire when ready). Grouped by cooldown. Use Grp to chain AAs that do the same thing.')
@@ -9779,7 +10118,10 @@ function UI.drawAATab()
                                 any = true
                                 ImGui.PushID('aa_' .. tier .. '_' .. cls .. '_' .. nm)
                                 local isFD = isFeignDeathAbility(nm)
-                                local entry = loadout.aas[nm] or
+                                -- Unsaved rows use a throwaway default, stored only once
+                                -- enabled (the only control a disabled row shows).
+                                local stored = loadout.aas[nm]
+                                local entry = stored or
                                     { cls = cls, target = 'F: Myself', when = isFD and 'my HP <=' or 'in combat', enabled = false, pct = isFD and 20 or 30, burn_only = false }
                                 entry.enabled = ImGui.Checkbox('##en', entry.enabled)
                                 if ImGui.IsItemHovered() then
@@ -9839,6 +10181,12 @@ function UI.drawAATab()
                                             'Minimum number of active NPCs on XTarget required for this AA to fire.')
                                     end
                                     ImGui.SameLine()
+                                    local aabossVal = ImGui.Checkbox('Boss##aabs', entry.boss_only or false)
+                                    entry.boss_only = aabossVal
+                                    if ImGui.IsItemHovered() then
+                                        ImGui.SetTooltip('Only fire this AA if the resolved target is a Named mob.')
+                                    end
+                                    ImGui.SameLine()
                                     local aaboVal = ImGui.Checkbox('Burn##bo', entry.burn_only or false)
                                     entry.burn_only = aaboVal
                                     if ImGui.IsItemHovered() then
@@ -9856,12 +10204,12 @@ function UI.drawAATab()
                                     end
                                     if entry.excl then
                                         ImGui.SameLine()
-                                        if runtime.aaGroupBusy(nm, entry) then
+                                        if runtime.aaGroupBusyCached(nm, entry) then
                                             ImGui.TextDisabled('waiting')
                                             if ImGui.IsItemHovered() then
                                                 ImGui.SetTooltip('Another AA in group ' .. entry.excl .. ' is still running; this one fires when it drops.')
                                             end
-                                        elseif runtime.isAAEffectActive(nm) then
+                                        elseif runtime.aaGroupSnapshot().running[nm] then
                                             local r2, g2, b2 = 0.4, 0.9, 0.4
                                             ImGui.TextColored(r2, g2, b2, 1, 'running')
                                             if ImGui.IsItemHovered() then
@@ -9870,7 +10218,7 @@ function UI.drawAATab()
                                         end
                                     end
                                 end
-                                loadout.aas[nm] = entry
+                                if not stored and entry.enabled then loadout.aas[nm] = entry end
                                 ImGui.PopID()
                             end
                         end
@@ -10090,7 +10438,11 @@ function UI.drawDiscTab()
                 if not ctrl.disc_trained_only or runtime.hasDisc(nm) then
                     anyDisc = true
                     ImGui.PushID('disc' .. cls .. nm)
-                    local entry = loadout.discs[nm] or
+                    -- Rows without a saved entry draw from a throwaway default; it is
+                    -- only stored once the user turns it on (the other controls only
+                    -- show for enabled rows), so browsing the tab adds nothing.
+                    local stored = loadout.discs[nm]
+                    local entry = stored or
                         { cls = cls, target = 'F: Myself', when = 'HP <=', enabled = false, pct = 30, boss_only = false, burn_only = false, priority = 50 }
                     entry.enabled = ImGui.Checkbox('##en', entry.enabled)
                     if ImGui.IsItemHovered() then
@@ -10171,7 +10523,7 @@ function UI.drawDiscTab()
                                 'Lower = tried first when more than one eligible\ndisc is ready at the same time.')
                         end
                     end
-                    loadout.discs[nm] = entry
+                    if not stored and entry.enabled then loadout.discs[nm] = entry end
                     ImGui.PopID()
                 end
             end
@@ -11408,7 +11760,19 @@ function UI.drawStatusTab()
     ImGui.EndTabItem()
 end
 
+-- Called from several UI panels every frame; each call does Spawn / Target
+-- TLO walks (and a Box Network lookup), so serve one result for 0.25 s like
+-- runtime.statusTargetSnapshot. Callers treat the table as read-only.
 function runtime.getMaTargetInfo()
+    local now = os.clock()
+    local c = runtime.maTargetInfoCache
+    if c and (now - c.at) < 0.25 then return c.info end
+    local info = runtime.getMaTargetInfoUncached()
+    runtime.maTargetInfoCache = { at = now, info = info }
+    return info
+end
+
+function runtime.getMaTargetInfoUncached()
     local maId = (runtime.maPcId and runtime.maPcId()) or (ctrl and ctrl.ma_id and ctrl.ma_id > 0 and ctrl.ma_id) or nil
     local maName = (ctrl and ctrl.ma_name and ctrl.ma_name ~= '') and ctrl.ma_name or nil
     local maSpawn = nil
@@ -11850,6 +12214,10 @@ function UI.drawControlTab()
                     if nm == curSpell then curIdx = idx; break end
                 end
             end
+            -- Found by name: only the slot may need re-syncing. Any fallback
+            -- (spell not memorized right now) is display-only and must not
+            -- overwrite the saved choice until the user picks an entry.
+            local foundByName = curIdx ~= nil
             if not curIdx then
                 for idx, slotNum in ipairs(pg.slots) do
                     if slotNum == (ctrl.pull_spell_gem or 1) then curIdx = idx; break end
@@ -11858,10 +12226,11 @@ function UI.drawControlTab()
             curIdx = curIdx or 1
 
             local newIdx = ImGui.Combo('Pull Spell##pullSpellCombo', curIdx, pg.labels)
-            if newIdx ~= curIdx or ctrl.pull_spell_gem ~= pg.slots[curIdx] or (curSpell == '' and pg.names[curIdx] ~= '') then
-                local chosenSlot = pg.slots[newIdx] or 1
-                ctrl.pull_spell_gem = chosenSlot
+            if newIdx ~= curIdx then
+                ctrl.pull_spell_gem = pg.slots[newIdx] or 1
                 ctrl.pull_spell = pg.names[newIdx] or ''
+            elseif foundByName and pg.slots[curIdx] and ctrl.pull_spell_gem ~= pg.slots[curIdx] then
+                ctrl.pull_spell_gem = pg.slots[curIdx]
             end
 
             if ImGui.IsItemHovered() then
@@ -12487,78 +12856,121 @@ function UI.drawControlTab()
         end
 
 
-        accent(GOLD, 'NPCs to Pull (Include List)')
-        accent(MUTED, 'If empty, pulls any mob in radius. If populated, ONLY pulls listed names.')
+        local curZoneShortName = runtime.curZoneShort() -- refreshes the cache below
+        local curZoneName = runtime.zoneNameCached or curZoneShortName or '?'
 
-        if ImGui.Button('Pull Current Target##pullCurTgt', UI.px(170), UI.px(24)) then
-            local nm
-            pcall(function() nm = mq.TLO.Target.CleanName() end)
-            if nm and nm ~= '' then
-                runtime.addPull(nm)
-            else
-                print('\ay[Triune]\ax no target selected.')
-            end
-        end
-        ImGui.SameLine()
-        ImGui.SetNextItemWidth(UI.px(180))
-        runtime.pullInput = ImGui.InputText('##pullAddInput', runtime.pullInput or '')
-        ImGui.SameLine()
-        if ImGui.Button('Add##pullAddBtn') then
-            if runtime.pullInput and runtime.pullInput ~= '' then
-                runtime.addPull(runtime.pullInput); runtime.pullInput = ''
-            end
-        end
+        -- One Pull / Ignore section: a Universal | <zone> toggle picks which list the
+        -- add controls and the list frame below act on. Zone entries apply IN ADDITION
+        -- to the Universal ones.
+        local function drawListSection(o)
+            accent(GOLD, o.title)
+            accent(MUTED, o.hint)
 
-        if ImGui.BeginChild('pullListFrame', 0, UI.px(90), true) then
-            if not runtime.pullList or #runtime.pullList == 0 then
-                ImGui.TextDisabled('(all mobs allowed)')
-            else
-                for i, nm in ipairs(runtime.pullList) do
-                    ImGui.PushID('pl_' .. i)
-                    if ImGui.Button('x') then runtime.removePull(nm) end
+            local zoneSel = runtime[o.scopeKey] == true
+            for idx = 1, 2 do
+                local isZone = (idx == 2)
+                local selected = (isZone == zoneSel)
+                if idx == 2 then ImGui.SameLine() end
+                if selected then
+                    ImGui.PushStyleColor(ImGuiCol.Button, 0.08, 0.32, 0.72, 1.0)
+                    ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 0.12, 0.42, 0.88, 1.0)
+                    ImGui.PushStyleColor(ImGuiCol.ButtonActive, 0.06, 0.25, 0.60, 1.0)
+                end
+                local label = (isZone and curZoneName or 'Universal') .. '##' .. o.id .. 'scope' .. idx
+                if ImGui.Button(label, UI.px(isZone and 150 or 110), UI.px(22)) then
+                    runtime[o.scopeKey] = isZone
+                    zoneSel = isZone
+                end
+                if selected then ImGui.PopStyleColor(3) end
+                if ImGui.IsItemHovered() then
+                    UI.setTooltip(isZone
+                        and ('Entries for ' .. curZoneName .. ' only. Applied in addition to the Universal list.')
+                        or 'Entries that apply in every zone.')
+                end
+            end
+
+            if ImGui.Button(o.curLabel .. '##' .. o.id .. 'Cur', UI.px(170), UI.px(24)) then
+                local nm
+                pcall(function() nm = mq.TLO.Target.CleanName() end)
+                if nm and nm ~= '' then
+                    if o.stopAttack and mq.TLO.Me.Combat() then mq.cmd('/attack off') end
+                    o.addFn(nm, zoneSel)
+                else
+                    print('\ay[Triune]\ax no target selected.')
+                end
+            end
+            ImGui.SameLine()
+            ImGui.SetNextItemWidth(UI.px(180))
+            runtime[o.inputKey] = ImGui.InputText('##' .. o.id .. 'AddInput', runtime[o.inputKey] or '')
+            ImGui.SameLine()
+            if ImGui.Button('Add##' .. o.id .. 'AddBtn') then
+                if runtime[o.inputKey] and runtime[o.inputKey] ~= '' then
+                    o.addFn(runtime[o.inputKey], zoneSel); runtime[o.inputKey] = ''
+                end
+            end
+            ImGui.SameLine()
+            local popId = 'pick_' .. o.id
+            if ImGui.Button('Pick...##' .. o.id .. 'PickBtn') then ImGui.OpenPopup(popId) end
+            if ImGui.IsItemHovered() then
+                UI.setTooltip('Choose from the NPCs currently spawned in this zone (count shown in brackets).\nClick a name to add it to the selected list; names already listed are hidden.')
+            end
+            if ImGui.BeginPopup(popId) then
+                ImGui.Text('NPCs in ' .. curZoneName .. ' -> ' .. (zoneSel and curZoneName or 'Universal'))
+                ImGui.SetNextItemWidth(UI.px(320))
+                local fk = o.id .. 'PickFilter'
+                runtime[fk] = ImGui.InputText('##' .. o.id .. 'PickFilterInput', runtime[fk] or '')
+                local filt = (runtime[fk] or ''):lower()
+                local listed = {}
+                for _, n in ipairs(o.uniList() or {}) do listed[n] = true end
+                for _, n in ipairs(runtime.zoneListFor(runtime[o.storeKey]) or {}) do listed[n] = true end
+                if ImGui.BeginChild('##' .. o.id .. 'PickList', UI.px(320), UI.px(220), true) then
+                    local shown = 0
+                    for _, e in ipairs(runtime.zoneNpcNames()) do
+                        if not listed[e.name] and (filt == '' or e.name:lower():find(filt, 1, true)) then
+                            shown = shown + 1
+                            local lbl = string.format('%s (%d)##%s_%s', e.name, e.count, o.id, e.name)
+                            if ImGui.Selectable(lbl, false, (ImGuiSelectableFlags and ImGuiSelectableFlags.DontClosePopups) or 0) then
+                                o.addFn(e.name, zoneSel)
+                            end
+                        end
+                    end
+                    if shown == 0 then ImGui.TextDisabled('(no matching NPCs)') end
+                end
+                ImGui.EndChild()
+                ImGui.EndPopup()
+            end
+
+            local list = zoneSel and (runtime.zoneListFor(runtime[o.storeKey]) or {}) or (o.uniList() or {})
+            if ImGui.BeginChild(o.id .. 'Frame', 0, UI.px(90), true) then
+                if #list == 0 then
+                    ImGui.TextDisabled(zoneSel and ('(nothing listed for ' .. curZoneName .. ')') or o.emptyText)
+                end
+                for i, nm in ipairs(list) do
+                    ImGui.PushID(o.id .. (zoneSel and '_z' or '_u') .. i)
+                    if ImGui.Button('x') then o.removeFn(nm, zoneSel) end
                     ImGui.SameLine(); ImGui.Text(tostring(nm))
                     ImGui.PopID()
                 end
             end
-        end
-        ImGui.EndChild()
-
-        accent(GOLD, 'NPCs to Ignore (Ignore List)')
-        accent(MUTED, 'Puller will NEVER auto-target these names (shared across all characters).')
-
-        if ImGui.Button('Ignore Current Target##ignoreCurTgt', UI.px(170), UI.px(24)) then
-            local nm
-            pcall(function() nm = mq.TLO.Target.CleanName() end)
-            if nm and nm ~= '' then
-                if mq.TLO.Me.Combat() then mq.cmd('/attack off') end
-                runtime.addIgnore(nm)
-            else
-                print('\ay[Triune]\ax no target selected.')
-            end
-        end
-        ImGui.SameLine()
-        ImGui.SetNextItemWidth(UI.px(180))
-        runtime.ignoreInput = ImGui.InputText('##ignoreAddInput', runtime.ignoreInput or '')
-        ImGui.SameLine()
-        if ImGui.Button('Add##ignoreAddBtn') then
-            if runtime.ignoreInput and runtime.ignoreInput ~= '' then
-                runtime.addIgnore(runtime.ignoreInput); runtime.ignoreInput = ''
-            end
+            ImGui.EndChild()
         end
 
-        if ImGui.BeginChild('ignoreListFrame', 0, UI.px(90), true) then
-            if not runtime.ignoreList or #runtime.ignoreList == 0 then
-                ImGui.TextDisabled('(none ignored)')
-            else
-                for i, nm in ipairs(runtime.ignoreList) do
-                    ImGui.PushID('ig_' .. i)
-                    if ImGui.Button('x') then runtime.removeIgnore(nm) end
-                    ImGui.SameLine(); ImGui.Text(tostring(nm))
-                    ImGui.PopID()
-                end
-            end
-        end
-        ImGui.EndChild()
+        drawListSection({
+            id = 'pull', title = 'NPCs to Pull (Include List)',
+            hint = 'If Universal and this zone\'s lists are both empty, pulls any mob in radius. Otherwise ONLY pulls listed names.',
+            scopeKey = 'pullScopeZone', inputKey = 'pullInput', storeKey = 'zonePull',
+            curLabel = 'Pull Current Target', emptyText = '(all mobs allowed)',
+            uniList = function() return runtime.pullList end,
+            addFn = runtime.addPull, removeFn = runtime.removePull,
+        })
+        drawListSection({
+            id = 'ignore', title = 'NPCs to Ignore (Ignore List)',
+            hint = 'Puller will NEVER auto-target these names (Universal + this zone; shared across all characters).',
+            scopeKey = 'ignoreScopeZone', inputKey = 'ignoreInput', storeKey = 'zoneIgnore',
+            curLabel = 'Ignore Current Target', emptyText = '(none ignored)', stopAttack = true,
+            uniList = function() return runtime.ignoreList end,
+            addFn = runtime.addIgnore, removeFn = runtime.removeIgnore,
+        })
     end
 
     -- Assist Mode Contextual Controls
@@ -12646,7 +13058,13 @@ function UI.drawControlTab()
         ImGui.SameLine()
         if not canRemove then ImGui.BeginDisabled() end
         if ImGui.Button('Remove##maRemove') then
-            runtime.removeCustomAssist()
+            -- The combo selection wins when it is a custom entry; only fall back
+            -- to the in-game PC target / current MA when it is not.
+            local removeArg = nil
+            if (isSelectedCustom or selectedInCustom) and selectedCandidate.name and selectedCandidate.name ~= '' then
+                removeArg = selectedCandidate.name
+            end
+            runtime.removeCustomAssist(removeArg)
         end
         if not canRemove then ImGui.EndDisabled() end
         if ImGui.IsItemHovered() then
@@ -14053,6 +14471,23 @@ function UI.drawWindowSettings()
     end
 end
 
+-- Med Break: the start threshold must stay below the stop threshold, or the
+-- break ends the moment it begins (or never starts). The slider just moved
+-- wins; the other one is pushed out of its way.
+function UI.clampMedBreak(kind, startMoved)
+    local sk, ek = 'medbreak_' .. kind .. '_start', 'medbreak_' .. kind .. '_stop'
+    local st, sp = tonumber(ctrl[sk]) or 20, tonumber(ctrl[ek]) or 90
+    if st < sp then return end
+    if startMoved then
+        if st >= 100 then st = 99 end
+        sp = st + 1
+    else
+        if sp <= 0 then sp = 1 end
+        st = sp - 1
+    end
+    ctrl[sk], ctrl[ek] = st, sp
+end
+
 function UI.drawSettingsTab()
     if not ImGui.BeginTabItem('Settings') then return end
 
@@ -14435,12 +14870,14 @@ function UI.drawSettingsTab()
             local mbHpStart = ImGui.SliderInt('##mbhpstart', ctrl.medbreak_hp_start or 20, 0, 100, '%d%%')
             if mbHpStart ~= ctrl.medbreak_hp_start then
                 ctrl.medbreak_hp_start = mbHpStart
+                UI.clampMedBreak('hp', true)
                 runtime.saveLoadout(true)
             end
             ImGui.SameLine(); ImGui.TextDisabled('until'); ImGui.SameLine(); ImGui.SetNextItemWidth(UI.px(120))
             local mbHpStop = ImGui.SliderInt('##mbhpstop', ctrl.medbreak_hp_stop or 90, 0, 100, '%d%%')
             if mbHpStop ~= ctrl.medbreak_hp_stop then
                 ctrl.medbreak_hp_stop = mbHpStop
+                UI.clampMedBreak('hp', false)
                 runtime.saveLoadout(true)
             end
 
@@ -14453,12 +14890,14 @@ function UI.drawSettingsTab()
             local mbManaStart = ImGui.SliderInt('##mbmanastart', ctrl.medbreak_mana_start or 20, 0, 100, '%d%%')
             if mbManaStart ~= ctrl.medbreak_mana_start then
                 ctrl.medbreak_mana_start = mbManaStart
+                UI.clampMedBreak('mana', true)
                 runtime.saveLoadout(true)
             end
             ImGui.SameLine(); ImGui.TextDisabled('until'); ImGui.SameLine(); ImGui.SetNextItemWidth(UI.px(120))
             local mbManaStop = ImGui.SliderInt('##mbmanastop', ctrl.medbreak_mana_stop or 90, 0, 100, '%d%%')
             if mbManaStop ~= ctrl.medbreak_mana_stop then
                 ctrl.medbreak_mana_stop = mbManaStop
+                UI.clampMedBreak('mana', false)
                 runtime.saveLoadout(true)
             end
 
@@ -14471,12 +14910,14 @@ function UI.drawSettingsTab()
             local mbEndStart = ImGui.SliderInt('##mbendstart', ctrl.medbreak_end_start or 20, 0, 100, '%d%%')
             if mbEndStart ~= ctrl.medbreak_end_start then
                 ctrl.medbreak_end_start = mbEndStart
+                UI.clampMedBreak('end', true)
                 runtime.saveLoadout(true)
             end
             ImGui.SameLine(); ImGui.TextDisabled('until'); ImGui.SameLine(); ImGui.SetNextItemWidth(UI.px(120))
             local mbEndStop = ImGui.SliderInt('##mbendstop', ctrl.medbreak_end_stop or 90, 0, 100, '%d%%')
             if mbEndStop ~= ctrl.medbreak_end_stop then
                 ctrl.medbreak_end_stop = mbEndStop
+                UI.clampMedBreak('end', false)
                 runtime.saveLoadout(true)
             end
         end
@@ -15734,8 +16175,9 @@ end
 function runtime.recordPetBuff(petId, spellName, durSec)
     if not petId or petId <= 0 or not spellName or spellName == '' then return end
     petState.cachedPetBuffs = petState.cachedPetBuffs or {}
-    local cData = petState.cachedPetBuffs[petId] or { time = os.clock(), buffs = {}, buffDetails = {} }
-    cData.time = os.clock()
+    local now = os.clock()
+    local cData = petState.cachedPetBuffs[petId] or { time = now, buffs = {}, buffDetails = {} }
+    cData.time = now
     cData.buffs = cData.buffs or {}
     cData.buffDetails = cData.buffDetails or {}
     local alreadyIn = false
@@ -15745,7 +16187,15 @@ function runtime.recordPetBuff(petId, spellName, durSec)
     if not alreadyIn then
         table.insert(cData.buffs, spellName)
     end
-    table.insert(cData.buffDetails, { name = spellName, duration = durSec or 0 })
+    -- One entry per buff name, stamped with its own cast time, so a recast
+    -- refreshes that buff only and every buff expires on its own clock
+    -- (cData.time is refreshed by any record and must not extend the others).
+    local rec = { name = spellName, duration = durSec or 0, at = now }
+    local replaced = false
+    for i, d in ipairs(cData.buffDetails) do
+        if d.name == spellName then cData.buffDetails[i] = rec; replaced = true; break end
+    end
+    if not replaced then table.insert(cData.buffDetails, rec) end
     petState.cachedPetBuffs[petId] = cData
 end
 
@@ -15814,8 +16264,10 @@ function runtime.isPetBuffActive(petId, name, minSec)
 
         -- Update petState.cachedPetBuffs
         if petState and petState.cachedPetBuffs and #activeBuffNames > 0 then
+            local nowScan = os.clock()
+            for _, d in ipairs(activeBuffDetails) do d.at = d.at or nowScan end
             petState.cachedPetBuffs[petId] = {
-                time = os.clock(),
+                time = nowScan,
                 buffs = activeBuffNames,
                 buffDetails = activeBuffDetails
             }
@@ -15956,20 +16408,28 @@ function runtime.isPetBuffActive(petId, name, minSec)
     -- 4. Check petState.cachedPetBuffs
     if petState and petState.cachedPetBuffs and petState.cachedPetBuffs[petId] then
         local cData = petState.cachedPetBuffs[petId]
-        local elapsed = os.clock() - (cData.time or 0)
+        local nowC = os.clock()
+        local elapsed = nowC - (cData.time or 0)
         if elapsed < 300 then
-            if cData.buffDetails then
+            -- Each detail expires on its own stamp (d.at; older records fall
+            -- back to the record time): past its duration, or 300 s when the
+            -- duration is unknown, the entry no longer counts as active.
+            local hasDetails = cData.buffDetails and #cData.buffDetails > 0
+            if hasDetails then
                 for _, d in ipairs(cData.buffDetails) do
                     if isBuffNameMatch(d.name) then
-                        local remSec = (d.duration or 0) - elapsed
-                        if minSec > 0 and (d.duration or 0) > 0 then
-                            return remSec > minSec
+                        local dur = tonumber(d.duration) or 0
+                        local age = nowC - (d.at or cData.time or 0)
+                        local remSec = dur - age
+                        if (dur > 0 and remSec > 0) or (dur <= 0 and age < 300) then
+                            if minSec > 0 and dur > 0 then
+                                return remSec > minSec
+                            end
+                            return true
                         end
-                        return true
                     end
                 end
-            end
-            if cData.buffs then
+            elseif cData.buffs then
                 for _, bName in ipairs(cData.buffs) do
                     if isBuffNameMatch(bName) then
                         return true
@@ -16744,7 +17204,12 @@ local function isCombat()
         if t() and (t.ID() or 0) > 0 and not isGroupOrRaidMember(t.ID()) and not isSpawnPetOrPlayer(t.ID()) then
             local stype = t.Type() or ''
             if (stype == 'NPC' or stype == 'Pet') and not t.Dead() and stype ~= 'Corpse' and not isIgnored(t.CleanName()) then
-                if runtime.targetIsEngaged(t.ID()) or isHostileTarget(t.ID()) then return true end
+                -- isHostileTarget alone is only "a live NPC/Pet", so a targeted
+                -- merchant or a mob being conned from afar is not combat. The
+                -- puller's own pull target still counts while it is hostile.
+                local tid = t.ID()
+                if runtime.targetIsEngaged(tid) then return true end
+                if (runtime.pullTargetId or 0) > 0 and tid == runtime.pullTargetId and isHostileTarget(tid) then return true end
             end
         end
         local slots = mq.TLO.Me.XTargetSlots() or 13
@@ -17391,7 +17856,8 @@ function runtime.resolvePetTargetId(when, spellName, cls, pct)
     if when == 'missing buff' and spellName and spellName ~= '' then
         local minSec = (not isCombat() and ctrl and tonumber(ctrl.buff_refresh_sec) or 0) or 0
         for _, pid in ipairs(allPets) do
-            if not runtime.sungBuffs[sungKey(spellName, pid)] and not buffActive(pid, spellName, minSec) then
+            local pkey = sungKey(spellName, pid)
+            if (not runtime.sungBuffs[pkey] or runtime.bardSongDropped(pkey, pid, spellName)) and not buffActive(pid, spellName, minSec) then
                 return pid
             end
         end
@@ -17704,9 +18170,11 @@ function runtime.resolveTargetId(token, cls, when, spellName, pct, extra)
     return id
 end
 
-mq.event('TriuneZone', 'You have entered #*#', function()
-    runtime.sungBuffs = {}; runtime.npcCastCounts = {}; runtime.npcSpellApplied = {}; runtime.npcSpellLastCast = {}; if runtime.onZoned then runtime.onZoned() end
-end)
+-- Zoning is detected only by the main loop's Zone.ShortName change check
+-- (runMainLoop). A 'You have entered #*#' chat event used to run onZoned too,
+-- but that text also prefixes non-zone messages ("You have entered an area
+-- where levitation effects do not function", "an Arena (PvP) area") and on a
+-- real zone it ran onZoned a second time.
 
 -- Sing-once bard songs: a sung mark is released -- and the song re-sung --
 -- only after the effect has been SEEN up and then stays gone for
@@ -17727,9 +18195,14 @@ local function bardSongDropped(key, targetId, spellName)
     st.missingSince = st.missingSince or now
     if (now - st.missingSince) < BARD_DROP_GRACE then return false end
     runtime.sungBuffs[key] = nil
-    print(string.format('\ay[Triune bard]\ax %s dropped -- singing it again.', spellName))
+    if st.other then
+        if ctrl.debug_mode then print(string.format('\ay[Triune]\ax %s dropped -- recasting it.', spellName)) end
+    else
+        print(string.format('\ay[Triune bard]\ax %s dropped -- singing it again.', spellName))
+    end
     return true
 end
+runtime.bardSongDropped = bardSongDropped -- the pet 'missing buff' resolver sits above this
 
 function runtime.reconcileSungBuffs()
     local found = 0
@@ -17909,12 +18382,15 @@ mq.event('TriuneFizzle', '#*#Your spell fizzles!#*#', function() onFailureEvent(
 mq.event('TriuneInterrupt1', '#*#Your spell is interrupted#*#', function() onFailureEvent('interrupted') end)
 mq.event('TriuneInterrupt2', '#*#Your casting has been interrupted!#*#', function() onFailureEvent('interrupted') end)
 mq.event('TriuneOutOfRangeSpell', '#*#target is out of range#*#', function() onFailureEvent('out of range') end)
-mq.event('TriuneCannotSee1', '#*#cannot see your target#*#', onCannotSeeEvent)
-mq.event('TriuneCannotSee2', '#*#can\'t see your target#*#', onCannotSeeEvent)
+-- Anchored to the start of the system message so say/tell/group chat
+-- ("Name says, '... cannot see your target'") can't trigger it.
+mq.event('TriuneCannotSee1', 'You cannot see your target#*#', onCannotSeeEvent)
+mq.event('TriuneCannotSee2', 'You can\'t see your target#*#', onCannotSeeEvent)
 mq.event('TriuneNoTakeHold1', 'Your #1# spell did not take hold#*#', function(_, sp) onFailureEvent('did not take hold', sp) end)
 mq.event('TriuneNoTakeHold2', '#*#Your spell did not take hold#*#', function() onFailureEvent('did not take hold') end)
 mq.event('TriuneNoTakeHold3', '#*#Your spell would not have taken hold#*#', function() onFailureEvent('did not take hold') end)
-mq.event('TriuneImmuneSpell1', 'Your target is immune to #1#', function(_, sp) onFailureEvent('target immune', sp) end)
+-- #1# here is a phrase ("changes in its attack speed", "snare spells"), not a spell name
+mq.event('TriuneImmuneSpell1', 'Your target is immune to #*#', function() onFailureEvent('target immune') end)
 mq.event('TriuneImmuneSpell2', '#*#Your target cannot be mezzed#*#', function() onFailureEvent('target immune') end)
 mq.event('TriuneDeadTargetSpell', '#*#dead target#*#', function() onFailureEvent('dead target') end)
 mq.event('TriuneCantCast', '#*#cast spells while#*#', function() onFailureEvent('cannot cast') end)
@@ -18263,8 +18739,8 @@ end
 function runtime.aaGroupBusy(name, a)
     local grp = a and a.excl
     if not grp or grp == '' or grp == '-' then return false end
-    for rawName, other in pairs(loadout.aas or {}) do
-        local oname = type(rawName) == 'string' and rawName:match('^%s*(.-)%s*$') or rawName
+    for _, e in ipairs(runtime.sortedAAEntries()) do -- names pre-trimmed there
+        local oname, other = e.name, e.entry
         if oname ~= name and type(other) == 'table' and other.enabled and other.excl == grp then
             if runtime.isAAEffectActive(oname) then return true end
         end
@@ -18303,18 +18779,36 @@ function runtime.aaTabOrder()
 end
 
 -- loadout.aas as a list sorted the way the AAs tab shows them (names not in
--- the data file sort last, alphabetically).
+-- the data file sort last, alphabetically), names trimmed. Cached: it was
+-- rebuilt and re-sorted every tick (and per grouped AA via aaGroupBusy). The
+-- cache is revalidated with one allocation-free walk -- same loadout.aas
+-- table, same tab order, same key -> entry set -- so adding, removing or
+-- replacing an AA (or a loadout/class switch) rebuilds it. Callers must not
+-- modify the returned list.
 function runtime.sortedAAEntries()
+    local aas = loadout.aas or {}
     local order = runtime.aaTabOrder()
-    local list = {}
-    for rawName, a in pairs(loadout.aas or {}) do
+    local c = runtime.sortedAACache
+    if c and c.aas == aas and c.order == order then
+        local n, same = 0, true
+        for rawName, a in pairs(aas) do
+            n = n + 1
+            if c.byRaw[rawName] ~= a then same = false; break end
+        end
+        if same and n == c.n then return c.list end
+    end
+    local list, byRaw, n = {}, {}, 0
+    for rawName, a in pairs(aas) do
         local name = type(rawName) == 'string' and rawName:match('^%s*(.-)%s*$') or rawName
         list[#list + 1] = { name = name, entry = a, ord = order[name] or math.huge }
+        byRaw[rawName] = a
+        n = n + 1
     end
     table.sort(list, function(x, y)
         if x.ord ~= y.ord then return x.ord < y.ord end
         return tostring(x.name) < tostring(y.name)
     end)
+    runtime.sortedAACache = { aas = aas, order = order, byRaw = byRaw, n = n, list = list }
     return list
 end
 
@@ -18771,7 +19265,17 @@ function runtime.processHealPriority()
                                         local curMana = tonumber(mq.TLO.Me.CurrentMana() or 0) or 0
                                         local ready = false
                                         pcall(function() ready = mq.TLO.Me.SpellReady(g.spell)() end)
-                                        if ready and curMana >= spMana and hasSpellReagents(g.spell) then
+                                        -- mirror castGem's own refusals (per-gem 1.2s throttle,
+                                        -- duration heal already on the target) so an entry
+                                        -- castGem would reject can't outrank one it would cast
+                                        local throttled = (os.clock() - (tonumber(runtime.lastCast['g' .. actualGem]) or 0)) < 1.2
+                                        local hotUp = false
+                                        if ready and not throttled then
+                                            local dur = 0
+                                            pcall(function() dur = tonumber(sp.Duration()) or 0 end)
+                                            hotUp = (tonumber(dur) or 0) > 0 and buffActive(id, g.spell) and not bardKeepSinging(g)
+                                        end
+                                        if ready and not throttled and not hotUp and curMana >= spMana and hasSpellReagents(g.spell) then
                                             local targetHp = pctHP(id) or 100
                                             eligibleHeals[#eligibleHeals + 1] = {
                                                 type = 'gem',
@@ -18797,8 +19301,8 @@ function runtime.processHealPriority()
 
     -- 2. Scan Activated AAs for Heals
     if loadout.aas then
-        for rawName, a in pairs(loadout.aas) do
-            local name = type(rawName) == 'string' and rawName:match('^%s*(.-)%s*$') or rawName
+        for _, e in ipairs(runtime.sortedAAEntries()) do -- cached, names pre-trimmed
+            local name, a = e.name, e.entry
             if a.enabled and runtime.isHealAction(name, a.target, a) then
                 local aPct = tonumber(a.pct) or 50
                 if aPct > 0 and (not a.burn_only or ctrl.burn) and not runtime.aaGroupBusy(name, a) then
@@ -18938,29 +19442,43 @@ function runtime.processHealPriority()
         return (a.priority or 50) < (b.priority or 50)
     end)
 
-    local best = eligibleHeals[1]
-    if not best then return false end
-
-    -- PRIORITIZE HEALING OVER MOVEMENT:
-    if isSitting() or isDucking() then
-        mq.cmd('/stand')
-        mq.delay(50)
-    end
-
-    if best.cls ~= 'Brd' then
-        runtime.stopMovementForCast(best.cls, best.name)
-    end
-
-    if best.type == 'gem' then
-        return runtime.castGem(best.slot, best.entry, best.targetId)
-    elseif best.type == 'aa' then
-        return runtime.fireAA(best.name, best.entry, best.targetId)
-    elseif best.type == 'action' then
-        return runtime.fireSkill(best.name, best.entry, best.targetId)
-    elseif best.type == 'disc' then
-        return runtime.fireDisc(best.name, best.entry, best.targetId)
-    elseif best.type == 'clickie' then
-        return runtime.useClickie(best.entry, best.targetId)
+    -- Try candidates in priority order until one actually fires: a rejected
+    -- best pick (lockout, target swap failed, ...) must not starve the rest.
+    -- Each fire function stands up and stops movement itself, after its own
+    -- checks. fireAA / useClickie refuse a cast-time effect while moving
+    -- instead of stopping, so only for those (heals over movement) halt
+    -- movement first -- the candidate has already passed every eligibility
+    -- check above.
+    for _, h in ipairs(eligibleHeals) do
+        local fired = false
+        if h.type == 'gem' then
+            fired = runtime.castGem(h.slot, h.entry, h.targetId)
+        elseif h.type == 'aa' or h.type == 'clickie' then
+            if h.cls ~= 'Brd' then
+                local castMs = 0
+                pcall(function()
+                    if h.type == 'aa' then
+                        castMs = tonumber(mq.TLO.Me.AltAbility(h.name).Spell.CastTime() or 0) or 0
+                    else
+                        local fi = mq.TLO.FindItem('=' .. h.entry.name)
+                        if not fi() then fi = mq.TLO.FindItem(h.entry.name) end
+                        castMs = tonumber(fi.CastTime() or 0) or 0
+                    end
+                end)
+                if (tonumber(castMs) or 0) > 0 then runtime.stopMovementForCast(h.cls, h.name) end
+            end
+            if h.type == 'aa' then
+                fired = runtime.fireAA(h.name, h.entry, h.targetId)
+            else
+                fired = runtime.useClickie(h.entry, h.targetId)
+            end
+        elseif h.type == 'action' then
+            fired = runtime.fireSkill(h.name, h.entry, h.targetId)
+        elseif h.type == 'disc' then
+            fired = runtime.fireDisc(h.name, h.entry, h.targetId)
+        end
+        if fired then return true end
+        if isCasting() then return false end -- something started anyway; don't stack another
     end
 
     return false
@@ -19171,7 +19689,12 @@ function runtime.recordStuckHazard(x, y, z, zs)
         print(string.format('\ay[Triune]\ax Logged new navigation hazard hotspot in %s at (Y:%.1f, X:%.1f, Z:%.1f)',
             zs, y, x, z))
     end
-    runtime.saveLoadout(true)
+    -- debounced: the main loop's autosave writes it ~1.5s later (a stuck
+    -- streak used to rewrite the whole loadout file on every event)
+    if not runtime.autoDirty then
+        runtime.autoDirty = true
+        runtime.autoDirtyAt = os.clock()
+    end
 end
 
 function runtime.clearZoneHazards(zs)
@@ -19612,11 +20135,23 @@ function runtime.tryOffMeshRecovery(id, targetDist)
     return false
 end
 
+-- XTarget pick / chase radius. Puller (Hunt) widens it to at least the scan
+-- radius (see combatTick's Hunt branch) unless ignore_distant_xtargets opts
+-- out; moveToward must use the same limit or it refuses to close on an
+-- XTarget the Hunt picker just chose.
+function runtime.huntXtarMaxDist()
+    local base = (ctrl and ctrl.xtar_nav_dist) or 150
+    if not ctrl or ctrl.mode ~= 'Puller' or ctrl.submode == 'Camp' or ctrl.ignore_distant_xtargets then return base end
+    local hasWps = (ctrl.waypoints and #ctrl.waypoints > 0 and ctrl.use_waypoints ~= false)
+    local maxScan = hasWps and (ctrl.waypoint_scan_radius or 100) or (ctrl.hunter_radius or 1500)
+    return math.max(base, maxScan)
+end
+
 function runtime.moveToward(id, dist, followOnly)
     local NAV_CONST = pursuit.NAV_CONST
     if not id or id <= 0 then return false end
     local d = distToId(id)
-    local maxNav = (ctrl and ctrl.xtar_nav_dist) or 150
+    local maxNav = runtime.huntXtarMaxDist()
     if isXTargetId(id) and d > maxNav then
         stopMoving()
         return false
@@ -19972,12 +20507,18 @@ local function handleCantHitFromHere()
     end
 end
 
-mq.event('TriuneTooFar1', '#*#too far away#*#', function() repositionCloser() end)
-mq.event('TriuneTooFar2', '#*#get closer#*#', function() repositionCloser() end)
-mq.event('TriuneTooFar3', '#*#cannot reach#*#', function() repositionCloser() end)
-mq.event('TriuneCantHit1', '#*#cannot hit#*#from here#*#', function() handleCantHitFromHere() end)
-mq.event('TriuneCantHit2', '#*#can\'t hit#*#from here#*#', function() handleCantHitFromHere() end)
-mq.event('TriuneCantHit3', '#*#not in line of sight#*#', function() handleCantHitFromHere() end)
+-- All anchored to the start of the system message: unanchored '#*#too far
+-- away#*#' etc. also fired on player and pet chat ("Name tells you, 'I beg
+-- forgiveness, Master. That target is too far away.'").
+mq.event('TriuneTooFar1', 'Your target is too far away#*#', function() repositionCloser() end)
+mq.event('TriuneTooFar1b', 'You are too far away#*#', function() repositionCloser() end)
+mq.event('TriuneTooFar2', 'Your target is out of range, get closer#*#', function() repositionCloser() end)
+mq.event('TriuneTooFar3', 'You cannot reach#*#', function() repositionCloser() end)
+mq.event('TriuneTooFar3b', 'You can\'t reach#*#', function() repositionCloser() end)
+mq.event('TriuneCantHit1', 'You cannot hit #*#from here#*#', function() handleCantHitFromHere() end)
+mq.event('TriuneCantHit2', 'You can\'t hit #*#from here#*#', function() handleCantHitFromHere() end)
+mq.event('TriuneCantHit3', 'Your target is not in line of sight#*#', function() handleCantHitFromHere() end)
+mq.event('TriuneCantHit3b', 'You are not in line of sight#*#', function() handleCantHitFromHere() end)
 
 -- Server-custom attack-mode toggle feedback ("#attackmode ranged"/"melee").
 -- This is the only reliable signal we have for which mode we're actually in
@@ -21889,8 +22430,6 @@ function runtime.checkPullHpRest()
         if not inCombatOrXtar and myHp < minHp then
             runtime.pullHpRest = true
             stopMoving()
-            if mq.TLO.Navigation.Active() then mq.cmd('/nav stop') end
-            if mq.TLO.Stick.Active() then mq.cmd('/stick off') end
             pursuit.wanderLoc = nil
             if runtime.pullState == 'TO_MOB' then
                 runtime.pullState = 'IDLE'
@@ -21920,8 +22459,6 @@ function runtime.checkPullHpRest()
             else
                 -- Still resting
                 stopMoving()
-                if mq.TLO.Navigation.Active() then mq.cmd('/nav stop') end
-                if mq.TLO.Stick.Active() then mq.cmd('/stick off') end
                 pursuit.wanderLoc = nil
                 local t = mq.TLO.Target
                 if t() and not isXTargetId(t.ID()) then
@@ -22292,7 +22829,9 @@ function runtime.checkAggroSwitch()
         end)
     end
 
-    for i = 1, 13 do
+    local xtSlots = 13
+    pcall(function() xtSlots = tonumber(mq.TLO.Me.XTargetSlots()) or 13 end)
+    for i = 1, xtSlots do
         local xt = mq.TLO.Me.XTarget(i)
         if xt() and (xt.ID() or 0) > 0 and xt.ID() ~= curId and (xt.Type() == 'NPC' or xt.Type() == 'Pet') and not isUnreachable(xt.ID())
             and not isGroupOrRaidMember(xt.ID()) and not isSpawnPetOrPlayer(xt.ID()) and isHostileTarget(xt.ID())
@@ -22981,6 +23520,10 @@ local function combatTick()
         if not castTracker.failed then
             castTracker.recordSuccess(castTracker.activeSpell or castTracker.lastSpell, castTracker.activeTargetId)
         end
+        -- kept for failure messages that arrive just after the cast ends
+        castTracker.lastTargetId   = castTracker.activeTargetId
+        castTracker.lastKind       = castTracker.activeKind
+        castTracker.lastEndAt      = os.clock()
         castTracker.activeSpell    = nil
         castTracker.activeTargetId = nil
         castTracker.activeKind     = nil
@@ -23202,8 +23745,7 @@ local function combatTick()
             -- ignore_distant_xtargets opts out of that widening: XTargets beyond the raw
             -- chase range are skipped entirely so Puller looks for a different mob instead
             -- of trying to close a long distance.
-            local maxHuntXtarDist = ctrl.ignore_distant_xtargets and (ctrl.xtar_nav_dist or 150)
-                or math.max(ctrl.xtar_nav_dist or 150, maxScan)
+            local maxHuntXtarDist = runtime.huntXtarMaxDist() -- same limit moveToward enforces
             local maxHuntXtarZ = math.max(maxHuntZ, 75) + 25
 
             if haveNPC then
@@ -23917,7 +24459,12 @@ local function combatTick()
             local xtOk = (numXtar >= minXt) or (not isDet and minXt <= 1)
             if a.enabled and (aPct > 0) and (not a.burn_only or ctrl.burn) and xtOk and not runtime.aaGroupBusy(name, a) then
                 local id = resolveTargetId(a.target, a.cls, a.when, name, aPct, a)
-                if id and conditionMet(a.when, aPct, name, id, a.cls, a.target) then
+                local bossOk = true
+                if id and a.boss_only then
+                    local bs = mq.TLO.Spawn(id)
+                    bossOk = not not (bs() and bs.Named())
+                end
+                if id and bossOk and conditionMet(a.when, aPct, name, id, a.cls, a.target, a) then
                     if not isDet or (isHostileTarget(id) and isTargetInRange(name, id)) then
                         fireAA(name, a, id)
                     end
@@ -23974,7 +24521,7 @@ local function combatTick()
                 local xtOk = (numXtar >= minXt) or (not isDet and minXt <= 1)
                 if (actPct > 0) and (not act.burn_only or ctrl.burn) and xtOk then
                     local id = resolveTargetId(act.target, act.cls, act.when, name, actPct, act)
-                    if id and conditionMet(act.when, actPct, name, id, act.cls, act.target) then
+                    if id and conditionMet(act.when, actPct, name, id, act.cls, act.target, act) then
                         local bossOk = true
                         if act.boss_only then
                             local s = mq.TLO.Spawn(id)
@@ -24014,7 +24561,7 @@ local function combatTick()
             local xtOk = (numXtar >= minXt) or (not isDet and minXt <= 1)
             if d.enabled and (dPct > 0) and (not d.burn_only or ctrl.burn) and xtOk then
                 local id = resolveTargetId(d.target, d.cls, d.when, name, dPct, d)
-                if id and conditionMet(d.when, dPct, name, id, d.cls, d.target) then
+                if id and conditionMet(d.when, dPct, name, id, d.cls, d.target, d) then
                     local bossOk = true
                     if d.boss_only then
                         local s = mq.TLO.Spawn(id)
@@ -24077,14 +24624,14 @@ local function combatTick()
                 local id = resolveTargetId(c.target, 'ALL', c.when, effName, cPct, c)
                 local lockedOut = id and castTracker.isLockedOut(effName, id, c.kind)
                 if not lockedOut then
-                    local condOk = id and conditionMet(c.when, cPct, effName, id, 'ALL', c.target)
+                    local condOk = id and conditionMet(c.when, cPct, effName, id, 'ALL', c.target, c)
                     if condOk then
                         local targetValid = (id == mq.TLO.Me.ID()) or (not isDet and runtime.isTargetInRange(effName, id)) or (isDet and isHostileTarget(id) and isTargetInRange(effName, id))
                         if targetValid and runtime.useClickie(c, id) then
                             if c.when == 'missing buff' and c.spell and c.spell ~= '' then
                                 local bene = false
                                 pcall(function() bene = mq.TLO.Spell(c.spell).Beneficial() end)
-                                if bene then runtime.sungBuffs[sungKey(c.spell, id)] = true end
+                                if bene then markSung(sungKey(c.spell, id), 'ALL') end
                             end
                             break
                         end
@@ -24138,6 +24685,10 @@ local function combatTick()
                         if isEnabled and burnOk and xtOk then
                             local id = resolveTargetId(g.target, g.cls, g.when, g.spell, pctVal, g)
                             local lockedOut = id and castTracker and castTracker.isLockedOut(g.spell, id, g.kind)
+                            if id and g.boss_only then
+                                local bs = mq.TLO.Spawn(id)
+                                if not (bs() and bs.Named()) then lockedOut = true end
+                            end
                             local condOk = false
                             if not lockedOut then
                                 condOk = not not (id and conditionMet(g.when, pctVal, g.spell, id, g.cls, g.target, g))
@@ -25180,6 +25731,24 @@ local function ensureLuaTurbo()
     end
 end
 
+-- Main-loop step guard: one failing step (an event handler, the zone-change
+-- block, a mem, the autosave) is logged and skipped instead of killing the
+-- script; same idea as the combatTick pcall. Chat output is throttled per step
+-- so an error that repeats every pass doesn't flood the window.
+function runtime.loopStep(label, fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok then
+        runtime.loopStepErrAt = runtime.loopStepErrAt or {}
+        local nowE = os.clock()
+        if (nowE - (runtime.loopStepErrAt[label] or -1000)) >= 5.0 then
+            runtime.loopStepErrAt[label] = nowE
+            print('\ar[Triune error]\ax ' .. label .. ' failed: ' .. tostring(err))
+        end
+        pcall(tlog.error, 'loop', '%s failed: %s', label, tostring(err))
+    end
+    return ok
+end
+
 local function runMainLoop()
     ensureLuaTurbo()
     while open do
@@ -25193,13 +25762,21 @@ local function runMainLoop()
         -- the per-plugin timers say which part.
         local passT0 = os.clock()
         local evT0 = passT0
-        mq.doevents()
+        runtime.loopStep('doevents', mq.doevents)
         runtime.doeventsMs = (os.clock() - evT0) * 1000
+        runtime.loopStep('character change', function()
         local nm = mq.TLO.Me.CleanName()
         if nm and nm ~= '' and nm ~= myName then
+            -- Flush the outgoing character's pending (debounced / not yet
+            -- detected) changes to ITS file before myName moves on.
+            if myName and (runtime.autoDirty or (runtime.lastSig and loadoutSig() ~= runtime.lastSig)) then
+                runtime.autoDirty = false
+                runtime.saveLoadout(true, true)
+            end
             myName = nm
             runtime.loadAll()
             runtime.onCharacterChanged()
+            runtime.waypointsZone = nil -- new ctrl: reload this zone's route below
             if runtime.pluginManager and runtime.pluginManager.restartAll then
                 runtime.pluginManager.restartAll() -- ctrl was replaced: re-seed plugin defaults + flags
             end
@@ -25212,7 +25789,15 @@ local function runMainLoop()
                 runtime.applyFov()
             end
         end
+        end)
+        runtime.loopStep('zone change', function()
         local curZone = mq.TLO.Zone.ShortName()
+        -- Live waypoint route not (yet) this zone's -- first detection at
+        -- startup, a character switch, or a zone change onZoned's debounce
+        -- skipped: load this zone's saved route (or clear the stale one).
+        if curZone and curZone ~= '' and runtime.waypointsZone ~= curZone then
+            runtime.loadZoneWaypoints(curZone)
+        end
         if curZone and curZone ~= '' and curZone ~= runtime.lastZoneShort then
             local prevZone = runtime.lastZoneShort
             runtime.lastZoneShort = curZone
@@ -25229,6 +25814,7 @@ local function runMainLoop()
                 print(string.format('\ar[Triune WARNING]\ax No NavMesh loaded for zone "%s"! Pathing and navigation require a valid zone mesh.', curZone))
             end
         end
+        end)
         if reDetectRequested then
             reDetectRequested = false
             local detected = detectClasses(true) -- safe here -- main loop coroutine can yield/delay
@@ -25239,7 +25825,7 @@ local function runMainLoop()
             runtime.pendingCursorClearAt = nil
             clearCursor()
         end
-        if runtime.pendingBardSong then runtime.tickPendingBardSong() end
+        if runtime.pendingBardSong then runtime.loopStep('tickPendingBardSong', runtime.tickPendingBardSong) end
         if runtime.pendingFovAt and os.clock() >= runtime.pendingFovAt then
             runtime.pendingFovAt = nil
             if ctrl.fov_enabled and runtime.applyFov then
@@ -25267,7 +25853,7 @@ local function runMainLoop()
                 runtime.pendingMem[slot] = nil
                 -- Memorizing can block outside combatTick; suspend patrol time.
                 if runtime.wpPatrol then runtime.wpPatrol.eligible = false end
-                runtime.tryMem(slot, name) -- verifies + reports; blocks briefly while it lands
+                runtime.loopStep('tryMem', runtime.tryMem, slot, name) -- verifies + reports; blocks briefly while it lands
                 memmed = true
             end
         end
@@ -25329,6 +25915,7 @@ local function runMainLoop()
         -- auto-save: persist the loadout ~1.5s after any change (no Save click needed).
         -- loadoutSig() walks every gem/AA/disc/action and all ~250 ctrl keys, so only
         -- re-check it once a second; the save itself is debounced 1.5s anyway.
+        runtime.loopStep('autosave', function()
         local nowClk = os.clock()
         if (nowClk - (runtime.lastSigCheckAt or 0)) >= 1.0 then
             runtime.lastSigCheckAt = nowClk
@@ -25337,9 +25924,11 @@ local function runMainLoop()
                 runtime.lastSig = sig; runtime.autoDirty = true; runtime.autoDirtyAt = nowClk
             end
         end
-        if runtime.autoDirty and (os.clock() - runtime.autoDirtyAt) > 1.5 then
-            runtime.saveLoadout(true, true); runtime.autoDirty = false
+        if runtime.autoDirty and (os.clock() - (runtime.autoDirtyAt or 0)) > 1.5 then
+            runtime.autoDirty = false -- cleared first: a failing save must not retry every pass
+            runtime.saveLoadout(true, true)
         end
+        end)
 
         local passMs = (os.clock() - passT0) * 1000
         runtime.loopPassMs = passMs

@@ -439,22 +439,32 @@ local function isPetActor(actorStr)
     local cleanActor = actorStr:gsub("%W", ""):lower()
     
     -- Matches "Your pet" / "your pet"
-    if cleanActor == 'yourpet' or cleanActor:find('yourpet') or actorStr:sub(1,8):lower() == 'your pet' then
+    if cleanActor == 'yourpet' or actorStr:sub(1,8):lower() == 'your pet' then
         return true
     end
     
-    -- Check Active Pet Clean Name (cached Pet.CleanName; the old second
-    -- Pet.ID / Pet.CleanName round-trip could only match what this already did)
+    -- Exact match on the active pet's CleanName (cached Pet.CleanName). Only an
+    -- exact name: other players' pets / mobs that merely contain or end in
+    -- "pet", "animated" or "corpse" are not ours.
     local pName = getPetName()
     if pName and pName ~= '' and pName ~= 'NULL' then
         local cleanPName = pName:gsub("%W", ""):lower()
-        if cleanPName ~= '' and (cleanActor == cleanPName or cleanActor:find(cleanPName, 1, true)) then
+        if cleanPName ~= '' and cleanActor == cleanPName then
             return true
         end
     end
     
-    -- Matches swarm pets / generic pet suffixes (e.g. "...'s pet" or "... pet") or Animated Corpse
-    if cleanActor:sub(-3) == 'pet' or cleanActor:find('corpse') or cleanActor:find('animated') then
+    -- Our own swarm pets ("Gennro`s pet" / "Gennro's warder")
+    local myName = getMyPlayerName()
+    if myName ~= '' then
+        local poss = actorStr:lower():match("^(.-)[`']s%s")
+        if poss and poss:gsub("%W", "") == myName:gsub("%W", ""):lower() then
+            return true
+        end
+    end
+    
+    -- A pet already credited to us this fight (seen earlier with "(Owner: <me>)")
+    if rt.petBreakdown and rt.petBreakdown[cleanLine(actorStr)] then
         return true
     end
     
@@ -717,20 +727,24 @@ end
 -- ----------------------------------------------------------------------------
 function isGroupMember(name)
     if not name or name == '' then return false end
-    local bn = core and rawget(core, 'boxnet')
-    if type(bn) == 'table' and type(bn.isGroupMember) == 'function' then
-        local okBn, v = pcall(bn.isGroupMember, name)
-        if okBn then return v == true end
-    end
+    -- Own bounded cache first: mob names flow through here too (isFriendlyTarget)
     local key = tostring(name):lower()
     local now = nowMs()
     local c = lookups.group[key]
     if c and (now - c.at) < LOOKUP_TTL_MS then return c.v end
-    local ok, isMember = pcall(function()
-        local m = mq.TLO.Group.Member(name)
-        return m ~= nil and m() ~= nil and (m.ID() or 0) > 0
-    end)
-    local v = ok and isMember == true
+    local v
+    local bn = core and rawget(core, 'boxnet')
+    if type(bn) == 'table' and type(bn.isGroupMember) == 'function' then
+        local okBn, bv = pcall(bn.isGroupMember, name)
+        if okBn then v = (bv == true) end
+    end
+    if v == nil then
+        local ok, isMember = pcall(function()
+            local m = mq.TLO.Group.Member(name)
+            return m ~= nil and m() ~= nil and (m.ID() or 0) > 0
+        end)
+        v = ok and isMember == true
+    end
     if not c then
         -- Mob names flow through here too (isFriendlyTarget): keep it bounded.
         if lookups.groupN >= GROUP_CACHE_MAX then lookups.group, lookups.groupN = {}, 0 end
@@ -855,7 +869,7 @@ local function drawMeterTable(rows, summary, tableId, detailed, barH)
         if ImGui.IsItemHovered() then
             local split = (r.petDmg or 0) > 0 and string.format('\nPlayer %s / Pet %s', fmtNum(r.playerDmg), fmtNum(r.petDmg)) or ''
             local state = r.live and 'fighting' or (summary.live and 'idle' or ('last fight' .. (r.at and (' at ' .. r.at) or '')))
-            ImGui.SetTooltip(string.format('%s - %s\n%s damage over %.0fs%s%s', tostring(r.name), state, fmtNum(r.dmg), r.dur or 0,
+            ImGui.SetTooltip('%s', string.format('%s - %s\n%s damage over %.0fs%s%s', tostring(r.name), state, fmtNum(r.dmg), r.dur or 0,
                 r.target and ('\nTarget: ' .. tostring(r.target)) or '', split))
         end
         ImGui.TableSetColumnIndex(1)
@@ -994,6 +1008,15 @@ end
 -- 1. Unified Melee & Special Skill Hit Handler: "#1# for #2#" or "#1# for #2# points of damage#3#"
 local function onUnifiedMeleeHit(line, sentenceRaw, dmgStrRaw, extraRaw)
     if cfg.paused then return end
+    
+    -- The catch-all also matches chat ("Bob says, 'kicked a mob for 500'"):
+    -- drop say/tell/shout/auction/channel lines before parsing them as damage.
+    local lowerLine = tostring(line or ''):lower()
+    if lowerLine:find(" says,", 1, true) or lowerLine:find(" says out", 1, true)
+       or lowerLine:find(" tells ", 1, true) or lowerLine:find(" shouts,", 1, true)
+       or lowerLine:find(" auctions,", 1, true) or lowerLine:find(", '", 1, true) then
+        return
+    end
     
     -- Filter out non-melee spell lines. With the 2-capture catch-all '#1# for #2#'
     -- the "points of non-melee damage" text lands in #2# (dmgStrRaw), so check
@@ -1270,21 +1293,9 @@ local function onMobSlain(line, targetRaw)
     end
 end
 
--- 8. Mob Damaged by DS / Environmental Non-Melee
-local function onMobHitByNonMelee(line, mobRaw, dmgStrRaw, extraRaw)
-    if cfg.paused then return end
-    local mob = cleanLine(mobRaw)
-    if isValidMobName(mob) then
-        local dmg = parseDamageValue(dmgStrRaw)
-        if dmg then
-            startFightIfNeeded(mob)
-            rt.playerHits = rt.playerHits + 1
-            rt.playerDamage = rt.playerDamage + dmg
-            rt.totalDamage = rt.totalDamage + dmg
-            recordHit(rt.playerBreakdown, 'Damage Shield / Non-Melee', dmg, false, false, false, 'Proc/DS')
-        end
-    end
-end
+-- 8. "#1# was hit by non-melee for N" is intentionally NOT parsed: EQ prints it
+-- for other players' damage shields and nukes too, so it cannot be credited to
+-- us. Our own damage shield is counted by the "is <verb> by your" DS events.
 
 -- Register Event Listeners
 local registeredEvents = {}
@@ -1323,12 +1334,13 @@ local function registerEvents()
     -- Spell / Non-Melee Patterns (Plural & Singular)
     regEvent('DPS_SpellHitPlural', '#1# hit #2# for #3# points of non-melee damage#4#', onUnifiedSpellHit)
     regEvent('DPS_SpellHitSingular', '#1# hit #2# for #3# point of non-melee damage#4#', onUnifiedSpellHit)
-    regEvent('DPS_ProcHitPlural', '#1# is struck by #2# for #3# points of damage#4#', onUnifiedSpellHit)
-    regEvent('DPS_ProcHitSingular', '#1# is struck by #2# for #3# point of damage#4#', onUnifiedSpellHit)
-    
-    -- Non-Melee DS / Environmental Patterns
-    regEvent('DPS_MobNonMeleePlural', '#1# was hit by non-melee for #2# points of damage#3#', onMobHitByNonMelee)
-    regEvent('DPS_MobNonMeleeSingular', '#1# was hit by non-melee for #2# point of damage#3#', onMobHitByNonMelee)
+    -- Proc lines name the victim first ("<mob> is struck by <source> ..."):
+    -- swap so onUnifiedSpellHit gets (actor = source, target = victim).
+    local function onProcHit(line, victimRaw, sourceRaw, dmgStrRaw, extraRaw)
+        onUnifiedSpellHit(line, sourceRaw, victimRaw, dmgStrRaw, extraRaw)
+    end
+    regEvent('DPS_ProcHitPlural', '#1# is struck by #2# for #3# points of damage#4#', onProcHit)
+    regEvent('DPS_ProcHitSingular', '#1# is struck by #2# for #3# point of damage#4#', onProcHit)
     
     -- DoT Patterns (DoT3 also fires for the DoT1/DoT2 lines; onPlayerDoTHit
     -- ignores the non-numeric "50 points of" capture so each tick counts once)
@@ -1874,7 +1886,7 @@ local function drawMiniDpsGui()
                 ImGui.ProgressBar(pFrac, MINI_WIDTH, 15, splitText)
             end
             if ImGui.IsItemHovered() then
-                ImGui.SetTooltip(string.format('Player %s damage / Pet %s damage', fmtNum(rt.playerDamage), fmtNum(rt.petDamage)))
+                ImGui.SetTooltip('%s', string.format('Player %s damage / Pet %s damage', fmtNum(rt.playerDamage), fmtNum(rt.petDamage)))
             end
         end
 
@@ -1902,11 +1914,11 @@ local function drawMiniDpsGui()
         if ImGui.IsItemHovered() then ImGui.SetTooltip('Clear the current fight') end
         ImGui.SameLine()
         if ImGui.SmallButton('Report##MiniReportBtn') then reportDPS() end
-        if ImGui.IsItemHovered() then ImGui.SetTooltip('Report your parse to /' .. tostring(cfg.reportChannel or 'group')) end
+        if ImGui.IsItemHovered() then ImGui.SetTooltip('%s', 'Report your parse to /' .. tostring(cfg.reportChannel or 'group')) end
         if cfg.compactGroup and boxnet() then
             ImGui.SameLine()
             if ImGui.SmallButton('Group##MiniGroupRptBtn') then reportGroupDPS() end
-            if ImGui.IsItemHovered() then ImGui.SetTooltip('Report the group meter to /' .. tostring(cfg.reportChannel or 'group')) end
+            if ImGui.IsItemHovered() then ImGui.SetTooltip('%s', 'Report the group meter to /' .. tostring(cfg.reportChannel or 'group')) end
         end
         ImGui.SameLine()
         if ImGui.SmallButton('Full##MiniFullBtn') then
@@ -2206,7 +2218,7 @@ local function drawDpsGui()
                     end
                     ImGui.SameLine()
                     if ImGui.SmallButton('Report Group##MainGroupRpt') then reportGroupDPS() end
-                    if ImGui.IsItemHovered() then ImGui.SetTooltip('Report the meter to /' .. tostring(cfg.reportChannel or 'group')) end
+                    if ImGui.IsItemHovered() then ImGui.SetTooltip('%s', 'Report the meter to /' .. tostring(cfg.reportChannel or 'group')) end
                     ImGui.Spacing()
                     if #rows <= 1 then
                         ImGui.TextDisabled(cfg.meterScope == 'group'
@@ -2249,7 +2261,8 @@ local function drawDpsGui()
                 if ImGui.BeginCombo("Default Report Channel", channels[currentIdx]) then
                     for idx, ch in ipairs(channels) do
                         local isSel = (idx == currentIdx)
-                        if ImGui.Selectable(ch, isSel) then
+                        local _, chPressed = ImGui.Selectable(ch, isSel)
+                        if chPressed then
                             cfg.reportChannel = ch
                             changed = true
                         end
@@ -2273,8 +2286,10 @@ local function drawDpsGui()
                 ImGui.TextColored(GOLD[1], GOLD[2], GOLD[3], GOLD[4], "Group Meter (Box Network)")
                 local scopeLabel = cfg.meterScope == 'all' and 'All Boxes' or 'Group Members'
                 if ImGui.BeginCombo("Meter Scope", scopeLabel) then
-                    if ImGui.Selectable('Group Members', cfg.meterScope ~= 'all') then cfg.meterScope = 'group'; changed = true end
-                    if ImGui.Selectable('All Boxes', cfg.meterScope == 'all') then cfg.meterScope = 'all'; changed = true end
+                    local _, grpPressed = ImGui.Selectable('Group Members', cfg.meterScope ~= 'all')
+                    if grpPressed then cfg.meterScope = 'group'; changed = true end
+                    local _, allPressed = ImGui.Selectable('All Boxes', cfg.meterScope == 'all')
+                    if allPressed then cfg.meterScope = 'all'; changed = true end
                     ImGui.EndCombo()
                 end
                 if ImGui.IsItemHovered() then

@@ -1,9 +1,23 @@
 name: CI
 
 on:
+  # Pushes to main plus every pull request (a PR branch is checked once via
+  # its pull_request event instead of twice via push + pull_request).
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+  # Called by release.yml so a release is only published from a tree that
+  # passes the same checks. `ref` is the tag being released.
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref to check out (defaults to the triggering ref)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
   lua-syntax:
@@ -11,6 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install Lua and LuaJIT
         run: sudo apt-get update && sudo apt-get install -y luajit lua5.1
@@ -38,6 +54,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Extract versions
         id: ver
@@ -61,6 +79,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install Luacheck
         run: |
@@ -75,6 +95,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Install Lua and LuaJIT
         run: sudo apt-get update && sudo apt-get install -y luajit lua5.1
@@ -87,6 +109,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Check satellite theme drift
         run: bash tests/check_theme_consistency.sh

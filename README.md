@@ -81,6 +81,7 @@ Everything below is built in. Open them from the buttons on the main window's he
 | Buffbot | `/ac buffbot on` | A buff station: players `/tell` you for buffs, it casts them. Off unless you turn it on. |
 | Cursor Manager | `/ac cursorui` | Clears whatever is stuck on your cursor. |
 | Parcels | `/ac parcels` | Tells you when parcels arrive and collects them all at a parcel merchant. |
+| GM Commands | `/ac gm` | Reference and runner for the server's `#` GM commands: search every command, fill in its arguments, run it, keep favourites; `/ac gm zone poknowledge` runs one from a hot button. Off unless you turn it on, and only useful with GM status. |
 | Floating damage | Settings -> Plugins | Big animated numbers for crits. |
 | Update Checker | `/ac update` | Tells you when a newer Triune release is out. Nothing is downloaded. |
 | Compact Mini HUD | `/ac compact` | The whole bot shrunk to a small strip. |
@@ -157,6 +158,6 @@ A plugin is one Lua file in `lua/tac/` that returns a table with an `id`, a `nam
 
 ## Version
 
-Current version: **3.1**
+Current version: **3.2**
 
 See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
