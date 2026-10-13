@@ -142,5 +142,5 @@ yours, so the cleanup rule above never applies to it.**
 
 `dev` has: the API version and capability check, spell record revisions with `core.spellRecord` / `core.reportSpellEnded` /
 `onSpellRecordChanged`, counted hook failures with registration sweeps on fatal errors, per-server config, four-class support, and the target
-selector registry. Not built yet (see `docs/HOOKS.md` section 10): `priority` ordering for `onCommand` / `onBetweenPulls`, `core.plugins`,
-the full manifest, deprecation warnings, the contract, leak and write-ratchet tests, and moving the mez plugin onto `reportSpellEnded`.
+selector registry, `core.logDir`, and `priority` ordering for `onCommand` / `onBetweenPulls` (with `core.hasCapability('hookPriority')`).
+Not built yet (see `docs/HOOKS.md` section 10): `core.plugins`, the full manifest, deprecation warnings, the contract, leak and write-ratchet tests, and moving the mez plugin onto `reportSpellEnded`.

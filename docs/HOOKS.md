@@ -125,8 +125,8 @@ Three hooks are dispatched with `firstTrue = true`:
 | Hook | Combine rule today | What a `true` means |
 |---|---|---|
 | `wantsCombatHold()` | first truthy wins | the combat loop should stand still (`runtime.combatHold()`) |
-| `onBetweenPulls()` | first truthy wins | the plugin started something; the puller should yield this tick |
-| `onCommand(cmd, args)` | first truthy wins | the plugin handled the `/ac <cmd>` fallthrough |
+| `onBetweenPulls()` | first truthy wins, in `priority` order | the plugin started something; the puller should yield this tick |
+| `onCommand(cmd, args)` | first truthy wins, in `priority` order | the plugin handled the `/ac <cmd>` fallthrough |
 
 The target selector registry (section 3.3) is a fourth kind: exactly one resolver per name.
 
@@ -149,7 +149,32 @@ the second (as the registry refuses a name collision) or takes an explicit prior
   plugin manifest (a number, higher first, default 0). **Tie rule:** equal priorities are ordered by plugin id,
   alphabetically, so the result is stable and documented. Load order is not used. Distinctive command names still help,
   but they do not resolve two plugins that both claim a command or both answer `onBetweenPulls`; priority does.
-  (Today the order is load order, `pm.pluginOrder`.)
+  **[CURRENT]** Implemented (docs/decision_log.md DL-003). Details:
+  - A plugin declares `priority = <number>` on the table its file returns. It must be a **finite Lua number**: negatives
+    and fractions are fine, there is no range limit, and integers are recommended. A missing `priority` is 0. Anything
+    else (a string, **including `'10'`**, a table, a boolean, NaN, infinity) counts as 0, the plugin still loads, and core
+    writes one warning to the TAC log for that plugin each time it loads.
+  - Core builds the order each time one of the two hooks runs: the enabled plugins that have the hook, sorted by
+    `priority` (highest first), then by plugin id (plain string comparison). Every other hook, `wantsCombatHold`
+    included, still runs in load order.
+  - `priority` is read when the plugin's file is loaded. Editing the file changes nothing until the plugin is reloaded
+    (the Reload button, or reload all). `restartAll` does not re-read files.
+  - `core.hasCapability('hookPriority')` is true when core honours it. Check it in `onInit` (and that `core.hasCapability`
+    exists at all: V3.2 has neither). An older core runs both hooks in load order and ignores the field.
+  - Do not confuse this with the per-action `priority` (1 to 99) on spell gems, discs and clickies. That one runs
+    **lowest first**. The plugin field runs **highest first**.
+
+  Example. Two plugins both implement `onCommand` and both can handle `/ac mez`:
+
+  ```lua
+  -- tac/mez.lua
+  return { id = 'mez', name = 'Mez', priority = 10, onCommand = function(cmd) return cmd == 'mez' end }
+  -- tac/mezlite.lua
+  return { id = 'mezlite', name = 'Mez Lite', priority = 5, onCommand = function(cmd) return cmd == 'mez' end }
+  ```
+
+  `mez` (10) is asked first and handles the command, so `mezlite` (5) is never called for it. With both at 5, the ids
+  decide: `mez` before `mezlite`. If `mez` returns false, the next plugin is asked.
 - `wantsCombatHold` is **advisory**. A plugin can ask the combat loop to stand still, but it is not a guaranteed safety
   interlock, and plugins must not rely on it as one.
 
@@ -487,7 +512,8 @@ implemented. **Deferred** items are intentionally left until a plugin needs them
 
 ### Still open
 
-- The `priority` field: its name and range, and how it is documented for plugin authors.
+- ~~The `priority` field: its name and range, and how it is documented for plugin authors.~~ Resolved and implemented, see section 3.2
+  and docs/decision_log.md DL-003 (the field is `priority`, a finite number, no range limit; documented in 3.2).
 - The exact `core.plugins` and `core.spellRecord` return shapes.
 - Which hooks count as non-fatal for the three-strikes rule beyond the list in section 4.4.
 - The final argument order of `core.reportSpellEnded` and `onSpellRecordChanged` (including a single table argument
@@ -509,11 +535,11 @@ What exists in the source, and what does not, as of the branch that merged this 
   new, detail)` event with copies for each plugin, fired only after core commits a change.
 - Hook failures counted per plugin and hook (three strikes, reset by a success and by a reload); fatal failures sweep the
   plugin's registrations, including the rollback of a failed `onInit`.
+- `priority` ordering for `onCommand` and `onBetweenPulls` (section 3.2, DL-003): the field, its validation and warning,
+  the order built on each call, the reload behaviour and the `hookPriority` capability. Tests in Suite 120.
 
 **Not implemented yet:**
 
-- The `priority` field and the alphabetical tie rule for `onCommand` and `onBetweenPulls` (section 3.2). Order is still
-  load order.
 - `core.plugins` (`list`, `usedBy`, `state`), and the rest of the manifest (the existing 65 keys, with tiers).
 - Deprecation flags and warnings (section 2.3).
 - The contract test, the write ratchet, and the registry leak test including the real reload path (section 8).
