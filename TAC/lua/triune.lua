@@ -5773,6 +5773,7 @@ runtime.apiManifest = {
     serverTag                = { kind = 'function', tier = 'experimental', since = '1.0' },
     configFilePath           = { kind = 'function', tier = 'experimental', since = '1.0' },
     logDir                   = { kind = 'function', tier = 'experimental', since = '1.0' },
+    hookPriority             = { kind = 'value',    tier = 'experimental', since = '1.0' },
     spellRecord             = { kind = 'function', tier = 'experimental', since = '1.0' },
     reportSpellEnded         = { kind = 'function', tier = 'experimental', since = '1.0' },
     onSpellRecordChanged     = { kind = 'event',    tier = 'experimental', since = '1.0' },
@@ -7453,6 +7454,9 @@ function runtime.initPluginManager()
             -- created when missing; if that cannot be used, the folder TAC logs to today). Check
             -- core.hasCapability('logDir') before calling it.
             logDir                   = function() return tlog.logDir() end,
+            -- true when core orders onCommand and onBetweenPulls by each plugin's `priority` (see
+            -- docs/HOOKS.md 3.2). Check core.hasCapability('hookPriority'); an older core runs them in load order.
+            hookPriority             = true,
             -- API version and capability manifest (docs/HOOKS.md): core.apiVersion is a string,
             -- core.hasCapability(name) says whether this build offers a documented entry.
             apiVersion               = runtime.API_VERSION,
@@ -7874,6 +7878,16 @@ function runtime.initPluginManager()
         return out
     end
 
+    -- A plugin's `priority` (docs/decision_log.md DL-003): a finite Lua number, higher runs first when two
+    -- plugins both answer onCommand or onBetweenPulls. Missing is 0. Anything else (a string, even '10', a
+    -- table, a boolean, NaN, infinity) is 0 with one warning in the TAC log, and the plugin still loads.
+    function pm.readPriority(id, value)
+        if value == nil then return 0 end
+        if type(value) == 'number' and value == value and value ~= math.huge and value ~= -math.huge then return value end
+        tlog.warn('plugins', 'plugin "%s": priority must be a finite number, got %s (%s); using 0', tostring(id), tostring(value), type(value))
+        return 0
+    end
+
     function pm.loadPlugin(filename, fullPath)
         local fn, err = loadfile(fullPath)
         if not fn then
@@ -7919,6 +7933,7 @@ function runtime.initPluginManager()
         p.description = inst.description or ''
         p.uses = pm.normalizeUses(inst.uses)
         p.tickInterval = tonumber(inst.tickInterval) or 0.1
+        p.priority = pm.readPriority(id, inst.priority)
         if not ctrl.plugins then ctrl.plugins = {} end
         local savedCfg = ctrl.plugins[id]
         if savedCfg and savedCfg.runInCombat ~= nil then
@@ -8333,8 +8348,28 @@ function runtime.initPluginManager()
     -- pm.HOOK_STRIKES in a row that hook is switched off for the plugin (see pm.hookFailed), and the
     -- call acts as if the plugin had not answered (the safe default: nothing new happens). `firstTrue` stops at (and
     -- returns) the first truthy result.
-    local function dispatch(hookName, firstTrue, ...)
+    --
+    -- onCommand and onBetweenPulls are claims, so who answers first matters: they run in `priority` order
+    -- (highest first, ties by plugin id), built fresh on every call (docs/decision_log.md DL-003). Every other
+    -- hook runs in load order.
+    local PRIORITY_HOOKS = { onCommand = true, onBetweenPulls = true }
+    local function hookOrder(hookName)
+        if not PRIORITY_HOOKS[hookName] then return pm.pluginOrder end
+        local ids = {}
         for _, id in ipairs(pm.pluginOrder) do
+            local p = pm.plugins[id]
+            if p and p.enabled and p.status ~= 'Error' and p.instance[hookName] and pm.hookEnabled(p, hookName) then ids[#ids + 1] = id end
+        end
+        table.sort(ids, function(a, b)
+            local pa, pb = pm.plugins[a].priority or 0, pm.plugins[b].priority or 0
+            if pa ~= pb then return pa > pb end
+            return a < b
+        end)
+        return ids
+    end
+
+    local function dispatch(hookName, firstTrue, ...)
+        for _, id in ipairs(hookOrder(hookName)) do
             local p = pm.plugins[id]
             if p and p.enabled and p.status ~= 'Error' and p.instance[hookName] and pm.hookEnabled(p, hookName) then
                 local ok, res = xpcall(p.instance[hookName], debug.traceback, ...)

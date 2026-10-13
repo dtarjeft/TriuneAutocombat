@@ -21047,6 +21047,172 @@ do
     assert_true(readme:find('| `Logs/triune_*.log` |', 1, true) == nil and readme:find('your MacroQuest `Logs/` folder', 1, true) == nil, 'Suite 119 R8: the README no longer says the logs are in the flat Logs folder')
 end
 
+-- ---------------------------------------------------------------------------
+-- Suite 120: plugin priority for onCommand and onBetweenPulls. Every expected value cites docs/decision_log.md
+-- DL-003 ("D1".."D4" are its four approved design choices) or docs/HOOKS.md section 3.2.
+-- ---------------------------------------------------------------------------
+do
+    print('--- Suite 120: plugin hook priority ---')
+    local noop = function() end
+    local passthrough = function(_, v) return v end
+    local env = {
+        unregisterTargetSelectorsByOwner = function() return 0 end,
+        ctrl = { plugins = {} },
+        mq = { event = noop, unevent = noop, cmd = noop, cmdf = noop, TLO = {
+            Me = { Combat = function() return false end, CombatState = function() return 'ACTIVE' end, Invited = function() return false end },
+            Target = { ID = function() return 0 end },
+            Window = function() return { Open = function() return false end } end,
+            Spawn = function() return setmetatable({}, { __call = function() return false end }) end,
+        } },
+        ImGui = setmetatable({ Checkbox = passthrough, SliderFloat = passthrough, SliderInt = passthrough, Combo = passthrough,
+            Button = function() return false end, SmallButton = function() return false end, IsItemHovered = function() return false end,
+            BeginTable = function() return false end }, { __index = function() return noop end }),
+        UI = { px = function(n) return n end, accent = noop, setTooltip = noop, pushTheme = noop, popTheme = noop,
+            preBeginWindow = noop, postBeginWindow = noop, drawStatusProgressBar = noop, drawSpellIcon = function() return false end,
+            getConColorRgb = function() return { 1, 1, 1, 1 } end, resolveTargetOfTarget = function() return nil end },
+        VERSION = '3.2', DATA = {}, loadout = {}, scriptDir = './',
+        GOLD = { 1, 1, 1, 1 }, ARC = { 1, 1, 1, 1 }, MUTED = { 1, 1, 1, 1 }, GOOD = { 1, 1, 1, 1 }, WARN = { 1, 1, 1, 1 }, ERR = { 1, 1, 1, 1 },
+        saveLoadout = noop, print = noop,
+        idxOf = function(tbl, val) for i, v in ipairs(tbl) do if v == val then return i end end return 0 end,
+        fmtSec = function(v) return tostring(v) .. 's' end, parseDurationSec = function() return 0 end,
+        cleanSpellName = function(n) return tostring(n or '') end, normalizeSpellName = function(n) return tostring(n or ''):lower() end,
+    }
+    local initPM = loadFunc(src, 'initPluginManager', env)
+    local rt = debug.getfenv(initPM).runtime
+    rt.saveLoadout = env.saveLoadout
+    initPM()
+    local pm = rt.pluginManager
+    local dir = (os.getenv('TMPDIR') or '/tmp') .. '/triune_junk_plugins'
+
+    local made = {}
+    -- Writes a plugin file whose `priority` is the Lua expression `priExpr` (nil leaves the field out) and loads it.
+    local function put(id, priExpr, file)
+        local path = dir .. '/' .. (file or ('prio120_' .. id .. '.lua'))
+        local fh = assert(io.open(path, 'w'))
+        fh:write(string.format("return { id = %q, name = %q, %s onCommand = function() return false end, onBetweenPulls = function() return false end, wantsCombatHold = function() return false end }\n",
+            id, id, priExpr and ('priority = ' .. priExpr .. ',') or ''))
+        fh:close()
+        made[#made + 1] = path
+        pm.loadPlugin(path:match('[^/]+$'), path)
+        return path
+    end
+    -- Replaces the three hooks with recorders; `answer` is the id that answers true (or nil for nobody).
+    local calls
+    local function record(ids, answer)
+        calls = {}
+        for _, id in ipairs(ids) do
+            for _, hook in ipairs({ 'onCommand', 'onBetweenPulls', 'wantsCombatHold' }) do
+                pm.plugins[id].instance[hook] = function() calls[#calls + 1] = id; return id == answer end
+            end
+        end
+    end
+    local function order() return table.concat(calls, ',') end
+    local function warnLines()
+        local out = {}
+        for _, l in ipairs(tlog.recent()) do if l:find('WRN %[plugins%]') then out[#out + 1] = l end end
+        return out
+    end
+
+    -- D1, D2: what core reads from the plugin table
+    local function priOf(id, expr)
+        local before = #warnLines()
+        put(id, expr)
+        return pm.plugins[id].priority, #warnLines() - before
+    end
+    local v, w = priOf('p120_num', '10')
+    assert_eq(v, 10, 'Suite 120 D1: priority = 10 is read from the plugin table'); assert_eq(w, 0, 'Suite 120 D2: ...with no warning')
+    v, w = priOf('p120_none', nil)
+    assert_eq(v, 0, 'Suite 120 D1: a missing priority is 0'); assert_eq(w, 0, 'Suite 120 D2: ...with no warning')
+    v, w = priOf('p120_neg', '-5')
+    assert_eq(v, -5, 'Suite 120 D2: a negative number is valid'); assert_eq(w, 0, 'Suite 120 D2: ...with no warning')
+    v, w = priOf('p120_frac', '2.5')
+    assert_eq(v, 2.5, 'Suite 120 D2: a fraction is valid'); assert_eq(w, 0, 'Suite 120 D2: ...with no warning')
+    v, w = priOf('p120_big', '1e300')
+    assert_eq(v, 1e300, 'Suite 120 D2: there is no range limit'); assert_eq(w, 0, 'Suite 120 D2: ...and no warning')
+    for _, bad in ipairs({ { "'10'", 'a numeric string' }, { "'high'", 'a word' }, { '0/0', 'NaN' }, { '1/0', 'infinity' },
+        { '-1/0', 'minus infinity' }, { '{}', 'a table' }, { 'true', 'a boolean' }, { 'false', 'false' } }) do
+        v, w = priOf('p120_bad', bad[1])
+        assert_eq(v, 0, 'Suite 120 D2: ' .. bad[2] .. ' counts as 0')
+        assert_eq(w, 1, 'Suite 120 D2: ' .. bad[2] .. ' gives exactly one warning per load')
+        assert_true(pm.plugins.p120_bad ~= nil and pm.plugins.p120_bad.enabled, 'Suite 120 D2: ' .. bad[2] .. ' still loads the plugin')
+    end
+    local last = warnLines()
+    assert_true(#last > 0 and last[#last]:find('p120_bad', 1, true) ~= nil, 'Suite 120 D2: the warning names the plugin: ' .. tostring(last[#last]))
+
+    -- D3 and HOOKS 3.2: the order. Load order is c, a, b, e, d; the expected order is b, c, a, e, d, so neither the load
+    -- order nor an ordering by id alone can explain a pass (b and c tie at 10 and load in the opposite order to their ids).
+    local ids = { 'p120_c', 'p120_a', 'p120_b', 'p120_e', 'p120_d' }
+    put('p120_c', '10'); put('p120_a', '5'); put('p120_b', '10'); put('p120_e', nil); put('p120_d', '-1')
+    local expected = 'p120_b,p120_c,p120_a,p120_e,p120_d'
+    local function onlyMine(s) local out = {}; for id in s:gmatch('[^,]+') do if id:find('^p120_[a-e]$') then out[#out + 1] = id end end; return table.concat(out, ',') end
+    record(ids, nil)
+    assert_eq(pm.onCommand('zz120', {}), false, 'Suite 120: nobody answers -> not handled')
+    assert_eq(onlyMine(order()), expected, 'Suite 120 D3/HOOKS 3.2: onCommand runs highest priority first, ties by id, missing = 0')
+    record(ids, nil)
+    pm.onBetweenPulls()
+    assert_eq(onlyMine(order()), expected, 'Suite 120 D3/HOOKS 3.2: onBetweenPulls is ordered the same way')
+    record(ids, 'p120_c')
+    assert_eq(pm.onCommand('zz120', {}), true, 'Suite 120 D3: the first truthy answer handles the command')
+    assert_eq(onlyMine(order()), 'p120_b,p120_c', 'Suite 120 D3: ...and nobody after it is called')
+    record(ids, 'p120_b')
+    pm.onBetweenPulls()
+    assert_eq(onlyMine(order()), 'p120_b', 'Suite 120 D3: the highest priority can answer first for onBetweenPulls')
+    record(ids, nil)
+    pm.combatHold()
+    assert_eq(onlyMine(order()), 'p120_c,p120_a,p120_b,p120_e,p120_d', 'Suite 120 D3: wantsCombatHold stays in load order (priority does not apply)')
+
+    -- D3: eligibility is unchanged
+    record(ids, nil)
+    pm.plugins.p120_b.enabled = false
+    pm.plugins.p120_c.status = 'Error'
+    pm.plugins.p120_a.hookOff = { onCommand = true }
+    pm.onCommand('zz120', {})
+    assert_eq(onlyMine(order()), 'p120_e,p120_d', 'Suite 120 D3: disabled, errored and switched-off plugins are skipped')
+    pm.plugins.p120_b.enabled = true; pm.plugins.p120_c.status = 'Active'; pm.plugins.p120_a.hookOff = nil
+
+    -- D3: a hook that errors is skipped and the next plugin still answers (HOOKS 3.2 safe default)
+    record(ids, 'p120_c')
+    pm.plugins.p120_b.instance.onCommand = function() calls[#calls + 1] = 'p120_b'; error('boom') end
+    assert_eq(pm.onCommand('zz120', {}), true, 'Suite 120 D3: a failing higher-priority hook does not stop the next plugin')
+    assert_eq(onlyMine(order()), 'p120_b,p120_c', 'Suite 120 D3: ...it was called, failed, and the next one answered')
+
+    -- D3 reload consequence: an edited file takes effect when the plugin is reloaded, not before
+    put('p120_a', '5')
+    record(ids, nil)
+    local pathA = dir .. '/prio120_p120_a.lua'
+    put('p120_a', '99') -- rewrites the file and loads it again: a reload
+    record(ids, nil)
+    pm.onCommand('zz120', {})
+    assert_eq(onlyMine(order()), 'p120_a,p120_b,p120_c,p120_e,p120_d', 'Suite 120 D3: a reloaded plugin runs at its new priority')
+    local fh = assert(io.open(pathA, 'w')); fh:write("return { id = 'p120_a', name = 'p120_a', priority = -50, onCommand = function() return false end }\n"); fh:close()
+    record(ids, nil)
+    pm.onCommand('zz120', {})
+    assert_eq(onlyMine(order()), 'p120_a,p120_b,p120_c,p120_e,p120_d', 'Suite 120 D3: editing the file does not change a plugin that is already loaded')
+    pm.restartAll()
+    assert_eq(pm.plugins.p120_a.priority, 99, 'Suite 120 D3: restartAll does not re-read the file')
+    pm.reloadPlugin('p120_a')
+    assert_eq(pm.plugins.p120_a.priority, -50, 'Suite 120 D3: reloadPlugin re-reads it')
+
+    -- D4: the capability. The manifest is a separate block of triune.lua; load it as Suite 116 does.
+    do
+        local text = src:gsub('\r\n', '\n')
+        local a = assert(text:find('-- Plugin API version and capability manifest', 1, true), 'missing manifest block')
+        local b = assert(text:find('-- Server name for per-server config files.', a, true), 'missing end of manifest block')
+        local menv = setmetatable({ runtime = {} }, { __index = _G })
+        local chunk = assert(loadstring(text:sub(a, b - 1)))
+        setfenv(chunk, menv)
+        chunk()
+        rt.apiManifest = menv.runtime.apiManifest
+    end
+    assert_eq(pm.getCoreApi().hasCapability('hookPriority'), true, 'Suite 120 D4: core.hasCapability("hookPriority") is true')
+    assert_eq(pm.getCoreApi().hasCapability('hookPriorityX'), false, 'Suite 120 D4: ...and false for a name that is not offered')
+    assert_eq(rt.apiManifest.hookPriority and rt.apiManifest.hookPriority.kind, 'value', 'Suite 120 D4: the manifest entry is a value')
+    assert_eq(rt.apiManifest.hookPriority and rt.apiManifest.hookPriority.tier, 'experimental', 'Suite 120 D4: ...in the experimental tier')
+    assert_eq(rt.apiManifest.hookPriority and rt.apiManifest.hookPriority.since, '1.0', 'Suite 120 D4: ...since 1.0')
+
+    for _, p in ipairs(made) do os.remove(p) end
+end
+
 print(string.format('\n=== Results: %d passed, %d failed ===', pass, fail))
 if fail > 0 then
     print('\nFailures:')

@@ -28,6 +28,8 @@ ImGui callback.
 - **A plugin file returns one table**: `id`, `name`, `version`, `author`,
   `description`, `defaultEnabled`, `tickInterval` (seconds, default 0.1),
   `runOutOfCombatOnly`, `hasThread` (run `onTick` in its own fiber), optional
+  `priority` (a finite number, default 0; higher runs first when two plugins both answer `onCommand` or
+  `onBetweenPulls`; ties by id; read at load, so reload the plugin to change it), optional
   `uses` (other plugin ids it depends on), optional `window = { label, tooltip,
   flag, desc, headerButton, order }` (its window's `ctrl` visibility flag and
   main-window header button), and `help` lines, plus any of these hooks:
