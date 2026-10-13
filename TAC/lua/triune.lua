@@ -800,6 +800,132 @@ do
 end
 
 -- ============================================================================
+-- Target selector registry
+-- ============================================================================
+-- A plugin can add its own entry to every Target dropdown (gems, AAs, discs,
+-- clickies, abilities) and supply the function that turns that entry into a
+-- spawn id:
+--
+--   core.registerTargetSelector({
+--       owner   = 'myplugin',            -- the plugin's id; its selectors are removed when it is disabled / reloaded
+--       label   = 'Mez Target',          -- shown as 'E: Mez Target'
+--       side    = 'E',                   -- 'E' enemy (default) or 'F' friendly
+--       help    = 'Shown in the Target help table.',
+--       resolve = function(ctx) return spawnId end,
+--   })
+--
+-- ctx = { token, label, cls, when, spellName, pct, entry }. Return a positive
+-- spawn id, or nil when nothing qualifies (the entry then does not fire). The
+-- id goes through the same checks as every built-in target (alive, hostile,
+-- not a pet, ...). A selector that errors counts as "no target". The saved
+-- text of an entry is just 'E: <label>', so a loadout keeps working only where
+-- the plugin that registered it is loaded; anywhere else the entry resolves to
+-- no target (see runtime.isUnknownSelectorToken).
+runtime.targetSelectors = runtime.targetSelectors or {}
+runtime.targetSelectorVersion = runtime.targetSelectorVersion or 0
+
+local function builtinTargetBase(label)
+    if label == 'Current Target' or label == 'Target' or label == 'Self' or label == 'Myself' then return true end
+    for _, t in ipairs(COMBO_OPTIONS.FRIENDLY) do if t == label then return true end end
+    for _, t in ipairs(COMBO_OPTIONS.ENEMY) do if t == label then return true end end
+    return false
+end
+
+-- Returns true, or false + the reason it was refused.
+function runtime.registerTargetSelector(spec)
+    if type(spec) ~= 'table' then return false, 'spec must be a table' end
+    local label = ''
+    if type(spec.label) == 'string' then label = (spec.label:gsub('^%s*(.-)%s*$', '%1')) end
+    if label == '' then return false, 'label is required' end
+    if label:find('^[A-Za-z]:') then return false, 'label must not start with a side prefix' end
+    if type(spec.resolve) ~= 'function' then return false, 'resolve must be a function' end
+    local side = spec.side or 'E'
+    if side ~= 'E' and side ~= 'F' then return false, "side must be 'E' or 'F'" end
+    if builtinTargetBase(label) then return false, 'label collides with a built-in target' end
+    local existing = runtime.targetSelectors[label]
+    if existing and existing.owner ~= spec.owner then
+        return false, 'label already registered by ' .. tostring(existing.owner or 'another plugin')
+    end
+    local token = side .. ': ' .. label
+    if existing and existing.side ~= side then
+        runtime.unregisterTargetSelector(label, spec.owner)
+    end
+    runtime.targetSelectors[label] = {
+        label = label, side = side, token = token, help = tostring(spec.help or ''),
+        resolve = spec.resolve, owner = spec.owner,
+    }
+    local present = false
+    for _, v in ipairs(COMBO_OPTIONS.TARGETS) do if v == token then present = true; break end end
+    if not present then
+        -- keep each side's entries together: insert after the last one of this side
+        local at = #COMBO_OPTIONS.TARGETS
+        for i = #COMBO_OPTIONS.TARGETS, 1, -1 do
+            if COMBO_OPTIONS.TARGETS[i]:sub(1, 2) == side .. ':' then at = i; break end
+        end
+        table.insert(COMBO_OPTIONS.TARGETS, at + 1, token)
+    end
+    runtime.targetSelectorVersion = runtime.targetSelectorVersion + 1
+    return true
+end
+
+function runtime.unregisterTargetSelector(label, owner)
+    local sel = runtime.targetSelectors[label]
+    if not sel then return false end
+    if owner ~= nil and sel.owner ~= owner then return false end
+    runtime.targetSelectors[label] = nil
+    for i = #COMBO_OPTIONS.TARGETS, 1, -1 do
+        if COMBO_OPTIONS.TARGETS[i] == sel.token then table.remove(COMBO_OPTIONS.TARGETS, i) end
+    end
+    runtime.targetSelectorVersion = runtime.targetSelectorVersion + 1
+    return true
+end
+
+function runtime.unregisterTargetSelectorsByOwner(owner)
+    if owner == nil then return 0 end
+    local labels = {}
+    for label, sel in pairs(runtime.targetSelectors) do
+        if sel.owner == owner then labels[#labels + 1] = label end
+    end
+    for _, label in ipairs(labels) do runtime.unregisterTargetSelector(label, owner) end
+    return #labels
+end
+
+-- Runs the selector for `label`; a positive spawn id or nil.
+function runtime.runTargetSelector(label, token, cls, when, spellName, pct, extra)
+    local sel = runtime.targetSelectors[label]
+    if not sel then return nil end
+    local ok, res = pcall(sel.resolve, {
+        token = token, label = label, cls = cls, when = when, spellName = spellName, pct = pct, entry = extra,
+    })
+    if not ok then
+        runtime.selectorErrorAt = runtime.selectorErrorAt or {}
+        local now = os.clock()
+        if (now - (runtime.selectorErrorAt[label] or -1e9)) > 30 then
+            runtime.selectorErrorAt[label] = now
+            print(string.format('\ar[Triune]\ax target selector "%s" failed: %s', label, tostring(res)))
+        end
+        return nil
+    end
+    res = tonumber(res)
+    if res and res > 0 then return res end
+    return nil
+end
+
+-- True for a token in the plugin form ('E: Something' / 'F: Something') that
+-- is neither built in nor registered right now, e.g. an entry saved while a
+-- plugin was loaded and opened later without it. Such an entry must resolve to
+-- no target and never fall back to the current target. Other odd values (no
+-- prefix, old prefixes) are left to the old behavior.
+function runtime.isUnknownSelectorToken(token, base)
+    local tok = tostring(token or '')
+    local side = tok:sub(1, 2)
+    if side ~= 'E:' and side ~= 'F:' then return false end
+    if base == nil or base == '' then return false end
+    if runtime.targetSelectors[base] then return false end
+    return true
+end
+
+-- ============================================================================
 -- Local Theme & Common Helpers (Self-Contained Module)
 -- ============================================================================
 local function idxOf(tbl, val)
@@ -6628,6 +6754,34 @@ end
 -- ============================================================================
 local UI = {}
 
+-- The Target dropdown. A saved token that is not in the list (a plugin's
+-- selector while that plugin is not loaded) used to snap to the first entry
+-- and be saved over; it is now shown as '<token> (unavailable)' and kept.
+-- Returns the token to store.
+UI.targetOptsCache = {}
+function UI.targetComboOptions(token)
+    local list = COMBO_OPTIONS.TARGETS
+    local idx
+    for i, v in ipairs(list) do if v == token then idx = i; break end end
+    if idx then return list, idx, false end
+    local c = UI.targetOptsCache[token]
+    if not c or c.ver ~= runtime.targetSelectorVersion or c.n ~= #list then
+        local opts = {}
+        for i, v in ipairs(list) do opts[i] = v end
+        opts[#opts + 1] = tostring(token) .. ' (unavailable)'
+        c = { ver = runtime.targetSelectorVersion, n = #list, opts = opts }
+        UI.targetOptsCache[token] = c
+    end
+    return c.opts, #c.opts, true
+end
+function UI.targetCombo(id, token)
+    if token == nil or token == '' then token = 'F: Myself' end
+    local opts, idx, isExtra = UI.targetComboOptions(token)
+    local ti = ImGui.Combo(id, idx, opts)
+    if isExtra and ti == idx then return token end
+    return COMBO_OPTIONS.TARGETS[ti] or token
+end
+
 function UI.accent(c, txt) ImGui.TextColored(c[1], c[2], c[3], c[4], txt) end
 local accent = UI.accent
 function UI.setTooltip(fmt, ...)
@@ -7123,6 +7277,10 @@ function runtime.initPluginManager()
             getPetSpawnInfo       = runtime.getPetSpawnInfo or getPetSpawnInfo,
             isSpawnAlive          = runtime.isSpawnAlive or isSpawnAlive,
             addIgnore             = runtime.addIgnore,
+            -- Target selector registry: add an entry to the Target dropdowns.
+            -- See the comment above runtime.registerTargetSelector.
+            registerTargetSelector   = function(spec) return runtime.registerTargetSelector(spec) end,
+            unregisterTargetSelector = function(label, owner) return runtime.unregisterTargetSelector(label, owner) end,
             addZoneIgnore         = runtime.addZoneIgnore,
             -- Extended Target window per-spawn overrides (see runtime.setXtForce)
             setXtForce            = runtime.setXtForce,
@@ -7614,6 +7772,7 @@ function runtime.initPluginManager()
         if p.instance.onDestroy then
             pcall(p.instance.onDestroy)
         end
+        runtime.unregisterTargetSelectorsByOwner(id)
     end
 
     function pm.reloadPlugin(id)
@@ -9071,6 +9230,17 @@ function UI.drawHelpTab()
                 ImGui.TableNextColumn()
                 ImGui.TextWrapped(entry.desc)
             end
+            local regLabels = {}
+            for label in pairs(runtime.targetSelectors) do regLabels[#regLabels + 1] = label end
+            table.sort(regLabels)
+            for _, label in ipairs(regLabels) do
+                local sel = runtime.targetSelectors[label]
+                ImGui.TableNextRow()
+                ImGui.TableNextColumn()
+                accent(sel.side == 'F' and GOOD or ERR, sel.token)
+                ImGui.TableNextColumn()
+                ImGui.TextWrapped(sel.help ~= '' and sel.help or ('Provided by the ' .. tostring(sel.owner or 'plugin') .. ' plugin.'))
+            end
             ImGui.EndTable()
         end
 
@@ -9308,11 +9478,10 @@ function UI.drawGemList(gemsTable, idPrefix, isActiveSet, allowBurn)
 
                         -- target
                         ImGui.SameLine(); ImGui.SetNextItemWidth(UI.px(133))
-                        local ti = ImGui.Combo('##t', idxOf(COMBO_OPTIONS.TARGETS, g.target or 'F: Myself'), COMBO_OPTIONS.TARGETS)
+                        local newTgt = UI.targetCombo('##t', g.target)
                         if ImGui.IsItemHovered() then
                             ImGui.SetTooltip('Target: who to cast on (Myself, Tank, Target, MA Target, Pet).')
                         end
-                        local newTgt = COMBO_OPTIONS.TARGETS[ti]
                         if newTgt ~= g.target then
                             g.target = newTgt
                             runtime.saveLoadout(true)
@@ -9774,11 +9943,11 @@ function UI.drawClickieTab()
 
             if c.enabled ~= false then
                 ImGui.SameLine(); ImGui.SetNextItemWidth(UI.px(133))
-                local ti = ImGui.Combo('##ct', idxOf(COMBO_OPTIONS.TARGETS, c.target or 'F: Myself'), COMBO_OPTIONS.TARGETS)
+                local newCTarget = UI.targetCombo('##ct', c.target)
                 if ImGui.IsItemHovered() then
                     UI.setTooltip('Target condition: who or what to use this clickie on (e.g. Myself, Tank, Current Target, MA Target, Pet).')
                 end
-                c.target = COMBO_OPTIONS.TARGETS[ti]
+                c.target = newCTarget
 
                 ImGui.SameLine(); ImGui.SetNextItemWidth(UI.px(116))
                 local wi = ImGui.Combo('##cw', idxOf(COMBO_OPTIONS.WHENS, c.when or 'missing buff'), COMBO_OPTIONS.WHENS)
@@ -9965,11 +10134,11 @@ function UI.drawAbilitiesTab()
                         end
                     else
                         ImGui.SameLine(); ImGui.SetNextItemWidth(UI.px(133))
-                        local ti = ImGui.Combo('##actt', idxOf(COMBO_OPTIONS.TARGETS, entry.target), COMBO_OPTIONS.TARGETS)
+                        local newActTarget = UI.targetCombo('##actt', entry.target)
                         if ImGui.IsItemHovered() then
                             ImGui.SetTooltip('Target condition: who or what to use this ability on (e.g. Myself, Tank, Current Target, MA Target, Pet).')
                         end
-                        entry.target = COMBO_OPTIONS.TARGETS[ti]
+                        entry.target = newActTarget
                         ImGui.SameLine(); ImGui.SetNextItemWidth(UI.px(116))
                         local wi = ImGui.Combo('##actw', idxOf(COMBO_OPTIONS.WHENS, entry.when), COMBO_OPTIONS.WHENS)
                         if ImGui.IsItemHovered() then
@@ -10141,11 +10310,11 @@ function UI.drawAATab()
                                 end
                                 if entry.enabled then
                                     ImGui.SameLine(); ImGui.SetNextItemWidth(UI.px(133))
-                                    local ti = ImGui.Combo('##aat', idxOf(COMBO_OPTIONS.TARGETS, entry.target), COMBO_OPTIONS.TARGETS)
+                                    local newAATarget = UI.targetCombo('##aat', entry.target)
                                     if ImGui.IsItemHovered() then
                                         ImGui.SetTooltip('Target condition: who or what to cast this ability on (e.g. Myself, Tank, Current Target, MA Target, Pet).')
                                     end
-                                    entry.target = COMBO_OPTIONS.TARGETS[ti]
+                                    entry.target = newAATarget
                                     ImGui.SameLine(); ImGui.SetNextItemWidth(UI.px(116))
                                     local wi = ImGui.Combo('##aaw', idxOf(COMBO_OPTIONS.WHENS, entry.when), COMBO_OPTIONS.WHENS)
                                     if ImGui.IsItemHovered() then
@@ -10462,11 +10631,11 @@ function UI.drawDiscTab()
                     end
                     if entry.enabled then
                         ImGui.SameLine(); ImGui.SetNextItemWidth(UI.px(133))
-                        local ti = ImGui.Combo('##dt', idxOf(COMBO_OPTIONS.TARGETS, entry.target), COMBO_OPTIONS.TARGETS)
+                        local newDiscTarget = UI.targetCombo('##dt', entry.target)
                         if ImGui.IsItemHovered() then
                             ImGui.SetTooltip('Target condition: who or what to use this discipline on (e.g. Myself, Tank, Current Target, MA Target, Pet).')
                         end
-                        entry.target = COMBO_OPTIONS.TARGETS[ti]
+                        entry.target = newDiscTarget
                         ImGui.SameLine(); ImGui.SetNextItemWidth(UI.px(116))
                         local wi = ImGui.Combo('##dw', idxOf(COMBO_OPTIONS.WHENS, entry.when), COMBO_OPTIONS.WHENS)
                         if ImGui.IsItemHovered() then
@@ -18105,6 +18274,10 @@ function runtime.resolveTargetId(token, cls, when, spellName, pct, extra)
         end
     elseif b == 'All Enemies' then
         id = runtime.resolveAllEnemiesTargetId(spellName, when, pct, cls, extra)
+    elseif runtime.targetSelectors[b] then
+        id = runtime.runTargetSelector(b, token, cls, when, spellName, pct, extra)
+    elseif runtime.isUnknownSelectorToken(token, b) then
+        return nil -- a plugin's selector that is not loaded: never fall back to the current target
     else
         id = mq.TLO.Target.ID()
     end

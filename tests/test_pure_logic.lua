@@ -10294,6 +10294,7 @@ do
     local ctrl88 = { plugins = {} }
     local saveCount = 0
     local env = {
+        unregisterTargetSelectorsByOwner = function() return 0 end,
         ctrl = ctrl88,
         mq = mockMq,
         ImGui = mockImGui,
@@ -10930,6 +10931,7 @@ do
         local mqDelays = {}
         mockMq.delay = function(ms) mqDelays[#mqDelays + 1] = ms end
         local env = {
+            unregisterTargetSelectorsByOwner = function() return 0 end,
             ctrl = { plugins = {} }, mq = mockMq, ImGui = mockImGui,
             UI = { accent = noop, setTooltip = noop, pushTheme = noop, popTheme = noop, preBeginWindow = noop, postBeginWindow = noop,
                    drawStatusProgressBar = noop, drawSpellIcon = function() return false end,
@@ -11841,6 +11843,7 @@ do
     }
     package.loaded['mq'] = mockMq
     local env = {
+        unregisterTargetSelectorsByOwner = function() return 0 end,
         ctrl = { plugins = {} }, mq = mockMq,
         ImGui = setmetatable({ Button = function() return false end, SmallButton = function() return false end, Checkbox = function(_, v) return v end, IsItemHovered = function() return false end, BeginTable = function() return false end }, { __index = function() return noop end }),
         UI = { accent = noop, setTooltip = noop, pushTheme = noop, popTheme = noop, preBeginWindow = noop, postBeginWindow = noop,
@@ -20158,6 +20161,158 @@ do
     end
 
     print = origPrint
+end
+
+-- ---------------------------------------------------------------------------
+-- Suite 114: Target selector registry
+-- ---------------------------------------------------------------------------
+do
+    print('--- Suite 114: Target selector registry ---')
+    local text = readFile('TAC/lua/triune.lua'):gsub('\r\n', '\n')
+    local function slice(startPat, endPat)
+        local s = assert(text:find(startPat, 1, true), 'missing: ' .. startPat)
+        local e = assert(text:find(endPat, s, true), 'missing: ' .. endPat)
+        return text:sub(s, e - 1)
+    end
+    local regCode = slice('local function builtinTargetBase', '-- Local Theme & Common Helpers')
+    local uiCode = slice('UI.targetOptsCache = {}', 'function UI.targetCombo(')
+    local resolveCode = slice("elseif b == 'All Enemies' then", "    if not id or id <= 0 then return nil end")
+
+    local printed = {}
+    local function newWorld()
+        local COMBO_OPTIONS = {
+            FRIENDLY = { 'Myself', 'Main Assist', 'Pet' },
+            ENEMY    = { 'Current Target', 'Assist Target', 'All Enemies' },
+            TARGETS  = { 'F: Myself', 'F: Main Assist', 'F: Pet', 'E: Current Target', 'E: Assist Target', 'E: All Enemies' },
+        }
+        local runtime = { targetSelectors = {}, targetSelectorVersion = 0 }
+        local UI = {}
+        local env = setmetatable({
+            COMBO_OPTIONS = COMBO_OPTIONS, runtime = runtime, UI = UI,
+            print = function(...) printed[#printed + 1] = table.concat({ ... }, ' ') end,
+        }, { __index = _G })
+        local chunk = assert((loadstring or load)(
+            'runtime.targetSelectors = {}\nruntime.targetSelectorVersion = 0\n'
+            .. regCode .. '\n' .. uiCode .. '\nreturn true', 'suite112'))
+        setfenv(chunk, env)
+        chunk()
+        return runtime, COMBO_OPTIONS, UI
+    end
+    local function indexOf(list, v)
+        for i, x in ipairs(list) do if x == v then return i end end
+        return nil
+    end
+
+    -- registering
+    local runtime, OPTS, UI = newWorld()
+    local seen
+    local ok, err = runtime.registerTargetSelector({
+        owner = 'mez', label = 'Mez Target', help = 'h',
+        resolve = function(ctx) seen = ctx; return 321 end,
+    })
+    assert_eq(ok, true, 'registry: a valid selector registers')
+    assert_eq(OPTS.TARGETS[#OPTS.TARGETS], 'E: Mez Target', 'registry: enemy selector goes after the last E: entry')
+    assert_eq(OPTS.TARGETS[indexOf(OPTS.TARGETS, 'E: Mez Target') - 1], 'E: All Enemies', 'registry: ...next to the other enemy targets')
+    assert_eq(runtime.targetSelectorVersion, 1, 'registry: version bumps on register')
+
+    ok = runtime.registerTargetSelector({ owner = 'mez', label = 'Mez Target', resolve = function() return 1 end })
+    assert_eq(ok, true, 'registry: the same owner may register the same label again')
+    local n = 0
+    for _, v in ipairs(OPTS.TARGETS) do if v == 'E: Mez Target' then n = n + 1 end end
+    assert_eq(n, 1, 'registry: re-registering does not duplicate the dropdown entry')
+    runtime.registerTargetSelector({ owner = 'mez', label = 'Mez Target', resolve = function(ctx) seen = ctx; return 321 end })
+
+    ok, err = runtime.registerTargetSelector({ owner = 'other', label = 'Mez Target', resolve = function() return 1 end })
+    assert_eq(ok, false, 'registry: another owner cannot take a registered label')
+    assert_true(tostring(err):find('already registered'), 'registry: the refusal says why')
+
+    for _, bad in ipairs({ 'Current Target', 'Pet', 'Myself', 'Target', 'All Enemies', 'Self' }) do
+        assert_eq((runtime.registerTargetSelector({ label = bad, resolve = function() return 1 end })), false,
+            'registry: built-in name refused: ' .. bad)
+    end
+    assert_eq((runtime.registerTargetSelector({ label = '', resolve = function() return 1 end })), false, 'registry: empty label refused')
+    assert_eq((runtime.registerTargetSelector({ label = 'E: Thing', resolve = function() return 1 end })), false, 'registry: side prefix in the label refused')
+    assert_eq((runtime.registerTargetSelector({ label = 'X', resolve = 'nope' })), false, 'registry: non-function resolve refused')
+    assert_eq((runtime.registerTargetSelector({ label = 'X', side = 'Z', resolve = function() return 1 end })), false, 'registry: bad side refused')
+    assert_eq((runtime.registerTargetSelector(nil)), false, 'registry: nil spec refused')
+
+    runtime.registerTargetSelector({ owner = 'buffs', label = 'Group Pick', side = 'F', resolve = function() return 9 end })
+    assert_eq(OPTS.TARGETS[indexOf(OPTS.TARGETS, 'F: Group Pick') - 1], 'F: Pet', 'registry: friendly selector goes after the last F: entry')
+
+    -- running a selector
+    local id = runtime.runTargetSelector('Mez Target', 'E: Mez Target', 'Enc', 'in combat', 'Dazzle', 100, { kind = 'util' })
+    assert_eq(id, 321, 'run: returns the selector\'s spawn id')
+    assert_eq(seen.spellName, 'Dazzle', 'run: the spell name reaches the selector')
+    assert_eq(seen.cls, 'Enc', 'run: the class reaches the selector')
+    assert_eq(seen.when, 'in combat', 'run: the When reaches the selector')
+    assert_eq(seen.entry.kind, 'util', 'run: the entry reaches the selector')
+    assert_eq(seen.token, 'E: Mez Target', 'run: the token reaches the selector')
+    assert_nil(runtime.runTargetSelector('Missing', 'E: Missing'), 'run: unknown label gives no target')
+    for _, ret in ipairs({ 0, -4, 'abc' }) do
+        runtime.registerTargetSelector({ owner = 'mez', label = 'Mez Target', resolve = function() return ret end })
+        assert_nil(runtime.runTargetSelector('Mez Target', 'E: Mez Target'), 'run: ' .. tostring(ret) .. ' is no target')
+    end
+    runtime.registerTargetSelector({ owner = 'mez', label = 'Mez Target', resolve = function() return nil end })
+    assert_nil(runtime.runTargetSelector('Mez Target', 'E: Mez Target'), 'run: nil is no target')
+    printed = {}
+    runtime.registerTargetSelector({ owner = 'mez', label = 'Mez Target', resolve = function() error('boom') end })
+    assert_nil(runtime.runTargetSelector('Mez Target', 'E: Mez Target'), 'run: an erroring selector gives no target')
+    assert_nil(runtime.runTargetSelector('Mez Target', 'E: Mez Target'), 'run: ...every time')
+    assert_eq(#printed, 1, 'run: the error is reported once, not on every call')
+
+    -- unknown plugin-form tokens fail closed; legacy values keep the old behavior
+    runtime.registerTargetSelector({ owner = 'mez', label = 'Mez Target', resolve = function() return 5 end })
+    assert_eq(runtime.isUnknownSelectorToken('E: Mez Target', 'Mez Target'), false, 'unknown: a registered selector is known')
+    runtime.unregisterTargetSelector('Mez Target', 'mez')
+    assert_eq(runtime.isUnknownSelectorToken('E: Mez Target', 'Mez Target'), true, 'unknown: an unregistered E: token is unknown')
+    assert_eq(runtime.isUnknownSelectorToken('F: Whatever', 'Whatever'), true, 'unknown: an unregistered F: token is unknown')
+    assert_eq(runtime.isUnknownSelectorToken('Target', 'Current Target'), false, 'unknown: legacy "Target" has no side prefix')
+    assert_eq(runtime.isUnknownSelectorToken('', ''), false, 'unknown: an empty token keeps the old behavior')
+    assert_eq(runtime.isUnknownSelectorToken(nil, ''), false, 'unknown: a missing token keeps the old behavior')
+    assert_eq(runtime.isUnknownSelectorToken('S: Self', 'S: Self'), false, 'unknown: an old non-E/F prefix keeps the old behavior')
+    assert_eq(runtime.isUnknownSelectorToken('E: Mez Target', ''), false, 'unknown: an empty base is not treated as unknown')
+
+    -- unregistering
+    runtime.registerTargetSelector({ owner = 'mez', label = 'Mez Target', resolve = function() return 5 end })
+    runtime.registerTargetSelector({ owner = 'mez', label = 'Second', resolve = function() return 6 end })
+    local v0 = runtime.targetSelectorVersion
+    assert_eq(runtime.unregisterTargetSelector('Mez Target', 'someone-else'), false, 'unregister: wrong owner refused')
+    assert_eq(runtime.unregisterTargetSelectorsByOwner('mez'), 2, 'unregister: by owner removes all of that owner\'s selectors')
+    assert_nil(indexOf(OPTS.TARGETS, 'E: Mez Target'), 'unregister: dropdown entry removed')
+    assert_nil(indexOf(OPTS.TARGETS, 'E: Second'), 'unregister: every entry removed')
+    assert_true(indexOf(OPTS.TARGETS, 'F: Group Pick'), 'unregister: other owners untouched')
+    assert_true(runtime.targetSelectorVersion > v0, 'unregister: version bumps')
+    assert_eq(runtime.unregisterTargetSelector('Nope'), false, 'unregister: unknown label is a no-op')
+    assert_eq(runtime.unregisterTargetSelectorsByOwner(nil), 0, 'unregister: nil owner removes nothing')
+
+    -- the dropdown keeps a token that is not in the list
+    runtime, OPTS, UI = newWorld()
+    local list, idx, extra = UI.targetComboOptions('F: Pet')
+    assert_eq(list, OPTS.TARGETS, 'combo: a known token uses the real list')
+    assert_eq(OPTS.TARGETS[idx], 'F: Pet', 'combo: ...at its own index')
+    assert_eq(extra, false, 'combo: ...with no extra item')
+    local list2, idx2, extra2 = UI.targetComboOptions('E: Mez Target')
+    assert_eq(extra2, true, 'combo: an unknown token gets an extra item')
+    assert_eq(list2[idx2], 'E: Mez Target (unavailable)', 'combo: ...labelled unavailable')
+    assert_eq(idx2, #list2, 'combo: ...selected, at the end')
+    assert_eq(#list2, #OPTS.TARGETS + 1, 'combo: the real list is otherwise unchanged')
+    assert_nil(indexOf(OPTS.TARGETS, 'E: Mez Target (unavailable)'), 'combo: the real list is not polluted')
+    local list3 = UI.targetComboOptions('E: Mez Target')
+    assert_eq(list3, list2, 'combo: the unavailable-token list is cached between frames')
+    runtime.registerTargetSelector({ owner = 'mez', label = 'Other', resolve = function() return 1 end })
+    local list4 = UI.targetComboOptions('E: Mez Target')
+    assert_true(list4 ~= list2, 'combo: the cache refreshes when the registry changes')
+    assert_eq(#list4, #OPTS.TARGETS + 1, 'combo: ...and includes the new entry')
+    runtime.registerTargetSelector({ owner = 'mez', label = 'Mez Target', resolve = function() return 1 end })
+    local list5, idx5, extra5 = UI.targetComboOptions('E: Mez Target')
+    assert_eq(extra5, false, 'combo: once the plugin registers, the token is a normal entry again')
+    assert_eq(list5[idx5], 'E: Mez Target', 'combo: ...selected normally')
+
+    -- resolveTargetId: the dispatch branch text
+    assert_true(resolveCode:find('runtime.targetSelectors[b]', 1, true), 'resolve: registered selectors are dispatched')
+    assert_true(resolveCode:find('isUnknownSelectorToken(token, b)', 1, true), 'resolve: unknown plugin-form tokens are checked')
+    assert_true(resolveCode:find('return nil', 1, true), 'resolve: ...and return no target')
+    assert_true(resolveCode:find('id = mq.TLO.Target.ID()', 1, true), 'resolve: other values keep the current-target fallback')
 end
 
 print(string.format('\n=== Results: %d passed, %d failed ===', pass, fail))
