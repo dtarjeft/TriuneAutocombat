@@ -35,6 +35,14 @@ review folder (none exists yet). Its recommendations do not authorize it, or Cla
 6. After the owner approves, record it and implement within the granted permissions. Report what was tested, what passed and what is
    unverified; a simulation result is not live verification.
 
+**Review copy of the code.** ChatGPT also reviews code, from `C:\Users\legal\source\repos\TriuneAutocombat-Review`. Whenever something is coded,
+that folder must hold a current copy of this repository before a code review is handed over. Run
+`sh /c/Users/legal/TAC-review-tools/refresh_review.sh` (the script is a project helper kept outside the repository; with no argument it copies the
+committed state of the branch that is checked out). It copies the committed files only (no `.git`, no uncommitted changes), leaves out
+`TAC/resources` (about 1.1 GB of navmeshes and data, not code), verifies every file against git and writes `MANIFEST.txt` (branch, commit, date).
+It removes only files an earlier run put there and reports anything else. Refresh after each code commit and before each handoff for review, and
+say in the handoff which commit the copy is. If the script is missing, recreate it with the same behaviour and tell the owner.
+
 Labels, so each exchange stays in step. Claude's message opens with
 `HANDOFF: Step [N] / Decision [N] / Revision [N] / From Claude / [DATE]`, plus `Answering: REVIEW OF: ...` when it replies to a review.
 ChatGPT replies with `REVIEW OF: Step [N] / Decision [N] / Revision [N] / From ChatGPT / [DATE]`. The revision number rises when a proposal is
