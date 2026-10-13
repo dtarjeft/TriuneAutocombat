@@ -291,6 +291,25 @@ The first inventory pass counted only top-level assignments and missed the neste
 **`revision` is an opaque token**. Reports must include the revision the reporter observed, and core ignores a report
 whose revision no longer matches the current record, without emitting any event.
 
+**The guarantee a revision must give.** An opaque token is the right interface, but it does not make the value
+underneath unique. The contract is therefore stated on the *behaviour*, whatever the implementation: **a revision must
+distinguish every record from every record that replaced it or could be mistaken for it.** In particular, a revision
+observed for one record must never match:
+
+- a later record for the same mob and spell, including one created after the first was cleared or expired;
+- a record created after the tables were **replaced wholesale** on a zone change or reset (`runtime.npcSpellApplied = {}`);
+- a record for a **different mob that reuses the same spawn id**. EverQuest reuses spawn ids, so a stale report for a dead
+  mob must not be able to hit a new mob that happens to have the same id.
+
+So uniqueness is **process-wide, not per mob-and-spell key.** An implementation may use timestamps only if it can
+guarantee all of the above, for example by forcing each new value to be strictly greater than the last one issued.
+Otherwise it must use a generation counter. **[DECIDED]** the target implementation is a process-wide, strictly
+increasing generation counter assigned whenever core writes or replaces a spell record, because it provides the
+guarantee by construction. The cast time stays available as the separate, informational `castAt` field.
+
+Today (**[CURRENT]**) no record carries a revision at all; only the cast time exists, so implementing this means a
+change at the two write sites and at the two reset sites.
+
 What was verified about using the cast time as the revision (`runtime.npcSpellLastCast[mob][spell]`):
 
 - It is written with `os.clock()` at the moment a cast is issued, at two sites (the gem cast path and the
@@ -298,8 +317,9 @@ What was verified about using the cast time as the revision (`runtime.npcSpellLa
 - `os.clock()` is monotonic within the TAC process with roughly 1 ms resolution. Successive casts of the same spell on the
   same mob are at least a cast time apart, so in practice they cannot share a value. Reloading a plugin does not reset
   it, since the process is the same. Records are not persisted, so none survives a TAC restart.
-- **It cannot be proven unique** for instant effects or if two sites ever wrote in the same millisecond. That is why the
-  contract promises only an opaque `revision`: core can switch to a generation counter later without breaking plugins.
+- **It cannot be proven unique** for instant effects or if two sites ever wrote in the same millisecond, and it is
+  keyed by mob id, so it says nothing about a reused spawn id. A timestamp does not meet the guarantee above without
+  extra work, so the contract promises only an opaque `revision` and the target implementation is a generation counter.
 - Two further facts the design must respect: `npcSpellLastCast` is **not cleared** when a resist or fizzle clears the
   applied entry, so a report that matches the revision after the entry was already cleared is a no-op; and both tables
   are **replaced wholesale** on a zone or reset (`runtime.npcSpellApplied = {}`), so a report about a record that no
@@ -444,8 +464,9 @@ implemented. **Deferred** items are intentionally left until a plugin needs them
 11. **Registrations and `Error`.** **Decided:** remove, and roll back a failed `onInit` (section 3.3).
 12. **Version format.** **Decided:** the string `"MAJOR.MINOR"` with `apiVersionInfo` and `apiAtLeast` (section 2.3).
 13. **Snapshot or live.** **Decided:** supported accessors return copies; point queries for hot paths (section 7.4).
-14. **Report revisions.** **Decided:** an opaque `revision` token, currently the cast time, replaceable by a generation
-    counter (section 5.2).
+14. **Report revisions.** **Decided:** an opaque `revision` token with a uniqueness guarantee: it must distinguish every
+    replacement record, across zone and reset boundaries and across reused spawn ids, process-wide. The target
+    implementation is a generation counter; timestamps only if they meet the guarantee (section 5.2).
 
 ### Still open
 
