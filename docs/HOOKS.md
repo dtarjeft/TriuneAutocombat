@@ -7,7 +7,7 @@ split so it cannot promise something that is not implemented:
 
 | Marker | Meaning |
 |---|---|
-| **[CURRENT]** | Verified in the source at `dev` (`808ce32`). Describes what the code does now, whether or not it was ever written down. |
+| **[CURRENT]** | Verified in the source (section 10 lists what was implemented since the first draft). Describes what the code does now, whether or not it was ever written down. |
 | **[PROPOSED]** | A contract we would adopt. Not implemented, or implemented but not yet promised. |
 | **[DECIDED]** | Agreed in review. Still not implemented unless the same text also says **[CURRENT]**. |
 | **[OPEN]** | Undecided. Listed in section 9 under "Still open". |
@@ -34,8 +34,12 @@ set.
 
 ### 2.1 Today **[CURRENT]**
 
-- There is no API version and no way for a plugin to ask what the core offers. `core.registerTargetSelector` exists,
-  and a plugin that needs it checks `type(core.registerTargetSelector) == 'function'` by hand (the mez plugin does).
+- **Implemented since the first version of this draft:** `core.apiVersion` (the string `"1.0"`), `core.apiVersionInfo`,
+  `core.apiAtLeast(major, minor)`, the manifest `core.api` and `core.hasCapability(name)` (section 10). Before that,
+  a plugin that needed the registry checked `type(core.registerTargetSelector) == 'function'` by hand (the mez plugin
+  still does).
+- The manifest so far lists only the entries added with it; the 65 existing keys are not in it yet, so
+  `hasCapability` answers `false` for them.
 - The plugin core API is the table built in `runtime.initPluginManager` (65 keys). It also contains `runtime`, the
   whole runtime table, which plugins read and call freely.
 - Nothing says which of that a plugin may rely on across releases.
@@ -193,10 +197,11 @@ The only registry today is the target selector registry (`core.registerTargetSel
 for that call and is reported at most once per 30 seconds (as today). It never counts toward disabling a hook and never
 removes the registration by itself. Only a fatal plugin failure (section 4.4) removes a plugin's registrations.
 
-**Today [CURRENT], a gap:** nothing is swept when a plugin enters `Error`. `runtime.runTargetSelector` looks the label up
-and calls the resolver without checking the owner's status, so an erroring plugin's selector stays callable. A plugin
-whose `onInit` fails partway keeps whatever it registered before the failure (`pm.enablePlugin` has already marked it
-active, and `pm.reportError` only changes the status).
+**[CURRENT]** (implemented): `pm.reportError` now sweeps the plugin's registrations by owner
+(`runtime.unregisterTargetSelectorsByOwner`). Before this, nothing was swept when a plugin entered `Error`:
+`runtime.runTargetSelector` looks the label up and calls the resolver without checking the owner's status, so an
+erroring plugin's selector stayed callable, and a plugin whose `onInit` failed partway kept whatever it had registered.
+`runTargetSelector` itself still does not check the owner's status; it relies on the sweep.
 **[DECIDED]** Remove, and roll back a failed `onInit`: a saved reference then shows as "unavailable" and fails closed,
 exactly as for a disabled plugin, with one code path.
 
@@ -240,7 +245,7 @@ is forbidden there. The draw restriction above is the template.
 An error in any dispatched hook calls `pm.reportError`: the status becomes `Error`, one line is printed, and the
 traceback goes to the TAC log. A plugin in `Error` receives **no further hooks of any kind** until it is reloaded. The Plugins page shows
 `Error: <message>`, and the plugin's settings panel shows the message with a **Reload Plugin** button.
-Registrations are not cleaned up on `Error` today; see the gap in section 3.3.
+Registrations are swept when a plugin enters `Error` (section 3.3).
 
 **[DECIDED]** A **hook failure** is not a **plugin failure**:
 
@@ -253,7 +258,11 @@ Registrations are not cleaned up on `Error` today; see the gap in section 3.3.
   back what it registered **immediately**.
 - *Cleanup.* An error in `onDestroy` is swallowed (as today) and **can never prevent the owner sweep**.
 
-Today every error is treated as a plugin failure.
+**[CURRENT]** (implemented, section 10): `pm.hookFailed`, `pm.hookSucceeded` and `pm.hookEnabled` count failures
+per plugin and hook; `dispatch`, `onTick` and `onSpellRecordChanged` use them, and `pm.loadPlugin` clears the counters on
+a reload. Draw errors, a failed `onInit` and fiber errors still go through `pm.reportError`. `onSaveSettings` and
+`onLoadSettings` are called under a plain `pcall` and have never flagged a plugin, so they are not counted. Before this
+change every error in any hook put the plugin in `Error`.
 
 ---
 
@@ -311,8 +320,9 @@ guarantee by construction. The cast time stays available as the separate, inform
 or reload of all plugins. It starts at its initial value only when the TAC process starts, which is also when every
 record disappears, so no revision can outlive the counter that issued it.
 
-Today (**[CURRENT]**) no record carries a revision at all; only the cast time exists, so implementing this means a
-change at the two write sites and at the two reset sites.
+**[CURRENT]** (implemented): `runtime.touchSpellRecord(mobId, spell)` stamps a revision from the process-wide counter
+`runtime.spellRecordGen` at the two places core writes a record, and `runtime.npcSpellRevision` is replaced at the two
+wholesale resets while the counter is left alone. The counter is initialised once, in the runtime table.
 
 What was verified about using the cast time as the revision (`runtime.npcSpellLastCast[mob][spell]`):
 
@@ -336,7 +346,8 @@ report had none). Rejected, stale and no-op reports do not emit it. Reasons: `fa
 order is **[PROPOSED]** and not final (section 9, "Still open").
 - **A plugin's own tracking stays private.** The mez plugin's landing-confirmation table is its own and needs no API.
 
-Nothing here is implemented. `reportSpellEnded` does not exist yet.
+**[CURRENT]** (implemented, experimental): `core.spellRecord`, `core.reportSpellEnded` and the `onSpellRecordChanged`
+event. The mez plugin has not been moved onto them yet.
 
 ---
 
@@ -481,6 +492,33 @@ implemented. **Deferred** items are intentionally left until a plugin needs them
 - Which hooks count as non-fatal for the three-strikes rule beyond the list in section 4.4.
 - The final argument order of `core.reportSpellEnded` and `onSpellRecordChanged` (including a single table argument
   instead of positional ones, which would make later additions easier).
+
+---
+
+## 10. Implementation status
+
+What exists in the source, and what does not, as of the branch that merged this section.
+
+**Implemented (tests in Suites 116 and 117, and in 88 and 92):**
+
+- `core.apiVersion` (string), `core.apiVersionInfo`, `core.apiAtLeast`, the manifest `core.api` and
+  `core.hasCapability`. Manifest entries so far: the version helpers, the target selector registry, `serverTag`,
+  `configFilePath`, `spellRecord`, `reportSpellEnded` and the `onSpellRecordChanged` event. Tiers are provisional.
+- Spell record revisions from a never-reset, process-wide counter; `core.spellRecord` (returns copies);
+  `core.reportSpellEnded(mobId, spell, reason, revision, detail)`; the `onSpellRecordChanged(mobId, spell, reason, old,
+  new, detail)` event with copies for each plugin, fired only after core commits a change.
+- Hook failures counted per plugin and hook (three strikes, reset by a success and by a reload); fatal failures sweep the
+  plugin's registrations, including the rollback of a failed `onInit`.
+
+**Not implemented yet:**
+
+- The `priority` field and the alphabetical tie rule for `onCommand` and `onBetweenPulls` (section 3.2). Order is still
+  load order.
+- `core.plugins` (`list`, `usedBy`, `state`), and the rest of the manifest (the existing 65 keys, with tiers).
+- Deprecation flags and warnings (section 2.3).
+- The contract test, the write ratchet, and the registry leak test including the real reload path (section 8).
+- Moving the mez plugin onto `reportSpellEnded`.
+- The three open details in section 9.
 
 ---
 

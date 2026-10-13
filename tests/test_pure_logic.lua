@@ -4847,6 +4847,7 @@ do
     runtime.sortedAAEntries = real('sortedAAEntries')
     runtime.useClickie = real('useClickie')
     runtime.castGem = real('castGem')
+    runtime.touchSpellRecord = function() end -- the real one stamps a revision on each spell record
     runtime.fireAA = real('fireAA')
     runtime.processHealPriority = real('processHealPriority')
     local combatTick = real('combatTick')
@@ -6334,6 +6335,7 @@ do
     testRuntime.conditionMet = yes
     testRuntime.countNPCXtarget = function() return #mockXTarget end
     testRuntime.npcCastCounts, testRuntime.npcSpellApplied, testRuntime.npcSpellLastCast = {}, {}, {}
+    testRuntime.touchSpellRecord = function() end
 
     -- 1. DoT casting across multiple XTarget enemies (Sicken)
     local t1 = testRuntime.resolveAllEnemiesTargetId('Sicken', 'in combat', 100, 'Shm', { kind = 'dot' })
@@ -10480,12 +10482,46 @@ do
         assert_eq(savedHook, 1, 'Suite 88: pm.onLoadoutSaved dispatches to plugins')
         aa.instance.onLoadoutSaved = realSaved
 
-        -- A hook that throws flags the plugin and stops dispatching to it
-        aa.instance.onCommand = function() error('cmd boom') end
+        -- A failing hook is not a failing plugin (docs/HOOKS.md 4.4): it is counted, three in a row switch that hook off,
+        -- a success starts the count again, and a reload switches it back on. Nothing the plugin registered is swept.
+        -- (state lives in one field of `sandbox`: this file's main chunk is at Lua's 200-local limit)
+        sandbox.hk = { swept = {}, calls = 0, n = 0 }
+        sandbox.runtime.unregisterTargetSelectorsByOwner = function(owner) local sw = sandbox.hk.swept; sw[#sw + 1] = owner; return 0 end
+        aa.instance.onCommand = function() sandbox.hk.calls = sandbox.hk.calls + 1; error('cmd boom') end
         assert_eq(pm.onCommand('autoaa', { 'autoaa' }), false, 'Suite 88: a throwing hook does not count as handled')
-        assert_eq(aa.status, 'Error', 'Suite 88: a throwing hook flags the plugin as Error')
+        assert_eq(aa.status, 'Active', 'Suite 88: a throwing hook does not flag the plugin as Error')
+        assert_eq(pm.hookEnabled(aa, 'onCommand'), true, 'Suite 88: one failure leaves the hook on')
+        pm.onCommand('autoaa', { 'autoaa' })
+        assert_eq(pm.hookEnabled(aa, 'onCommand'), true, 'Suite 88: two failures leave the hook on')
+        pm.onCommand('autoaa', { 'autoaa' })
+        assert_eq(pm.hookEnabled(aa, 'onCommand'), false, 'Suite 88: three failures in a row switch the hook off')
+        assert_eq(sandbox.hk.calls, 3, 'Suite 88: the hook ran three times')
+        pm.onCommand('autoaa', { 'autoaa' })
+        assert_eq(sandbox.hk.calls, 3, 'Suite 88: a hook that is switched off is not called again')
+        assert_eq(aa.status, 'Active', 'Suite 88: the plugin stays active')
+        assert_eq(#sandbox.hk.swept, 0, 'Suite 88: a hook failure sweeps no registrations')
         pm.reloadPlugin('auto_aa')
-        assert_eq(aa.status, 'Active', 'Suite 88: reload recovers the plugin after a hook error')
+        assert_eq(aa.status, 'Active', 'Suite 88: reload keeps the plugin active')
+        assert_eq(pm.hookEnabled(aa, 'onCommand'), true, 'Suite 88: a reload switches the hook back on')
+
+        -- a success starts the count again: fail, fail, succeed, fail, fail leaves the hook on
+        sandbox.hk.n = 0
+        aa.instance.onCommand = function()
+            sandbox.hk.n = sandbox.hk.n + 1
+            if sandbox.hk.n == 3 then return false end
+            error('cmd boom')
+        end
+        for _ = 1, 5 do pm.onCommand('autoaa', { 'autoaa' }) end
+        assert_eq(sandbox.hk.n, 5, 'Suite 88: all five calls ran')
+        assert_eq(pm.hookEnabled(aa, 'onCommand'), true, 'Suite 88: a success in between resets the count')
+
+        -- a fatal failure (a draw error) puts the plugin in Error and sweeps its registrations
+        aa.instance.onDrawUI = function() error('draw boom') end
+        pm.drawUI()
+        assert_eq(aa.status, 'Error', 'Suite 88: a draw error is fatal for the plugin')
+        assert_eq(sandbox.hk.swept[#sandbox.hk.swept], 'auto_aa', 'Suite 88: ...and sweeps what it registered')
+        pm.reloadPlugin('auto_aa')
+        assert_eq(aa.status, 'Active', 'Suite 88: reload recovers the plugin after a fatal error')
     end
 
     -- 11. Spellbook plugin (was the standalone triune_spellbook.lua script)
@@ -11947,6 +11983,17 @@ do
     assert_true(tostring(S.err):find('mq.exit', 1, true) ~= nil, 'Suite 92: reason names mq.exit')
     mockMq.exit(); assert_eq(S.exits, 1, 'Suite 92: original mq.exit restored afterwards')
     pm.scripts['exits_at_load.lua'] = nil
+
+    -- 1c. A plugin whose onInit fails is in Error, and what it registered before failing is swept (rolled back)
+    S.swept = {}
+    rt.unregisterTargetSelectorsByOwner = function(owner) S.swept[#S.swept + 1] = owner; return 0 end
+    S.path = writeJunk('fails_in_init.lua', "return { id = 'fails_in_init', name = 'Fails in init', defaultEnabled = true, onInit = function() error('init boom') end }\n")
+    pm.loadPlugin('fails_in_init.lua', S.path)
+    assert_true(pm.plugins.fails_in_init ~= nil, 'Suite 92: the plugin is registered')
+    assert_eq(pm.plugins.fails_in_init.status, 'Error', 'Suite 92: a failing onInit puts the plugin in Error')
+    assert_eq(S.swept[#S.swept], 'fails_in_init', 'Suite 92: ...and what it registered is swept at once')
+    pm.plugins.fails_in_init = nil -- (later checks expect no junk plugin to stay registered)
+    for k, id in ipairs(pm.pluginOrder) do if id == 'fails_in_init' then table.remove(pm.pluginOrder, k); break end end
 
     -- 1c. UI-triggered lifecycle work is queued and runs from pm.tick (main coroutine), never in the render callback
     S.ran = {}
@@ -20600,6 +20647,263 @@ do
         local ptxt = readFile(p)
         assert_true(ptxt:find('core.configFilePath(', 1, true) ~= nil, 'Suite 115: ' .. p .. ' builds its config path through the core')
     end
+end
+
+-- ---------------------------------------------------------------------------
+-- Suite 116: Plugin API version and capability manifest
+-- ---------------------------------------------------------------------------
+do
+    print('--- Suite 116: Plugin API version and capabilities ---')
+    local text = readFile('TAC/lua/triune.lua'):gsub('\r\n', '\n')
+    local a = assert(text:find('-- Plugin API version and capability manifest', 1, true), 'missing manifest block')
+    local b = assert(text:find('-- Server name for per-server config files.', a, true), 'missing end of manifest block')
+    local code = text:sub(a, b - 1)
+    local function world()
+        local env = setmetatable({ runtime = {} }, { __index = _G })
+        local chunk = assert(loadstring(code))
+        setfenv(chunk, env)
+        chunk()
+        return env.runtime
+    end
+
+    local rt = world()
+    assert_eq(type(rt.API_VERSION), 'string', 'Suite 116: the API version is a string')
+    assert_true(rt.API_VERSION:match('^%d+%.%d+$') ~= nil, 'Suite 116: ...of the form MAJOR.MINOR')
+    local info = rt.apiVersionInfo()
+    assert_true(info.major >= 1, 'Suite 116: apiVersionInfo gives the numeric major')
+
+    -- 1.10 is newer than 1.9 and is not the same as 1.1 (as numbers they would be)
+    rt.API_VERSION = '1.10'
+    info = rt.apiVersionInfo()
+    assert_true(info.major == 1 and info.minor == 10, 'Suite 116: "1.10" parses as major 1, minor 10')
+    assert_eq(rt.apiAtLeast(1, 9), true, 'Suite 116: 1.10 is at least 1.9')
+    assert_eq(rt.apiAtLeast(1, 10), true, 'Suite 116: 1.10 is at least 1.10')
+    assert_eq(rt.apiAtLeast(1, 11), false, 'Suite 116: 1.10 is not at least 1.11')
+    assert_eq(rt.apiAtLeast(2, 0), false, 'Suite 116: 1.10 is not at least 2.0')
+    assert_eq(rt.apiAtLeast(1), true, 'Suite 116: the minor defaults to 0')
+    assert_eq(rt.apiAtLeast(0, 99), true, 'Suite 116: an older major is always satisfied')
+    rt.API_VERSION = '1.1'
+    assert_eq(rt.apiAtLeast(1, 10), false, 'Suite 116: 1.1 is not at least 1.10')
+    assert_eq(rt.apiAtLeast('x', 1), false, 'Suite 116: a non-number is never satisfied')
+    assert_eq(rt.apiAtLeast(nil, nil), false, 'Suite 116: nil is never satisfied')
+
+    -- the manifest
+    local valid = { stable = true, experimental = true }
+    local kinds = { value = true, ['function'] = true, registry = true, event = true, hook = true }
+    local count = 0
+    for name, e in pairs(rt.apiManifest) do
+        count = count + 1
+        assert_true(valid[e.tier] == true, 'Suite 116: manifest tier for ' .. name)
+        assert_true(kinds[e.kind] == true, 'Suite 116: manifest kind for ' .. name)
+        assert_true(type(e.since) == 'string' and e.since:match('^%d+%.%d+$') ~= nil, 'Suite 116: manifest version for ' .. name)
+    end
+    assert_true(count >= 9, 'Suite 116: the manifest lists the first entries')
+    assert_eq(rt.apiManifest.registerTargetSelector.tier, 'experimental', 'Suite 116: the target registry is experimental')
+    assert_eq(rt.apiManifest.hasCapability.tier, 'stable', 'Suite 116: the capability check itself is stable')
+
+    -- every non-event entry has a key in the core API table, and hasCapability is wired
+    local ga = assert(text:find('function pm.getCoreApi()', 1, true), 'missing getCoreApi')
+    local gb = assert(text:find('setmetatable(api, {', ga, true), 'missing end of getCoreApi table')
+    local apiText = text:sub(ga, gb)
+    for name, e in pairs(rt.apiManifest) do
+        if e.kind ~= 'event' and e.kind ~= 'hook' and name ~= 'hasCapability' then
+            assert_true(apiText:find('\n%s+' .. name .. '%s*=') ~= nil, 'Suite 116: the core API table has ' .. name)
+        end
+    end
+    assert_true(apiText:find('api.hasCapability = function(name)', 1, true) ~= nil, 'Suite 116: the core API table gets hasCapability')
+end
+
+-- ---------------------------------------------------------------------------
+-- Suite 117: Spell records -- revisions, copies and reports
+-- ---------------------------------------------------------------------------
+do
+    print('--- Suite 117: Spell records ---')
+    local text = readFile('TAC/lua/triune.lua'):gsub('\r\n', '\n')
+    local a = assert(text:find('-- Spell records (docs/HOOKS.md, section 5)', 1, true), 'missing spell record block')
+    local b = assert(text:find('-- Server name for per-server config files.', a, true), 'missing end of spell record block')
+    local code = text:sub(a, b - 1)
+    local function world()
+        local events = {}
+        local rt = { npcSpellApplied = {}, npcSpellLastCast = {}, npcSpellRevision = {}, spellRecordGen = 0,
+            pluginManager = { onSpellRecordChanged = function(...) events[#events + 1] = { ... } end } }
+        local env = setmetatable({ runtime = rt }, { __index = _G })
+        local chunk = assert(loadstring(code))
+        setfenv(chunk, env)
+        chunk()
+        -- what the two write sites in core do for a cast issued now
+        function rt.cast(mob, spell, at, expires)
+            rt.npcSpellLastCast[mob] = rt.npcSpellLastCast[mob] or {}
+            rt.npcSpellLastCast[mob][spell] = at
+            rt.touchSpellRecord(mob, spell)
+            rt.npcSpellApplied[mob] = rt.npcSpellApplied[mob] or {}
+            rt.npcSpellApplied[mob][spell] = expires
+        end
+        return rt, events
+    end
+
+    -- the accessor returns a copy
+    local rt, events = world()
+    assert_nil(rt.spellRecord(5, 'Mesmerize'), 'Suite 117: no record -> nil')
+    rt.cast(5, 'Mesmerize', 100, 112)
+    local rec = rt.spellRecord(5, 'Mesmerize')
+    assert_true(rec.castAt == 100 and rec.expiresAt == 112 and rec.revision ~= nil, 'Suite 117: the record has castAt, expiresAt and a revision')
+    rec.expiresAt = 9999; rec.revision = 'x'
+    assert_eq(rt.npcSpellApplied[5].Mesmerize, 112, 'Suite 117: changing the returned copy does not change the shared table')
+    assert_true(rt.spellRecord(5, 'Mesmerize').revision ~= 'x', 'Suite 117: ...or the revision')
+
+    -- report validation
+    local r1 = rt.spellRecord(5, 'Mesmerize').revision
+    local ok, why = rt.reportSpellEnded(5, 'Mesmerize', 'exploded', r1)
+    assert_true(ok == false and why == 'bad reason', 'Suite 117: an unknown reason is refused')
+    ok, why = rt.reportSpellEnded(nil, 'Mesmerize', 'failed', r1)
+    assert_true(ok == false and why == 'bad arguments', 'Suite 117: a missing mob id is refused')
+    ok, why = rt.reportSpellEnded(5, '', 'failed', r1)
+    assert_true(ok == false and why == 'bad arguments', 'Suite 117: an empty spell name is refused')
+    ok, why = rt.reportSpellEnded(6, 'Mesmerize', 'failed', r1)
+    assert_true(ok == false and why == 'no record', 'Suite 117: a report for a mob with no record changes nothing')
+    ok, why = rt.reportSpellEnded(5, 'Mesmerize', 'failed', nil)
+    assert_true(ok == false and why == 'stale', 'Suite 117: a report with no revision is refused')
+    ok, why = rt.reportSpellEnded(5, 'Mesmerize', 'failed', r1 + 1000)
+    assert_true(ok == false and why == 'stale', 'Suite 117: a report with another revision is refused')
+    assert_eq(#events, 0, 'Suite 117: refused reports emit no event')
+    assert_eq(rt.npcSpellApplied[5].Mesmerize, 112, 'Suite 117: ...and clear nothing')
+
+    -- a good report
+    ok = rt.reportSpellEnded(5, 'Mesmerize', 'woke', r1, 'hit by the tank')
+    assert_eq(ok, true, 'Suite 117: a report with the current revision is accepted')
+    assert_nil(rt.npcSpellApplied[5].Mesmerize, 'Suite 117: ...and core clears the record')
+    assert_eq(#events, 1, 'Suite 117: one event after the change')
+    local ev = events[1]
+    assert_true(ev[1] == 5 and ev[2] == 'Mesmerize' and ev[3] == 'woke', 'Suite 117: the event carries mob, spell and reason')
+    assert_true(ev[4].revision == r1 and ev[4].expiresAt == 112 and ev[5] == nil, 'Suite 117: ...the old record (with its revision) and no new record')
+    assert_eq(ev[6], 'hit by the tank', 'Suite 117: ...and the detail as the last argument')
+    ok, why = rt.reportSpellEnded(5, 'Mesmerize', 'woke', r1)
+    assert_true(ok == false and why == 'no record', 'Suite 117: reporting the same thing twice is a no-op')
+    assert_eq(#events, 1, 'Suite 117: ...with no second event')
+
+    -- a late report must not clear a newer cast of the same spell on the same mob
+    rt.cast(5, 'Mesmerize', 130, 142)
+    local r2 = rt.spellRecord(5, 'Mesmerize').revision
+    assert_true(r2 ~= r1, 'Suite 117: a recast gets a new revision')
+    ok, why = rt.reportSpellEnded(5, 'Mesmerize', 'faded', r1)
+    assert_true(ok == false and why == 'stale', 'Suite 117: a delayed report for the older cast is ignored')
+    assert_eq(rt.npcSpellApplied[5].Mesmerize, 142, 'Suite 117: ...and the newer record survives')
+    assert_eq(#events, 1, 'Suite 117: ...with no event')
+
+    -- the counter survives a wholesale reset, so nothing before the reset can match anything after it
+    local before = rt.spellRecordGen
+    rt.npcSpellApplied, rt.npcSpellLastCast, rt.npcSpellRevision = {}, {}, {}
+    assert_eq(rt.spellRecordGen, before, 'Suite 117: a reset of the tables leaves the counter alone')
+    rt.cast(5, 'Mesmerize', 200, 212)
+    local r3 = rt.spellRecord(5, 'Mesmerize').revision
+    assert_true(r3 > r2, 'Suite 117: a record made after a reset has a later revision')
+    ok, why = rt.reportSpellEnded(5, 'Mesmerize', 'failed', r2)
+    assert_true(ok == false and why == 'stale', 'Suite 117: a report from before the reset cannot clear a record after it')
+
+    -- a reused spawn id: a report about the dead mob must not hit the new one
+    rt.npcSpellApplied[5] = nil
+    rt.cast(5, 'Mesmerize', 300, 312)
+    local r4 = rt.spellRecord(5, 'Mesmerize').revision
+    assert_true(r4 ~= r3 and r4 > r3, 'Suite 117: the new mob that reuses id 5 gets a new revision')
+    ok, why = rt.reportSpellEnded(5, 'Mesmerize', 'faded', r3)
+    assert_true(ok == false and why == 'stale', 'Suite 117: a stale report about the old mob is ignored')
+    assert_eq(rt.npcSpellApplied[5].Mesmerize, 312, 'Suite 117: ...and the new mob keeps its record')
+
+    -- other spells and mobs are independent
+    rt.cast(5, 'Dazzle', 310, 400)
+    rt.cast(6, 'Mesmerize', 310, 322)
+    local rd, rm = rt.spellRecord(5, 'Dazzle').revision, rt.spellRecord(6, 'Mesmerize').revision
+    assert_true(rd ~= r4 and rm ~= r4 and rd ~= rm, 'Suite 117: revisions differ across spells and mobs')
+    rt.reportSpellEnded(5, 'Dazzle', 'faded', rd)
+    assert_true(rt.npcSpellApplied[5].Mesmerize == 312 and rt.npcSpellApplied[6].Mesmerize == 322, 'Suite 117: ending one record leaves the others')
+
+    -- core wiring (source level): both write sites stamp a revision, both resets clear revisions, the counter is never reset
+    local _, stamps = text:gsub('runtime%.touchSpellRecord%(id, [%w%.]+%)', '')
+    assert_eq(stamps, 2, 'Suite 117: both places where core writes a record stamp a revision')
+    local _, resets = text:gsub('runtime%.npcSpellRevision = {}', '')
+    assert_true(resets >= 2, 'Suite 117: both wholesale resets of the spell tables also reset the revisions')
+    local _, gens = text:gsub('spellRecordGen%s*=%s*0', '')
+    assert_eq(gens, 1, 'Suite 117: the generation counter is initialised once and never reset')
+    assert_true(text:find('copy(old), copy(new), detail', 1, true) ~= nil, 'Suite 117: each plugin receives its own copies of the old and new record')
+end
+
+-- ---------------------------------------------------------------------------
+-- Suite 118: tools/api_probe.lua (the throwaway in-game probe) still loads and its commands run
+-- ---------------------------------------------------------------------------
+do
+    print('--- Suite 118: API probe plugin ---')
+    local lines = {}
+    local chunk = assert(loadfile('tools/api_probe.lua'))
+    setfenv(chunk, setmetatable({ print = function(...) lines[#lines + 1] = table.concat({ ... }, ' ') end }, { __index = _G }))
+    local probe = chunk()
+    assert_eq(probe.id, 'api_probe', 'Suite 118: the probe has an id')
+    assert_eq(probe.defaultEnabled, false, 'Suite 118: the probe is off by default')
+
+    local registered, record = nil, { castAt = 100, expiresAt = 160, revision = 7 }
+    local reported = {}
+    local core = {
+        apiVersion = '1.0', apiVersionInfo = { major = 1, minor = 0 },
+        api = { a = { tier = 'stable' }, b = { tier = 'experimental' } },
+        apiAtLeast = function(ma, mi) return ma == 1 and (mi or 0) <= 0 end,
+        hasCapability = function(name) return name ~= 'notAThing' end,
+        registerTargetSelector = function(spec) registered = spec; return true end,
+        spellRecord = function(mob, spell) return record end,
+        reportSpellEnded = function(mob, spell, reason, rev, detail) reported[#reported + 1] = { rev = rev, detail = detail }; return rev == 7, rev ~= 7 and 'stale' or nil end,
+        runtime = { npcSpellApplied = { [5] = { Mesmerize = 160 } } },
+        mq = { TLO = { Target = { ID = function() return 5 end } } },
+        ImGui = { TextWrapped = function() end },
+    }
+    probe.onInit(core)
+    assert_true(registered ~= nil and registered.owner == 'api_probe' and registered.label == 'Probe Target', 'Suite 118: onInit registers E: Probe Target for its owner')
+    assert_nil(registered.resolve(), 'Suite 118: the probe selector never picks a target')
+
+    local function run(...) return probe.onCommand('probe', { 'probe', ... }) end
+    assert_eq(probe.onCommand('other', { 'other' }), false, 'Suite 118: other commands are left alone')
+    for _, sub in ipairs({ 'help', 'version', 'status', 'bogus' }) do
+        assert_eq(run(sub), true, 'Suite 118: probe ' .. sub .. ' is handled')
+    end
+    lines = {}
+    run('record')
+    local joined = table.concat(lines, '\n')
+    assert_true(joined:find('Mesmerize on #5', 1, true) and joined:find('revision=7', 1, true), 'Suite 118: "probe record" lists the target\'s records')
+    run('report', 'stale')
+    run('report', 'current')
+    assert_eq(reported[1].rev, -1, 'Suite 118: "report stale" sends a revision that cannot match')
+    assert_eq(reported[2].rev, 7, 'Suite 118: "report current" sends the current revision')
+
+    -- failure modes
+    run('fail')
+    assert_true(not pcall(probe.onTick), 'Suite 118: "probe fail" makes onTick throw')
+    run('flaky')
+    local thrown = 0
+    for _ = 1, 12 do if not pcall(probe.onTick) then thrown = thrown + 1 end end
+    assert_eq(thrown, 8, 'Suite 118: "probe flaky" fails two ticks in three for twelve ticks')
+    assert_true(pcall(probe.onTick), 'Suite 118: ...and stops by itself')
+    run('drawfail')
+    assert_true(not pcall(probe.onDrawUI), 'Suite 118: "probe drawfail" makes onDrawUI throw once')
+    assert_true(pcall(probe.onDrawUI), 'Suite 118: ...only once')
+    probe.onSpellRecordChanged(5, 'Mesmerize', 'woke', record, nil, 'x')
+    probe.onDrawSettings()
+
+    -- "probe selftest" against core's real spell record functions (sliced from the source)
+    local text = readFile('TAC/lua/triune.lua'):gsub('\r\n', '\n')
+    local a = assert(text:find('-- Spell records (docs/HOOKS.md, section 5)', 1, true), 'missing spell record block')
+    local b = assert(text:find('-- Server name for per-server config files.', a, true), 'missing end of spell record block')
+    local rt2 = { npcSpellApplied = {}, npcSpellLastCast = {}, npcSpellRevision = {}, spellRecordGen = 0 }
+    local ch = assert(loadstring(text:sub(a, b - 1)))
+    setfenv(ch, setmetatable({ runtime = rt2 }, { __index = _G }))
+    ch()
+    rt2.pluginManager = { onSpellRecordChanged = function(...) probe.onSpellRecordChanged(...) end }
+    local core2 = { hasCapability = function() return true end, registerTargetSelector = function() return true end,
+        spellRecord = rt2.spellRecord, reportSpellEnded = rt2.reportSpellEnded, runtime = rt2,
+        mq = core.mq, ImGui = core.ImGui }
+    probe.onInit(core2)
+    lines = {}
+    run('selftest')
+    local out = table.concat(lines, '\n')
+    assert_true(out:find('FAIL', 1, true) == nil, 'Suite 118: "probe selftest" reports no failure against core\'s real functions')
+    assert_true(out:find('selftest: 13 passed, 0 failed', 1, true) ~= nil, 'Suite 118: ...and runs all of its checks')
+    assert_nil(rt2.npcSpellApplied[999999], 'Suite 118: ...and removes the record it planted')
 end
 
 print(string.format('\n=== Results: %d passed, %d failed ===', pass, fail))

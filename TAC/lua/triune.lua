@@ -627,6 +627,11 @@ local runtime = {
     npcCastCounts = {},
     npcSpellApplied = {},
     npcSpellLastCast = {},
+    -- Revision of each spell record: [mobId][spell] = the generation assigned when the record was last written.
+    -- spellRecordGen is process-wide and never reset (not by zoning, a table reset or a plugin reload), so a
+    -- revision cannot match a later record, a record after a reset, or a different mob that reuses a spawn id.
+    npcSpellRevision = {},
+    spellRecordGen = 0,
     lastNpcCastPruneAt = 0,
     trackStartTime = nil,
     startAA = nil,
@@ -5739,6 +5744,87 @@ local function splitByChar(s, sep)
     return out
 end
 
+-- ============================================================================
+-- Plugin API version and capability manifest (see docs/HOOKS.md)
+-- ============================================================================
+-- core.apiVersion is the string "MAJOR.MINOR". Never compare it as a number: 1.10 and 1.1 are the
+-- same Lua number. Use core.apiVersionInfo ({ major, minor }) or core.apiAtLeast(major, minor).
+-- The compatibility promise covers entries whose tier is 'stable'; 'experimental' entries may change in a
+-- minor release (called out in the release notes); anything not listed here is internal. The tiers below
+-- are provisional until docs/HOOKS.md is approved. A new entry is added here when it is added to the core API.
+runtime.API_VERSION = '1.0'
+runtime.apiManifest = {
+    apiVersion               = { kind = 'value',    tier = 'stable',       since = '1.0' },
+    apiVersionInfo           = { kind = 'value',    tier = 'stable',       since = '1.0' },
+    apiAtLeast               = { kind = 'function', tier = 'stable',       since = '1.0' },
+    hasCapability            = { kind = 'function', tier = 'stable',       since = '1.0' },
+    api                      = { kind = 'value',    tier = 'stable',       since = '1.0' },
+    registerTargetSelector   = { kind = 'registry', tier = 'experimental', since = '1.0' },
+    unregisterTargetSelector = { kind = 'registry', tier = 'experimental', since = '1.0' },
+    serverTag                = { kind = 'function', tier = 'experimental', since = '1.0' },
+    configFilePath           = { kind = 'function', tier = 'experimental', since = '1.0' },
+    spellRecord              = { kind = 'function', tier = 'experimental', since = '1.0' },
+    reportSpellEnded         = { kind = 'function', tier = 'experimental', since = '1.0' },
+    onSpellRecordChanged     = { kind = 'event',    tier = 'experimental', since = '1.0' },
+}
+
+function runtime.apiVersionInfo()
+    local major, minor = tostring(runtime.API_VERSION):match('^(%d+)%.(%d+)$')
+    return { major = tonumber(major) or 0, minor = tonumber(minor) or 0 }
+end
+
+-- True when this build's API is at least MAJOR.MINOR (minor defaults to 0). False for anything that is not a number.
+function runtime.apiAtLeast(major, minor)
+    major, minor = tonumber(major), tonumber(minor or 0)
+    if not major or not minor then return false end
+    local v = runtime.apiVersionInfo()
+    return v.major > major or (v.major == major and v.minor >= minor)
+end
+
+-- ----------------------------------------------------------------------------
+-- Spell records (docs/HOOKS.md, section 5): plugins read copies and report observations; core owns the
+-- shared tables. A record is what TAC wrote when a cast was issued: npcSpellApplied[mob][spell] (expiry) and
+-- npcSpellLastCast[mob][spell] (cast time), plus the revision below.
+-- ----------------------------------------------------------------------------
+runtime.SPELL_END_REASONS = { failed = true, woke = true, faded = true }
+
+-- Called wherever core writes or replaces a record. Returns the new revision.
+function runtime.touchSpellRecord(mobId, spell)
+    runtime.spellRecordGen = (runtime.spellRecordGen or 0) + 1
+    runtime.npcSpellRevision = runtime.npcSpellRevision or {}
+    local per = runtime.npcSpellRevision[mobId]
+    if not per then per = {}; runtime.npcSpellRevision[mobId] = per end
+    per[spell] = runtime.spellRecordGen
+    return runtime.spellRecordGen
+end
+
+-- A COPY of the record for this mob and spell: { castAt, expiresAt, revision }, or nil when none is recorded.
+-- `revision` is opaque: keep it and hand it back to reportSpellEnded; do not interpret or compare it.
+function runtime.spellRecord(mobId, spell)
+    local applied = runtime.npcSpellApplied and runtime.npcSpellApplied[mobId]
+    local expiresAt = applied and applied[spell]
+    if not tonumber(expiresAt) then return nil end
+    local last = runtime.npcSpellLastCast and runtime.npcSpellLastCast[mobId]
+    local rev = runtime.npcSpellRevision and runtime.npcSpellRevision[mobId]
+    return { castAt = last and last[spell] or nil, expiresAt = expiresAt, revision = rev and rev[spell] or nil }
+end
+
+-- A plugin reports that a spell on a mob ended early or is over. Returns true when core cleared the record, else
+-- false and why ('bad reason', 'bad arguments', 'no record', 'stale'). A report whose revision is not the current
+-- record's is ignored (it describes an older cast) and emits nothing. `detail` is an optional string.
+function runtime.reportSpellEnded(mobId, spell, reason, revision, detail)
+    if not runtime.SPELL_END_REASONS[reason] then return false, 'bad reason' end
+    mobId = tonumber(mobId)
+    if not mobId or type(spell) ~= 'string' or spell == '' then return false, 'bad arguments' end
+    local old = runtime.spellRecord(mobId, spell)
+    if not old then return false, 'no record' end
+    if revision == nil or old.revision ~= revision then return false, 'stale' end
+    runtime.npcSpellApplied[mobId][spell] = nil
+    local pm = runtime.pluginManager
+    if pm and pm.onSpellRecordChanged then pm.onSpellRecordChanged(mobId, spell, reason, old, nil, detail) end
+    return true
+end
+
 -- Server name for per-server config files. MacroQuest.Server() is what other MacroQuest
 -- tools and the inventory plugin use; EverQuest.ServerName() and Zone.Server() come back
 -- empty on some servers, which made every server share one file per character. '' when
@@ -7353,6 +7439,15 @@ function runtime.initPluginManager()
             -- copied across on first use).
             serverTag                = runtime.serverTag,
             configFilePath           = runtime.configFilePath,
+            -- API version and capability manifest (docs/HOOKS.md): core.apiVersion is a string,
+            -- core.hasCapability(name) says whether this build offers a documented entry.
+            apiVersion               = runtime.API_VERSION,
+            apiVersionInfo           = runtime.apiVersionInfo and runtime.apiVersionInfo() or nil,
+            apiAtLeast               = runtime.apiAtLeast,
+            api                      = runtime.apiManifest,
+            -- Spell records: copies in, observations out (docs/HOOKS.md section 5).
+            spellRecord              = runtime.spellRecord,
+            reportSpellEnded         = runtime.reportSpellEnded,
             addZoneIgnore         = runtime.addZoneIgnore,
             -- Extended Target window per-spawn overrides (see runtime.setXtForce)
             setXtForce            = runtime.setXtForce,
@@ -7387,6 +7482,12 @@ function runtime.initPluginManager()
             -- runtime function directly from onDrawUI.
             defer                 = function(label, fn) return pm.defer(label, fn) end,
         }
+        -- True for a manifest entry this build really offers: a function or value present in this table, or an
+        -- event or hook name (which has no key here).
+        api.hasCapability = function(name)
+            local entry = (runtime.apiManifest or {})[name]
+            return entry ~= nil and (entry.kind == "event" or rawget(api, name) ~= nil)
+        end
         setmetatable(api, {
             __index = function(_, k)
                 local getter = live[k]
@@ -7451,6 +7552,47 @@ function runtime.initPluginManager()
         p.errorMsg = phase .. ': ' .. first
         print(string.format('\ar[Triune Plugin Error]\ax %s %s failed: %s', p.name, phase, first))
         if full ~= first then tlog.error('plugin', '%s %s traceback:\n%s', p.name, phase, full) end
+        -- Only fatal failures come here (a draw error, a failed onInit, an error in a plugin's fiber): the plugin
+        -- stops receiving hooks, so what it registered must stop being called too. For onInit this is the rollback
+        -- of whatever it registered before it failed. A failing onDestroy cannot block this: disablePlugin runs
+        -- onDestroy under pcall and then sweeps.
+        runtime.unregisterTargetSelectorsByOwner(p.id)
+    end
+
+    -- A failing HOOK is not a failing PLUGIN (docs/HOOKS.md, section 4.4). A failure is counted per plugin and
+    -- hook; after pm.HOOK_STRIKES in a row the hook is switched off for that plugin until it is reloaded, and a
+    -- success starts the count again. Fatal failures (above) still put the plugin in Error and sweep what it
+    -- registered.
+    pm.HOOK_STRIKES = 3
+
+    -- True while the hook has not been switched off.
+    function pm.hookEnabled(p, hook)
+        return not (p.hookOff and p.hookOff[hook])
+    end
+
+    -- The hook ran without error: the consecutive-failure count starts again.
+    function pm.hookSucceeded(p, hook)
+        if p.hookFails then p.hookFails[hook] = nil end
+    end
+
+    -- The hook raised `err`. Returns true when this failure switched the hook off.
+    function pm.hookFailed(p, hook, err)
+        p.hookFails = p.hookFails or {}
+        local n = (p.hookFails[hook] or 0) + 1
+        p.hookFails[hook] = n
+        local full = tostring(err)
+        local first = full:match('^([^\n]*)') or full
+        if n >= pm.HOOK_STRIKES then
+            p.hookOff = p.hookOff or {}
+            p.hookOff[hook] = true
+            print(string.format('\ar[Triune Plugin Error]\ax %s: %s failed %d times in a row and is switched off until the plugin is reloaded: %s',
+                tostring(p.name), hook, n, first))
+            if full ~= first then tlog.error('plugin', '%s %s traceback:\n%s', tostring(p.name), hook, full) end
+            return true
+        end
+        print(string.format('\ay[Triune Plugin]\ax %s: %s failed (%d of %d): %s', tostring(p.name), hook, n, pm.HOOK_STRIKES, first))
+        if full ~= first then tlog.warn('plugin', '%s %s traceback:\n%s', tostring(p.name), hook, full) end
+        return false
     end
 
     function pm.createFiber(p)
@@ -7476,6 +7618,7 @@ function runtime.initPluginManager()
     local PLUGIN_HOOKS = {
         'onInit', 'onDestroy', 'onTick', 'onDrawUI', 'onDrawSettings', 'onCombatTick', 'onZoned',
         'onLoadoutSaved', 'onSaveSettings', 'onLoadSettings', 'wantsCombatHold', 'onBetweenPulls', 'onCommand',
+        'onSpellRecordChanged',
     }
 
     -- Lower-case filenames in lua/tac/ that are core library modules, not
@@ -7773,6 +7916,7 @@ function runtime.initPluginManager()
         p.instance = inst
         p.status = 'Disabled'
         p.errorMsg = nil
+        p.hookFails, p.hookOff = nil, nil -- a reload switches disabled hooks back on
 
         if not existing then
             pm.plugins[id] = p
@@ -8093,10 +8237,12 @@ function runtime.initPluginManager()
                             if not ok then
                                 pm.reportError(p, 'fiber', debug.traceback(p.thread, tostring(err)))
                             end
-                        elseif p.instance.onTick then
+                        elseif p.instance.onTick and pm.hookEnabled(p, 'onTick') then
                             local ok, err = xpcall(p.instance.onTick, debug.traceback)
                             if not ok then
-                                pm.reportError(p, 'onTick', err)
+                                pm.hookFailed(p, 'onTick', err)
+                            else
+                                pm.hookSucceeded(p, 'onTick')
                             end
                         end
 
@@ -8169,17 +8315,20 @@ function runtime.initPluginManager()
         return true
     end
 
-    -- Runs a hook on every active plugin that defines it; a hook error flags the
-    -- plugin. `firstTrue` stops at (and returns) the first truthy result.
+    -- Runs a hook on every active plugin that defines it. A hook error is counted, not fatal: after
+    -- pm.HOOK_STRIKES in a row that hook is switched off for the plugin (see pm.hookFailed), and the
+    -- call acts as if the plugin had not answered (the safe default: nothing new happens). `firstTrue` stops at (and
+    -- returns) the first truthy result.
     local function dispatch(hookName, firstTrue, ...)
         for _, id in ipairs(pm.pluginOrder) do
             local p = pm.plugins[id]
-            if p and p.enabled and p.status ~= 'Error' and p.instance[hookName] then
+            if p and p.enabled and p.status ~= 'Error' and p.instance[hookName] and pm.hookEnabled(p, hookName) then
                 local ok, res = xpcall(p.instance[hookName], debug.traceback, ...)
                 if not ok then
-                    pm.reportError(p, hookName, res)
-                elseif firstTrue and res then
-                    return res
+                    pm.hookFailed(p, hookName, res)
+                else
+                    pm.hookSucceeded(p, hookName)
+                    if firstTrue and res then return res end
                 end
             end
         end
@@ -8215,6 +8364,24 @@ function runtime.initPluginManager()
 
     -- Fired after the loadout file has been written.
     function pm.onLoadoutSaved() dispatch('onLoadoutSaved', false) end
+
+    -- Fired by runtime.reportSpellEnded after core commits a change. Every plugin gets its own COPIES of the old and
+    -- new records (new is nil when the record is gone), so one plugin cannot alter what another sees.
+    function pm.onSpellRecordChanged(mobId, spell, reason, old, new, detail)
+        local function copy(t) if type(t) ~= "table" then return t end local c = {} for k, v in pairs(t) do c[k] = v end return c end
+        for _, id in ipairs(pm.pluginOrder) do
+            local p = pm.plugins[id]
+            if p and p.enabled and p.status ~= "Error" and p.instance.onSpellRecordChanged
+                and pm.hookEnabled(p, "onSpellRecordChanged") then
+                local ok, err = xpcall(p.instance.onSpellRecordChanged, debug.traceback, mobId, spell, reason, copy(old), copy(new), detail)
+                if not ok then
+                    pm.hookFailed(p, "onSpellRecordChanged", err)
+                else
+                    pm.hookSucceeded(p, "onSpellRecordChanged")
+                end
+            end
+        end
+    end
 
     -- ------------------------------------------------------------------
     -- Plugin windows. A plugin that owns a toggleable window declares
@@ -18703,6 +18870,7 @@ function runtime.castGem(i, g, id)
         runtime.npcSpellLastCast = runtime.npcSpellLastCast or {}
         runtime.npcSpellLastCast[id] = runtime.npcSpellLastCast[id] or {}
         runtime.npcSpellLastCast[id][g.spell] = os.clock()
+        runtime.touchSpellRecord(id, g.spell)
 
         local durSec = 0
         pcall(function()
@@ -19360,6 +19528,7 @@ runtime.useClickie = function(c, id)
             runtime.npcSpellLastCast = runtime.npcSpellLastCast or {}
             runtime.npcSpellLastCast[id] = runtime.npcSpellLastCast[id] or {}
             runtime.npcSpellLastCast[id][effSpell] = os.clock()
+            runtime.touchSpellRecord(id, effSpell)
 
             local durSec = 0
             pcall(function()
@@ -23129,6 +23298,7 @@ runtime.onZoned = function()
     end
     runtime.npcSpellApplied = {}
     runtime.npcSpellLastCast = {}
+    runtime.npcSpellRevision = {}
     runtime.aaEffectUntil = {}
     pursuit.unreachableIds = {}
     pursuit.id = 0
@@ -23561,6 +23731,7 @@ local function combatTick()
             runtime.npcCastCounts = {}
             runtime.npcSpellApplied = {}
             runtime.npcSpellLastCast = {}
+            runtime.npcSpellRevision = {}
             runtime.discExpires = {}
             runtime.discCooldown = {}
             runtime.aaEffectUntil = {}
