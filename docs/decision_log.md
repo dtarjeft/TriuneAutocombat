@@ -49,4 +49,12 @@ Entries that supersede a specification item are listed here, so the supersession
 - **Supersedes:** nothing in a specification. It adds to `CLAUDE.md`'s rules; where `CLAUDE.md` says "do not push anything unless asked", the docs-only exception in item 7 applies.
 - **Source:** developer statements in chat, 2026-10-13; `docs/Development_Protocol.txt`; commits `0b9c0cb`, `d7a572f`, `0394b30` and `203cbca`.
 
+**Addendum to DL-001, 2026-10-13 — decisions made after reviewing `docs/New_Project_Kit.md`** (the kit was written for another project; it is reference material, not adopted wholesale). Developer's own words, confirmed:
+
+- **User stories are a conversation, on a trial basis this session.** A story is not written as a formal document. The developer talks it through with Claude. Claude's restatement and the labelled items (Requirement, Assumption, Open) from the Protocol still apply to what comes out of that conversation. The trial's result is not yet judged. `User_Story_Template.md` is not being used.
+- **There is no `SPEC.md`.** TAC is an existing project, not a new one, so nothing is created from scratch. This resolves the "SPEC.md" question the kit raised. `docs/HOOKS.md` stays the plugin API contract and is not a project spec.
+- **Helper scripts are made per project, when needed.** Scripts from another project (such as its mutation runner or review-folder scripts) are not reused unless the developer says so, because they may not suit this project.
+
+Not yet decided from the kit review: whether the ledger gets a Dependencies section, and whether TAC needs a single check command. Not verified: that conversational stories carry enough evidence for the decision log; revisit after the first one is done.
+
 ---
