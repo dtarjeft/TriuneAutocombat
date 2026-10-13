@@ -7552,6 +7552,47 @@ function runtime.initPluginManager()
         p.errorMsg = phase .. ': ' .. first
         print(string.format('\ar[Triune Plugin Error]\ax %s %s failed: %s', p.name, phase, first))
         if full ~= first then tlog.error('plugin', '%s %s traceback:\n%s', p.name, phase, full) end
+        -- Only fatal failures come here (a draw error, a failed onInit, an error in a plugin's fiber): the plugin
+        -- stops receiving hooks, so what it registered must stop being called too. For onInit this is the rollback
+        -- of whatever it registered before it failed. A failing onDestroy cannot block this: disablePlugin runs
+        -- onDestroy under pcall and then sweeps.
+        runtime.unregisterTargetSelectorsByOwner(p.id)
+    end
+
+    -- A failing HOOK is not a failing PLUGIN (docs/HOOKS.md, section 4.4). A failure is counted per plugin and
+    -- hook; after pm.HOOK_STRIKES in a row the hook is switched off for that plugin until it is reloaded, and a
+    -- success starts the count again. Fatal failures (above) still put the plugin in Error and sweep what it
+    -- registered.
+    pm.HOOK_STRIKES = 3
+
+    -- True while the hook has not been switched off.
+    function pm.hookEnabled(p, hook)
+        return not (p.hookOff and p.hookOff[hook])
+    end
+
+    -- The hook ran without error: the consecutive-failure count starts again.
+    function pm.hookSucceeded(p, hook)
+        if p.hookFails then p.hookFails[hook] = nil end
+    end
+
+    -- The hook raised `err`. Returns true when this failure switched the hook off.
+    function pm.hookFailed(p, hook, err)
+        p.hookFails = p.hookFails or {}
+        local n = (p.hookFails[hook] or 0) + 1
+        p.hookFails[hook] = n
+        local full = tostring(err)
+        local first = full:match('^([^\n]*)') or full
+        if n >= pm.HOOK_STRIKES then
+            p.hookOff = p.hookOff or {}
+            p.hookOff[hook] = true
+            print(string.format('\ar[Triune Plugin Error]\ax %s: %s failed %d times in a row and is switched off until the plugin is reloaded: %s',
+                tostring(p.name), hook, n, first))
+            if full ~= first then tlog.error('plugin', '%s %s traceback:\n%s', tostring(p.name), hook, full) end
+            return true
+        end
+        print(string.format('\ay[Triune Plugin]\ax %s: %s failed (%d of %d): %s', tostring(p.name), hook, n, pm.HOOK_STRIKES, first))
+        if full ~= first then tlog.warn('plugin', '%s %s traceback:\n%s', tostring(p.name), hook, full) end
+        return false
     end
 
     function pm.createFiber(p)
@@ -7875,6 +7916,7 @@ function runtime.initPluginManager()
         p.instance = inst
         p.status = 'Disabled'
         p.errorMsg = nil
+        p.hookFails, p.hookOff = nil, nil -- a reload switches disabled hooks back on
 
         if not existing then
             pm.plugins[id] = p
@@ -8195,10 +8237,12 @@ function runtime.initPluginManager()
                             if not ok then
                                 pm.reportError(p, 'fiber', debug.traceback(p.thread, tostring(err)))
                             end
-                        elseif p.instance.onTick then
+                        elseif p.instance.onTick and pm.hookEnabled(p, 'onTick') then
                             local ok, err = xpcall(p.instance.onTick, debug.traceback)
                             if not ok then
-                                pm.reportError(p, 'onTick', err)
+                                pm.hookFailed(p, 'onTick', err)
+                            else
+                                pm.hookSucceeded(p, 'onTick')
                             end
                         end
 
@@ -8271,17 +8315,20 @@ function runtime.initPluginManager()
         return true
     end
 
-    -- Runs a hook on every active plugin that defines it; a hook error flags the
-    -- plugin. `firstTrue` stops at (and returns) the first truthy result.
+    -- Runs a hook on every active plugin that defines it. A hook error is counted, not fatal: after
+    -- pm.HOOK_STRIKES in a row that hook is switched off for the plugin (see pm.hookFailed), and the
+    -- call acts as if the plugin had not answered (the safe default: nothing new happens). `firstTrue` stops at (and
+    -- returns) the first truthy result.
     local function dispatch(hookName, firstTrue, ...)
         for _, id in ipairs(pm.pluginOrder) do
             local p = pm.plugins[id]
-            if p and p.enabled and p.status ~= 'Error' and p.instance[hookName] then
+            if p and p.enabled and p.status ~= 'Error' and p.instance[hookName] and pm.hookEnabled(p, hookName) then
                 local ok, res = xpcall(p.instance[hookName], debug.traceback, ...)
                 if not ok then
-                    pm.reportError(p, hookName, res)
-                elseif firstTrue and res then
-                    return res
+                    pm.hookFailed(p, hookName, res)
+                else
+                    pm.hookSucceeded(p, hookName)
+                    if firstTrue and res then return res end
                 end
             end
         end
@@ -8324,9 +8371,14 @@ function runtime.initPluginManager()
         local function copy(t) if type(t) ~= "table" then return t end local c = {} for k, v in pairs(t) do c[k] = v end return c end
         for _, id in ipairs(pm.pluginOrder) do
             local p = pm.plugins[id]
-            if p and p.enabled and p.status ~= "Error" and p.instance.onSpellRecordChanged then
+            if p and p.enabled and p.status ~= "Error" and p.instance.onSpellRecordChanged
+                and pm.hookEnabled(p, "onSpellRecordChanged") then
                 local ok, err = xpcall(p.instance.onSpellRecordChanged, debug.traceback, mobId, spell, reason, copy(old), copy(new), detail)
-                if not ok then pm.reportError(p, "onSpellRecordChanged", err) end
+                if not ok then
+                    pm.hookFailed(p, "onSpellRecordChanged", err)
+                else
+                    pm.hookSucceeded(p, "onSpellRecordChanged")
+                end
             end
         end
     end

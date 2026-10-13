@@ -10482,12 +10482,46 @@ do
         assert_eq(savedHook, 1, 'Suite 88: pm.onLoadoutSaved dispatches to plugins')
         aa.instance.onLoadoutSaved = realSaved
 
-        -- A hook that throws flags the plugin and stops dispatching to it
-        aa.instance.onCommand = function() error('cmd boom') end
+        -- A failing hook is not a failing plugin (docs/HOOKS.md 4.4): it is counted, three in a row switch that hook off,
+        -- a success starts the count again, and a reload switches it back on. Nothing the plugin registered is swept.
+        -- (state lives in one field of `sandbox`: this file's main chunk is at Lua's 200-local limit)
+        sandbox.hk = { swept = {}, calls = 0, n = 0 }
+        sandbox.runtime.unregisterTargetSelectorsByOwner = function(owner) local sw = sandbox.hk.swept; sw[#sw + 1] = owner; return 0 end
+        aa.instance.onCommand = function() sandbox.hk.calls = sandbox.hk.calls + 1; error('cmd boom') end
         assert_eq(pm.onCommand('autoaa', { 'autoaa' }), false, 'Suite 88: a throwing hook does not count as handled')
-        assert_eq(aa.status, 'Error', 'Suite 88: a throwing hook flags the plugin as Error')
+        assert_eq(aa.status, 'Active', 'Suite 88: a throwing hook does not flag the plugin as Error')
+        assert_eq(pm.hookEnabled(aa, 'onCommand'), true, 'Suite 88: one failure leaves the hook on')
+        pm.onCommand('autoaa', { 'autoaa' })
+        assert_eq(pm.hookEnabled(aa, 'onCommand'), true, 'Suite 88: two failures leave the hook on')
+        pm.onCommand('autoaa', { 'autoaa' })
+        assert_eq(pm.hookEnabled(aa, 'onCommand'), false, 'Suite 88: three failures in a row switch the hook off')
+        assert_eq(sandbox.hk.calls, 3, 'Suite 88: the hook ran three times')
+        pm.onCommand('autoaa', { 'autoaa' })
+        assert_eq(sandbox.hk.calls, 3, 'Suite 88: a hook that is switched off is not called again')
+        assert_eq(aa.status, 'Active', 'Suite 88: the plugin stays active')
+        assert_eq(#sandbox.hk.swept, 0, 'Suite 88: a hook failure sweeps no registrations')
         pm.reloadPlugin('auto_aa')
-        assert_eq(aa.status, 'Active', 'Suite 88: reload recovers the plugin after a hook error')
+        assert_eq(aa.status, 'Active', 'Suite 88: reload keeps the plugin active')
+        assert_eq(pm.hookEnabled(aa, 'onCommand'), true, 'Suite 88: a reload switches the hook back on')
+
+        -- a success starts the count again: fail, fail, succeed, fail, fail leaves the hook on
+        sandbox.hk.n = 0
+        aa.instance.onCommand = function()
+            sandbox.hk.n = sandbox.hk.n + 1
+            if sandbox.hk.n == 3 then return false end
+            error('cmd boom')
+        end
+        for _ = 1, 5 do pm.onCommand('autoaa', { 'autoaa' }) end
+        assert_eq(sandbox.hk.n, 5, 'Suite 88: all five calls ran')
+        assert_eq(pm.hookEnabled(aa, 'onCommand'), true, 'Suite 88: a success in between resets the count')
+
+        -- a fatal failure (a draw error) puts the plugin in Error and sweeps its registrations
+        aa.instance.onDrawUI = function() error('draw boom') end
+        pm.drawUI()
+        assert_eq(aa.status, 'Error', 'Suite 88: a draw error is fatal for the plugin')
+        assert_eq(sandbox.hk.swept[#sandbox.hk.swept], 'auto_aa', 'Suite 88: ...and sweeps what it registered')
+        pm.reloadPlugin('auto_aa')
+        assert_eq(aa.status, 'Active', 'Suite 88: reload recovers the plugin after a fatal error')
     end
 
     -- 11. Spellbook plugin (was the standalone triune_spellbook.lua script)
@@ -11949,6 +11983,17 @@ do
     assert_true(tostring(S.err):find('mq.exit', 1, true) ~= nil, 'Suite 92: reason names mq.exit')
     mockMq.exit(); assert_eq(S.exits, 1, 'Suite 92: original mq.exit restored afterwards')
     pm.scripts['exits_at_load.lua'] = nil
+
+    -- 1c. A plugin whose onInit fails is in Error, and what it registered before failing is swept (rolled back)
+    S.swept = {}
+    rt.unregisterTargetSelectorsByOwner = function(owner) S.swept[#S.swept + 1] = owner; return 0 end
+    S.path = writeJunk('fails_in_init.lua', "return { id = 'fails_in_init', name = 'Fails in init', defaultEnabled = true, onInit = function() error('init boom') end }\n")
+    pm.loadPlugin('fails_in_init.lua', S.path)
+    assert_true(pm.plugins.fails_in_init ~= nil, 'Suite 92: the plugin is registered')
+    assert_eq(pm.plugins.fails_in_init.status, 'Error', 'Suite 92: a failing onInit puts the plugin in Error')
+    assert_eq(S.swept[#S.swept], 'fails_in_init', 'Suite 92: ...and what it registered is swept at once')
+    pm.plugins.fails_in_init = nil -- (later checks expect no junk plugin to stay registered)
+    for k, id in ipairs(pm.pluginOrder) do if id == 'fails_in_init' then table.remove(pm.pluginOrder, k); break end end
 
     -- 1c. UI-triggered lifecycle work is queued and runs from pm.tick (main coroutine), never in the render callback
     S.ran = {}
