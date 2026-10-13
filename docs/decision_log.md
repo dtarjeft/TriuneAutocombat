@@ -58,3 +58,29 @@ Entries that supersede a specification item are listed here, so the supersession
 Not yet decided from the kit review: whether the ledger gets a Dependencies section, and whether TAC needs a single check command. Not verified: that conversational stories carry enough evidence for the decision log; revisit after the first one is done.
 
 ---
+
+### DL-002 — TAC logs move to `Logs\TAC\`
+
+- **Status:** In progress, 2026-10-13. Requirement agreed in conversation; design not yet agreed; nothing built. This entry lives on branch `feat/log-folder` until the feature merges.
+- **Story:** the Protocol (§8) puts a script's logs in a folder named for the script under the MacroQuest `Logs` folder. TAC writes its logs flat into `Logs` (or into `config` when `Logs` cannot be used). Reading the code (2026-10-13): the main log (`tac/triune_log.lua`, `resolveDir`) builds `config/../Logs` and falls back through `config/../logs`, `config`, then the working folder, testing each by writing a probe file. The chat logs (`tac/chat.lua`) use `MacroQuest.Path('logs')` without probing. Nothing in TAC creates a folder. MacroQuest's documentation (`reference/data-types/datatype-macroquest.md`, docs commit `a85c4a6`) says the logs location is configurable and must be read from `${MacroQuest.Path[logs]}`, not hard coded. `lfs` is not bundled; the docs describe it as a LuaRocks module installed through PackageMan, which can be declined. The installed LuaFileSystem 1.9.0 manual documents `lfs.mkdir(dirname)`, returning `true`, or `nil` plus an error message and a system error code.
+- **Requirement (developer's own words, confirmed 2026-10-13):**
+  1. The folder is `Logs\TAC\`.
+  2. Five kinds of file move into it: the main log and its `.old` rotation, the dump files, the chat tab logs, the chat trace file and the chat capture file.
+  3. Chat history (`triune_chat_history_<server>_<Name>.txt`) stays in `config`, because TAC reads it back at the next start.
+  4. Existing log files stay where they are; nothing is moved or copied.
+  5. If the folder cannot be used, TAC behaves as it does today when a log location fails: it falls back and retries a failed open later, without a warning.
+  6. TAC must ensure the folder exists, in two ways: the release ships the folder, and TAC creates it when it is missing.
+  7. The main log asks MacroQuest where `Logs` is (`MacroQuest.Path('logs')`) instead of guessing `config/../Logs`.
+  8. The README is updated to say the logs are in `Logs/TAC/`.
+- **Design choices:** none agreed yet.
+- **Implementation choices:** none.
+- **Open:**
+  - Whether the main log and the chat files share one function for the folder, and where it lives.
+  - How a test build of this feature is named and versioned, given the version-must-match check (see DL-001).
+  - What happens to the other, lower-priority fallback candidates the main log tries today.
+  - Not yet verified: that `lfs.mkdir` succeeds against `Logs` in the running game; that it does not stall the client; that `MacroQuest.Path('logs')` returns a usable path at the point TAC first opens the log.
+- **Shares a seam with:** DL-001 (version naming; the log move was named there as the first piece of work). The hook-priority work is unrelated.
+- **Supersedes:** nothing.
+- **Source:** developer statements in chat, 2026-10-13; `TAC/lua/tac/triune_log.lua`; `TAC/lua/tac/chat.lua`; the MacroQuest docs and the installed LuaFileSystem 1.9.0 manual cited above.
+
+---
