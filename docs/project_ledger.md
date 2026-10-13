@@ -8,7 +8,7 @@ When new evidence resolves an open question, update the ledger before building o
 
 Cold start (replace this block as the state changes; read it first):
 
-- The development protocol was adopted on 2026-10-13. This ledger, the decision log and the lessons log were created that day. They hold no entries yet.
+- The development protocol was adopted on 2026-10-13. This ledger, the decision log and the lessons log were created that day. The decision log holds one retrofit entry, DL-001, covering the agreements of that day; the ledger and lessons log hold no further entries.
 - First planned piece of work: move TAC's logs out of `config` and into the MacroQuest `Logs` folder. Nothing investigated or built yet.
 - Paused: priority ordering for `onCommand` and `onBetweenPulls` (see `docs/HOOKS.md` sections 3.2, 9 and 10). A design was proposed but nothing was agreed or built.
 

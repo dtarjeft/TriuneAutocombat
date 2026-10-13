@@ -24,3 +24,29 @@ Entries that supersede a specification item are listed here, so the supersession
 (none yet)
 
 ---
+
+### DL-001 — Retrofit: adopting the Development Protocol and the working agreements made on 2026-10-13
+
+- **Status:** Retrofit entry, 2026-10-13 (Protocol §19). The decisions below were made in conversation on 2026-10-13 before this log existed. Confirmed means the developer said it in chat; nothing here has been exercised in practice yet.
+- **Story:** the project (a fork of the archived `gennro/TriuneAutocombat`, based on v3.2.0) had working rules only in `CLAUDE.md` and `.agents/AGENTS.md`. The developer supplied a general development protocol, `docs/Development_Protocol.txt`, written for another project, and asked for it to govern this one. Applying it needs a decision log, a project ledger and a lessons log, none of which existed. The developer supplied copies of those three documents from the other project as structural references; they were read first and then cleared for TAC.
+- **Requirement (developer's own words, confirmed):**
+  1. `docs/Development_Protocol.txt` governs development. `CLAUDE.md` points to it as mandatory reading.
+  2. Test builds are named `v3.2.0-<feature>-<N>`: the base version, the feature, then a counter that rises with each build of that feature.
+  3. The decision log and project ledger must exist and be maintained. They were created on this date, along with a lessons log.
+  4. The developer maintains `docs/sibling-project.txt`, the list of the developer's other projects on this platform and what they cover (Protocol §21).
+  5. The developer decides when a session ends (Protocol §22). The ledger and decision log must be current before that point.
+  6. MacroQuest behavior is read from the MacroQuest documentation (https://github.com/macroquest/docs), not guessed.
+  7. Docs-only changes may be committed and pushed directly to `dev` without a feature branch and without asking, except docs about a feature still on a feature branch, which stay on that branch until the feature merges.
+  8. TAC's logs move out of `config` and into the MacroQuest `Logs` folder. This is the first piece of work. Only the direction is agreed.
+- **Design choices:** none agreed yet. How the log move is done, which files move, and the folder layout are not decided.
+- **Implementation choices:** Claude chose the three documents' structure (taken from the reference copies, with the other project's content removed), put the version-naming and other agreements in `CLAUDE.md`, and made the ledger's cold-start block short.
+- **Open:**
+  - How the Protocol §8 file schema (logs in `macroquest\logs\<luaname>\`, configs in `macroquest\config\<luaname>\`) applies to existing TAC files beyond logs.
+  - How pre-release test build names fit the rule that `triune.lua` and `README.md` versions must match.
+  - Earlier decisions recorded only in `docs/HOOKS.md` section 9 are not retrofitted here. Whether to do so is not decided.
+  - Not yet verified: that the Protocol's process (one change at a time, mutation-checked tests, handoff review) works in practice on this project.
+- **Shares a seam with:** none yet. The log move (item 8) will touch the per-server file naming already described in `CLAUDE.md`.
+- **Supersedes:** nothing in a specification. It adds to `CLAUDE.md`'s rules; where `CLAUDE.md` says "do not push anything unless asked", the docs-only exception in item 7 applies.
+- **Source:** developer statements in chat, 2026-10-13; `docs/Development_Protocol.txt`; commits `0b9c0cb`, `d7a572f`, `0394b30` and `203cbca`.
+
+---
