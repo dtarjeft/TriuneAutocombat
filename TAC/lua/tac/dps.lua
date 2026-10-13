@@ -354,7 +354,8 @@ local function getConfigFilePath()
     local myName = 'Default'
     local ok, name = pcall(function() return mq.TLO.Me.CleanName() end)
     if ok and name and name ~= '' then myName = name end
-    cachedConfigPath = string.format('%s/triune_dps_%s.lua', mq.configDir or 'config', myName)
+    cachedConfigPath = (core and core.configFilePath and core.configFilePath('triune_dps', myName, 'lua'))
+        or string.format('%s/triune_dps_%s.lua', mq.configDir or 'config', myName)
     return cachedConfigPath
 end
 
