@@ -1,5 +1,15 @@
 # Triune AutoCombat Change Log
 
+## Unreleased (after 3.2)
+
+- Audit class-dependent spell gems, activated AAs, disciplines, abilities, cooldowns, and spellbook lists for fourth-class support. Refresh Auto AA's scan when selected classes change, and clear stale spellbook selections and caster tabs when classes are changed or removed. Rename the spellbook header to **Active Classes** and add regression coverage for the fourth class's spells, AA eligibility and scans, disciplines, skills, and spellbook tabs and spell lists.
+
+- Support servers with four classes per character while retaining single-class and three-class setups. Add a fourth manual class selector and color, show every class in the status badges and window title, and include the fourth class's pet in pet controls and HUDs. Rename Box Network class labels and widen its class column to fit four abbreviations.
+
+- Fix clearing a class selector so choosing **-- None --** removes that class and compacts the remaining selections without losing the fourth class. Add regression coverage for four-class detection, editing, loadout collection, and pet reconciliation.
+
+---
+
 ## 2026-10-11
 
 - **Canonical Version Bump to 3.2 (`TAC/lua/triune.lua`, `README.md`, `TAC/lua/tac/hud_unitframes.lua`, `tests/test_pure_logic.lua`, `.agents/AGENTS.md`, `RELEASES.md`).** Release of the code-review fixes below plus the new GM Commands plugin. Bumped the version across the main script, the README, the unit-frame window title fallbacks, the test suites and the AGENTS.md examples; `RELEASES.md` has the `## 3.2` summary the release workflow (which now requires it) turns into the GitHub release page. Tag the release as `v3.2`.

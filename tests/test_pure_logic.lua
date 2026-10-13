@@ -11540,6 +11540,21 @@ do
     slots, extra = F.getMultiPetList()
     assert_eq(#extra, 0, 'Suite 92: name-dup: extras never repeat a name shown in a slot')
 
+    -- Four pet classes retain their own slots, including the fourth pet.
+    resetWorld({ 'Nec', 'Mag', 'Bst', 'Enc' }, { Nec = 'Bones', Mag = 'Fire', Bst = 'Tiger', Enc = 'Animation' })
+    addPet(201, 'Bones'); addPet(202, 'Fire'); addPet(203, 'Tiger'); addPet(204, 'Animation')
+    F.reconcilePets()
+    slots, extra = F.getMultiPetList()
+    assert_eq(#slots, 4, 'Suite 92: four classes get four pet slots')
+    assert_eq(#extra, 0, 'Suite 92: fourth class pet is not an extra')
+    for i, cls in ipairs({ 'Nec', 'Mag', 'Bst', 'Enc' }) do
+        assert_eq(slots[i].cls, cls, 'Suite 92: four-pet class order ' .. i)
+        assert_eq(slots[i].petId, 200 + i, 'Suite 92: each class owns its pet ' .. i)
+    end
+    assert_eq(slots[4].scope, 'enc', 'Suite 92: fourth pet retains its command scope')
+    world.spawns[204].dead = true; tick()
+    assert_true(F.isPetMissingForClass('Enc'), 'Suite 92: fourth class can summon a replacement')
+
     -- D. Learned names map pets back to their classes after a restart
     resetWorld({ 'Mag', 'Nec', 'War' }, { Mag = 'Xobarb', Nec = 'Gebann' })
     addPet(100, 'Gebann', { race = 'Unknown', dist = 3 })
@@ -19811,6 +19826,196 @@ do
         'Suite 112: zoning in restores the zone\'s anchor')
     local _, zoneSaves = src:gsub('runtime%.saveZoneAnchor%(%)', '')
     assert_true(zoneSaves >= 3, 'Suite 112: Set / Clear / radius all update the zone entry')
+end
+
+-- Four-class detection and manual selection exercise the production functions.
+do
+    print('--- Four-class support ---')
+    local rawClasses = 'WAR\nCLR\nMAG\nENC'
+    local child = setmetatable({ Text = function() return rawClasses end }, { __call = function() return true end })
+    local window = setmetatable({ Open = function() return true end,
+        Child = function(name) return name == 'IW_ClassAbbr' and child or nil end },
+        { __call = function() return true end })
+    local detectorCode = src:match('(local classesFromInventoryWindow\ndo\n.-)\nlocal function detectClasses')
+    local detectorChunk = assert(loadstring(detectorCode .. '\nreturn classesFromInventoryWindow'))
+    setfenv(detectorChunk, setmetatable({ mq = { TLO = { Window = function() return window end } },
+        parseClassLine = parseClassLine }, { __index = _G }))
+    local detect = detectorChunk()
+    assert_tbl_eq(detect(false, false), { 'War', 'Clr', 'Mag', 'Enc' }, 'detect all four inventory classes')
+    -- A client patch shows the classes two per line ("WAR / PAL"); every one must be detected.
+    rawClasses = 'WAR / PAL\nSHD / MNK'
+    assert_tbl_eq(detect(false, false), { 'War', 'Pal', 'SK', 'Mnk' }, 'classes shown two per line are all detected')
+    rawClasses = 'WAR, CLR\nMAG|ENC'
+    assert_tbl_eq(detect(false, false), { 'War', 'Clr', 'Mag', 'Enc' }, 'other separators between classes are handled too')
+    rawClasses = 'WAR\nCLR\nMAG'
+    assert_tbl_eq(detect(false, false), { 'War', 'Clr', 'Mag' }, 'three-class detection remains supported')
+    rawClasses = 'WAR'
+    assert_tbl_eq(detect(false, false), { 'War' }, 'single-class detection remains supported')
+
+    local classes, edits, calls, saves = { 'War', 'Clr', 'Mag' }, {}, 0, 0
+    local collect = loadFunc(src, 'collectEntry', { myClasses = classes, loadout = {}, ctrl = {} })
+    local saved
+    local pickerSrc = src:gsub('function UI%.drawClassPicker%(', 'local function drawClassPicker(')
+    local draw = loadFunc(pickerSrc, 'drawClassPicker', {
+        myClasses = classes, UI = { px = function(n) return n end },
+        runtime = { saveLoadout = function() saves = saves + 1; saved = collect().classes end },
+        ImGuiTreeNodeFlags = { DefaultOpen = 0 }, MUTED = {}, accent = function() end,
+        ImGui = { CollapsingHeader = function() return true end, TextDisabled = function() end,
+            SetNextItemWidth = function() end, SameLine = function() end, Button = function() return false end,
+            Combo = function(id, current) calls = calls + 1; return edits[id] or current end },
+    })
+    edits['##cls4'] = 15 -- Enc
+    draw()
+    assert_eq(calls, 4, 'picker exposes four class selectors')
+    assert_tbl_eq(classes, { 'War', 'Clr', 'Mag', 'Enc' }, 'add a fourth class')
+    assert_tbl_eq(saved, { 'War', 'Clr', 'Mag', 'Enc' }, 'loadout collection preserves all four classes')
+    local reloaded = assert(loadstring('return ' .. serializeToString(saved)))()
+    assert_tbl_eq(reloaded, { 'War', 'Clr', 'Mag', 'Enc' }, 'four classes survive loadout serialization')
+    edits = { ['##cls2'] = 1 }; draw()
+    assert_tbl_eq(classes, { 'War', 'Mag', 'Enc' }, 'clearing an earlier slot preserves the fourth class')
+    edits = { ['##cls3'] = 1 }; draw()
+    assert_tbl_eq(classes, { 'War', 'Mag' }, 'clear the last selected class')
+    assert_eq(saves, 3, 'each edit saves the loadout')
+    local color = loadFunc(src, 'classColor', { myClasses = { 'War', 'Clr', 'Mag', 'Enc' } })
+    local r, g, b = color('Enc')
+    assert_tbl_eq({ r, g, b }, { 0.75, 0.55, 1.00 }, 'fourth class gets its own color')
+    local title
+    local fullGuiSrc = src:gsub('function UI%.drawFullGui%(', 'local function drawFullGui(')
+    local noop = function() end
+    local gui = loadFunc(fullGuiSrc, 'drawFullGui', {
+        open = true, ctrl = {}, myClasses = { 'War', 'Clr', 'Mag', 'Enc' }, myName = 'Tester', VERSION = 'test',
+        ImGuiCond = { FirstUseEver = 0 }, ImGuiWindowFlags = { HorizontalScrollbar = 0 },
+        UI = { px = function(n) return n end, pushTheme = noop, popTheme = noop,
+            preBeginWindow = noop, preEndWindow = noop, windowFlags = function(_, f) return f end },
+        ImGui = { SetNextWindowSize = noop, End = noop,
+            Begin = function(t) title = t; return true, false end },
+    })
+    gui()
+    assert_true(title:find('(War / Clr / Mag / Enc)', 1, true) ~= nil, 'window title includes the fourth class')
+end
+
+do
+    print('--- Fourth-class spell gems, AA and discipline tabs, and abilities ---')
+    local classes = { 'War', 'Clr', 'Mag', 'Enc' }
+    local data = { spells = { Enc = { { 'Fourth Spell', 20, 1, 'buff' }, { 'Too High', 80, 1, 'buff' } } },
+        aas = { Enc = { [10] = { { 'Fourth AA', 10 } } } },
+        discs = { Enc = { { 'Fourth Disc', 20 } } }, ALIAS_CLASS_MAP = {} }
+    local rt = { PURE_MELEE = { War = true }, filteredSpellsCache = {} }
+    local env = { myClasses = classes, DATA = data, runtime = rt, ctrl = { scribed_only = true }, lvlMin = 1, lvlMax = 60,
+        isDisciplineSpell = function() return false end, isScribed = function(n) return n == 'Fourth Spell' end,
+        mapTLOCategoryToKind = function() return 'other' end }
+    env.lookupSpells = loadFunc(src, 'lookupSpells', env)
+    local filter = loadFunc(src, 'filteredSpells', env)
+    local names, lookup = filter('Enc')
+    assert_eq(#names, 1, 'gem filter includes the fourth class and respects scribed/level filters')
+    assert_eq(lookup[1].name, 'Fourth Spell', 'fourth-class spell is selectable')
+    assert_eq(rt.filteredSpellsCache.Enc.indexOf['Fourth Spell'], 2, 'gem combo indexes the fourth-class spell')
+    local info = loadFunc(src, 'spellClassInfo', env)
+    local cls, bene, kind = info('Fourth Spell')
+    assert_eq(cls, 'Enc', 'Import Bar assigns spells to the fourth class')
+    assert_true(bene and kind == 'buff', 'fourth-class spell retains its casting defaults')
+    -- Use the production class-option block, including its iteration.
+    local optsCode = src:match('(local classOpts = {.-\n                for _, c in ipairs%(myClasses%) do classOpts%[#classOpts %+ 1%] = c end)')
+    local optionChunk = assert(loadstring(optsCode .. '\nreturn classOpts'))
+    setfenv(optionChunk, setmetatable({ myClasses = classes }, { __index = _G }))
+    assert_tbl_eq(optionChunk(), { '--', 'War', 'Clr', 'Mag', 'Enc' }, 'spell gem class selector includes slot four')
+
+    local noop = function() end
+    local pushed = {}
+    local imgui = setmetatable({ BeginTabItem = function() return true end, BeginChild = function() return true end,
+        PushID = function(id) pushed[#pushed + 1] = tostring(id) end,
+        Checkbox = function(_, v) return v end, Button = function() return false end,
+        IsItemHovered = function() return false end }, { __index = function() return noop end })
+    local loadout = { aas = {}, discs = {} }
+    local uiEnv = { myClasses = classes, DATA = data, loadout = loadout, ctrl = { aa_purchased_only = true, disc_trained_only = true },
+        runtime = { hasAA = function(n) return n == 'Fourth AA' end, hasDisc = function(n) return n == 'Fourth Disc' end },
+        UI = { px = function(n) return n end }, ImGui = imgui, ImGuiStyleVar = {},
+        aaTier = aaTier, fmtSec = function(n) return tostring(n) end,
+        classColor = function() return 1, 1, 1, 1 end, isFeignDeathAbility = function() return false end }
+    for _, tab in ipairs({ 'drawAATab', 'drawDiscTab' }) do
+        local tabSrc = src:gsub('function UI%.' .. tab .. '%(', 'local function ' .. tab .. '(')
+        loadFunc(tabSrc, tab, uiEnv)()
+    end
+    -- 3.2 draws unsaved rows with a throwaway default and stores them only once enabled, so the
+    -- check is that each tab drew a row for the fourth class, not that it wrote a loadout entry.
+    local function drewRow(part)
+        for _, id in ipairs(pushed) do if id:find(part, 1, true) then return true end end
+        return false
+    end
+    assert_true(drewRow('_Enc_Fourth AA'), 'activated AA tab includes purchased AAs from slot four')
+    assert_true(drewRow('discEncFourth Disc'), 'disciplines tab includes trained discs from slot four')
+    local order = loadFunc(src, 'aaTabOrder', { myClasses = classes, DATA = data, runtime = {}, aaTier = aaTier })()
+    assert_eq(order['Fourth AA'], 1, 'combat AA ordering includes slot four')
+    local skills = loadFunc(src, 'getClientAbilities', { myClasses = classes, CLASS_ACTIONS = { Enc = { 'Fourth Skill' }, racial = {}, universal = {} },
+        mq = { TLO = { Me = {} } }, hasActionSkill = function() return true end, ctrl = { action_trained_only = true } })()
+    assert_eq(skills[1].cls, 'Enc', 'abilities list includes slot four skills')
+end
+
+do
+    print('--- Fourth-class spellbook tabs and spell lists ---')
+    local book = assert(loadfile('TAC/lua/tac/spellbook.lua'))()
+    local api = { myClasses = { 'Clr', 'Dru', 'Mag', 'Enc' }, ctrl = {}, runtime = {}, ImGui = {},
+        DATA = { spells = { Enc = { { 'Fourth Book Spell', 20, 1, 'buff' } } } },
+        normalizeSpellName = function(n) return n:lower() end, cleanSpellName = function(n) return n end,
+        mq = { TLO = { Me = { Book = function() return function() return nil end end }, Spell = function() return nil end } } }
+    book.onInit(api)
+    assert_tbl_eq(book.state.casterClasses, { 'Clr', 'Dru', 'Mag', 'Enc' }, 'spellbook exposes four caster tabs')
+    assert_eq(book.getClassSpells('Enc')[1][1], 'Fourth Book Spell', 'spellbook database contains fourth-class spells')
+    api.ctrl.show_spellbook = true
+    book.getActiveClassSpells('Enc')
+    for _ = 1, 7 do book.onTick() end
+    local spells = book.getActiveClassSpells('Enc')
+    assert_eq(spells[1].name, 'Fourth Book Spell', 'fourth-class browser builds and publishes its spell list')
+    api.ctrl.show_spellbook = false
+    book.state.activeClassTab = 4; book.state.selectedSpell = spells[1]
+    api.myClasses = { 'Clr', 'Dru', 'Mag', 'Shm' }; book.onTick()
+    assert_nil(book.state.selectedSpell, 'replacing the fourth class clears the old selected spell')
+    assert_eq(book.state.casterClasses[4], 'Shm', 'fourth caster tab updates after replacement')
+    api.myClasses = { 'War', 'Clr', 'Mag', 'Enc' }; book.onTick()
+    assert_tbl_eq(book.state.casterClasses, { 'Clr', 'Mag', 'Enc' }, 'melee filtering retains the fourth class caster')
+    assert_eq(book.state.activeClassTab, 3, 'removed caster tabs clamp the active tab')
+    api.myClasses = {}; book.onTick()
+    assert_eq(#book.state.casterClasses, 0, 'clearing classes clears all spellbook tabs')
+    assert_eq(#book.state.myClasses, 0, 'spellbook follows an empty live class list')
+    book.onDestroy()
+end
+
+do
+    print('--- Fourth-class Auto AA restrictions and rescans ---')
+    local plugin = assert(loadfile('TAC/lua/tac/auto_aa.lua'))()
+    local api = { myClasses = { 'War', 'Clr', 'Mag' }, ctrl = {}, runtime = {}, ImGui = {},
+        DATA = { aas = { Enc = { { 'Fourth Combat AA' } } } },
+        mq = { TLO = { Me = { AltAbility = function() return nil end }, AltAbility = function() return nil end } } }
+    plugin.onInit(api)
+    local engine = plugin.AA
+    engine.AA_CLASS_RESTRICTIONS = { ['Fourth Class AA'] = { Enc = true } }
+    engine.CLASS_SPECIFIC_ABILITIES = { Enc = { 'Fourth Class AA' } }
+    engine.ARCHETYPE_RESTRICTIONS = { ['Fourth Caster AA'] = 'caster' }
+    engine.ARCHETYPE_CLASSES = { caster = { Enc = true } }
+    assert_eq(engine.isAAAllowedForPlayer('Fourth Class AA'), false, 'AA restriction rejects an unselected class')
+    api.myClasses[4] = 'Enc'
+    assert_true(engine.isAAAllowedForPlayer('Fourth Class AA'), 'fourth class satisfies the AA class restriction')
+    assert_true(engine.isAAAllowedForPlayer('Fourth Caster AA'), 'fourth class satisfies the AA archetype restriction')
+    engine.recordScannedAA = function(list, found, name)
+        if not found[name] and engine.isAAAllowedForPlayer(name) then
+            found[name] = true; list[#list + 1] = { name = name, maxRank = 1 }
+        end
+    end
+    engine.getAAWindow = function() return nil end
+    engine.readSpecialTabNamesFromUI = function() return {} end
+    local scans, scan = 0, engine.scanPlayerAAs
+    engine.scanPlayerAAs = function(force) scans = scans + 1; return scan(force) end
+    plugin.onTick()
+    assert_eq(scans, 1, 'adding the fourth class queues a scan on the tick')
+    assert_true(engine.scannedAAMap['Fourth Combat AA'], 'AA scan includes fourth-class combat AAs')
+    assert_true(engine.scannedAAMap['Fourth Class AA'], 'AA scan includes fourth-class training catalog')
+    assert_true(engine.scannedAAMap['Fourth Caster AA'], 'AA scan includes fourth-class archetype AAs')
+    plugin.onTick()
+    assert_eq(scans, 1, 'unchanged classes do not cause repeated scans')
+    api.myClasses[4] = nil; plugin.onTick()
+    assert_eq(scans, 2, 'removing the fourth class refreshes the AA scan')
+    assert_nil(engine.scannedAAMap['Fourth Class AA'], 'removed class AA leaves the scan')
+    plugin.onDestroy()
 end
 
 
