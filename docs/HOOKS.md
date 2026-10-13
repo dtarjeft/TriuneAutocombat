@@ -53,10 +53,14 @@ registries, not to remove access.
 
 ### 2.3 What `apiVersion` promises **[PROPOSED]**
 
-`core.apiVersion = MAJOR.MINOR`.
+`core.apiVersion` is a **string**, `"MAJOR.MINOR"`, with structured access
+(`core.apiVersionInfo = { major = 1, minor = 10 }`) and a helper `core.apiAtLeast(major, minor)`. Plugins must not
+compare versions as Lua numbers: `1.10` and `1.1` are the same number.
 
-- **Minor** bump: additions only (a new hook, function, event, registry or optional argument). A plugin written for
-  `N.x` keeps working on `N.y` for `y >= x`.
+- **Minor** bump: additions (a new hook, function, event, registry or optional argument), and changes to
+  **experimental** entries, which are called out in the release notes. **The compatibility promise covers stable
+  capabilities only:** a plugin that uses only stable entries and was written for `N.x` keeps working on `N.y` for
+  `y >= x`. Experimental entries carry no such promise within a major version, and internal ones none at all.
 - **Major** bump: anything that changes the arguments, return values, **timing, calling context or meaning** of a
   stable entry, or removes one.
 - Behaviour changes are documented in prose release notes even when the signature is unchanged. A signature check is
@@ -149,6 +153,17 @@ The only registry today is the target selector registry (`core.registerTargetSel
 4. A saved reference to something that is no longer registered degrades to "unavailable" and **fails closed** (a
    missing condition does not fire, a missing selector targets nothing, a missing tab or command simply is not there).
 5. Registrations take effect and are removed without a restart.
+6. **[PROPOSED]** A plugin that enters `Error` is treated like a disabled plugin for registrations: its registrations
+   are swept by owner. A registration made during an `onInit` that then fails is rolled back the same way. Reloading
+   the plugin registers again through `onInit`.
+
+**Today [CURRENT], a gap:** nothing is swept when a plugin enters `Error`. `runtime.runTargetSelector` looks the label up
+and calls the resolver without checking the owner's status, so an erroring plugin's selector stays callable. A plugin
+whose `onInit` fails partway keeps whatever it registered before the failure (`pm.enablePlugin` has already marked it
+active, and `pm.reportError` only changes the status).
+**[OPEN]** suspend (keep the entry, skip the call) or remove, and whether a failed `onInit` rolls back (section 9, item 11).
+My lean is remove and roll back: a saved reference then shows as "unavailable" and fails closed, exactly as for a
+disabled plugin, with one code path.
 
 ---
 
@@ -191,6 +206,7 @@ An error in any dispatched hook calls `pm.reportError`: the status becomes `Erro
 traceback goes to the TAC log. A plugin in `Error` receives **no further hooks of any kind** until it is reloaded. The Plugins page shows
 `Error: <message>`, and the plugin's settings panel shows the message with a **Reload Plugin** button.
 **[OPEN]** whether one failure should silence a plugin completely, or only the hook that failed (section 9, item 3).
+Registrations are not cleaned up on `Error` today; see the gap in section 3.3.
 
 ---
 
@@ -215,8 +231,14 @@ The first inventory pass counted only top-level assignments and missed the neste
 - **Mutating** shared state (targeting, casting, cooldown and cast records) is not safe for plugins to do directly,
   because it can undermine coordination between plugins. It is not blocked, and it is not documented as supported.
 - **Plugins report observations; core owns shared record changes.** A plugin that learns something calls a supported
-  function (for example `core.reportSpellEnded(mobId, spell, reason)`, with reasons such as `failed`, `woke`, `faded`).
-  Core decides what to clear and tells other plugins. This is the supported route for what the mez plugin does by hand.
+  function (for example `core.reportSpellEnded(mobId, spell, reason, castAt)`, with reasons such as `failed`, `woke`,
+  `faded`). Core decides what to clear and tells other plugins. This is the supported route for what the mez plugin does
+  by hand.
+- **Reports must not clear a newer cast.** A delayed `failed` or `faded` report for an older cast could otherwise erase
+  the record of a later cast of the same spell on the same mob. `castAt` is the cast time the reporter observed (the
+  value of `npcSpellLastCast[mobId][spell]` it read). Core ignores the report if the current record has a different
+  cast time. A cast identifier or a record revision would serve the same purpose; core picks which. Today the mez
+  plugin approximates this by matching the failed cast's time to a record within 3 seconds, which is a heuristic.
 - **A plugin's own tracking stays private.** The mez plugin's landing-confirmation table is its own and needs no API.
 
 Nothing here is implemented. `reportSpellEnded` does not exist yet.
@@ -270,6 +292,12 @@ first.**
 `hud_cooldowns`, `auto_aa` and the mez plugin. **Proposed: read accessors, experimental; shared-record changes only
 through `reportSpellEnded` (section 5.2), which is new.**
 
+**Accessors return values, not live tables [PROPOSED].** Returning a raw table would keep the nested-write problem
+(a plugin could write into it). Point queries return a copy, for example `core.spellRecord(mobId, spell)` giving
+`{ castAt, expiresAt }`; any list-returning accessor returns a snapshot. The raw tables stay internal-tier.
+**[OPEN]** cost in hot paths: a snapshot of a whole table every tick is expensive, so the supported accessors should
+be point queries or small result sets (section 9, item 13).
+
 ### 7.5 Actions and presets (today `core.runtime` calls)
 
 `castGem`, `fireAA`, `fireDisc`, `fireSkill`, `useClickie`, `tryMem`, `isDiscReady`, `getSpellBookSlot`,
@@ -304,10 +332,14 @@ All **[PROPOSED]**; none exists yet.
 
 - **Contract test.** A file listing every stable entry with its documented signature and calling context. A change that
   breaks it needs a major bump.
-- **Leak test.** For every registry, capture its contents (count and keys) before a plugin is enabled, enable and disable
-  it, and assert the contents equal that baseline (not "empty", so built-in entries may remain). Repeat with two
-  enable/disable cycles and also exercise the real `pm.reloadPlugin` path, which may retain references or clean up
-  differently.
+- **Leak test.** For every registry, capture a snapshot before a plugin is enabled: not only the count and keys but
+  each entry's **identity** (the function or table itself), **owner** and **metadata** (label, side, help text and so
+  on). Enable and disable the plugin and assert the snapshot is identical to the baseline (not "empty", so built-in
+  entries may remain). Comparing counts and keys alone would miss a plugin that replaced an existing entry while
+  keeping both. Repeat with two enable/disable cycles. Also exercise the real `pm.reloadPlugin` path, which may retain
+  references or clean up differently, and after a reload assert that only the **new** plugin instance's registrations
+  remain, by checking that no registered function is one the old instance created. Add a case where `onInit` raises
+  after registering, and one where the plugin enters `Error` (section 3.3).
 - **Write ratchet.** A review guard that lists plugin writes into runtime state and fails when a plugin adds one that is
   not on the list, prompting the question "should this be a supported function?". It is a guard, not a proof. It must
   cover nested writes (`rt.x[a] = ...`), aliases (`local t = rt.x`) and table mutations (`table.insert`,
@@ -332,6 +364,11 @@ All **[PROPOSED]**; none exists yet.
 8. **`reportSpellEnded`.** Reasons list, whether core notifies other plugins, and the migration of the mez plugin.
 9. **Request/callback pair** replacing `pendingCursorClearAt` and `onBoxBuffRequestDone`.
 10. **Extra registries.** Which of conditions, tabs and commands, and when.
+11. **Registrations and `Error`.** Suspend or remove when a plugin enters `Error`, and whether a failed `onInit` rolls
+    back what it registered (section 3.3).
+12. **Version format.** Confirm the string `"MAJOR.MINOR"` with `apiVersionInfo` and `apiAtLeast` (section 2.3).
+13. **Snapshot or live.** Confirm that supported accessors return copies, and set the rule for hot paths (section 7.4).
+14. **Report revisions.** Cast time, a cast identifier or a record revision for `reportSpellEnded` (section 5.2).
 
 ---
 
