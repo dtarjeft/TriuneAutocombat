@@ -20884,6 +20884,26 @@ do
     assert_true(pcall(probe.onDrawUI), 'Suite 118: ...only once')
     probe.onSpellRecordChanged(5, 'Mesmerize', 'woke', record, nil, 'x')
     probe.onDrawSettings()
+
+    -- "probe selftest" against core's real spell record functions (sliced from the source)
+    local text = readFile('TAC/lua/triune.lua'):gsub('\r\n', '\n')
+    local a = assert(text:find('-- Spell records (docs/HOOKS.md, section 5)', 1, true), 'missing spell record block')
+    local b = assert(text:find('-- Server name for per-server config files.', a, true), 'missing end of spell record block')
+    local rt2 = { npcSpellApplied = {}, npcSpellLastCast = {}, npcSpellRevision = {}, spellRecordGen = 0 }
+    local ch = assert(loadstring(text:sub(a, b - 1)))
+    setfenv(ch, setmetatable({ runtime = rt2 }, { __index = _G }))
+    ch()
+    rt2.pluginManager = { onSpellRecordChanged = function(...) probe.onSpellRecordChanged(...) end }
+    local core2 = { hasCapability = function() return true end, registerTargetSelector = function() return true end,
+        spellRecord = rt2.spellRecord, reportSpellEnded = rt2.reportSpellEnded, runtime = rt2,
+        mq = core.mq, ImGui = core.ImGui }
+    probe.onInit(core2)
+    lines = {}
+    run('selftest')
+    local out = table.concat(lines, '\n')
+    assert_true(out:find('FAIL', 1, true) == nil, 'Suite 118: "probe selftest" reports no failure against core\'s real functions')
+    assert_true(out:find('selftest: 13 passed, 0 failed', 1, true) ~= nil, 'Suite 118: ...and runs all of its checks')
+    assert_nil(rt2.npcSpellApplied[999999], 'Suite 118: ...and removes the record it planted')
 end
 
 print(string.format('\n=== Results: %d passed, %d failed ===', pass, fail))

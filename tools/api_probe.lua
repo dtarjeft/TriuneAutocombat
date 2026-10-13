@@ -7,6 +7,7 @@
 --
 --   /ac probe help               the commands
 --   /ac probe version            apiVersion, apiAtLeast and hasCapability
+--   /ac probe selftest           the whole spell-record check in one go: no mob, spell or timing needed
 --   /ac probe record [spell]     the spell records on your target (or one spell)
 --   /ac probe report stale       report an old revision: refused, nothing changes
 --   /ac probe report current     report the current revision: core clears the record, the event prints
@@ -31,6 +32,7 @@ local core = nil
 local last = nil          -- the last record read by "probe record": { mob, spell, revision }
 local mode = nil          -- 'fail' | 'flaky' | 'drawfail' | nil
 local ticks, tickCalls, events = 0, 0, 0
+local lastEvent = nil   -- the arguments of the last onSpellRecordChanged
 local flakyN = 0
 
 local function say(fmt, ...)
@@ -59,7 +61,7 @@ end
 local COMMANDS = {}
 
 COMMANDS.help = function()
-    say('/ac probe version | record [spell] | report stale|current | fail | flaky | drawfail | status')
+    say('/ac probe selftest | version | record [spell] | report stale|current | fail | flaky | drawfail | status')
 end
 
 COMMANDS.version = function()
@@ -77,6 +79,62 @@ COMMANDS.version = function()
         if e.tier == 'stable' then stable = stable + 1 else experimental = experimental + 1 end
     end
     say('manifest: %d entries (%d stable, %d experimental)', n, stable, experimental)
+end
+
+-- Plants a made-up record (mob id 999999, "Probe Spell") through core's own functions, then exercises the
+-- report API on it and prints PASS or FAIL for each check. It needs no target and no timing, and it removes
+-- what it planted. It writes to runtime tables, which is fine for a test tool and nothing a plugin should do.
+COMMANDS.selftest = function()
+    local rt = core.runtime
+    if not (rt and rt.touchSpellRecord and rt.npcSpellApplied and rt.npcSpellLastCast) then
+        say('this build has no spell record support (touchSpellRecord is missing)')
+        return
+    end
+    local mob, spell = 999999, 'Probe Spell'
+    local passed, failed = 0, 0
+    local function check(label, ok)
+        if ok then passed = passed + 1 else failed = failed + 1 end
+        say('%s: %s', ok and 'PASS' or 'FAIL', label)
+    end
+    local function plant()
+        rt.npcSpellLastCast[mob] = rt.npcSpellLastCast[mob] or {}
+        rt.npcSpellLastCast[mob][spell] = os.clock()
+        rt.npcSpellApplied[mob] = rt.npcSpellApplied[mob] or {}
+        rt.npcSpellApplied[mob][spell] = os.clock() + 60
+        rt.touchSpellRecord(mob, spell)
+        return core.spellRecord(mob, spell)
+    end
+    local eventsBefore = events
+
+    local r1 = plant()
+    check('a planted record can be read (revision ' .. fmt(r1 and r1.revision) .. ')', r1 ~= nil and r1.revision ~= nil)
+    local ok, why = core.reportSpellEnded(mob, spell, 'woke', -1, 'selftest stale')
+    check('a report with a revision that cannot match is refused as stale', ok == false and why == 'stale')
+    check('...and the record is still there', core.spellRecord(mob, spell) ~= nil)
+
+    local r2 = plant() -- the same spell cast again on the same mob
+    check('a recast gets a different revision (' .. fmt(r1 and r1.revision) .. ' then ' .. fmt(r2 and r2.revision) .. ')',
+        r1 ~= nil and r2 ~= nil and r1.revision ~= r2.revision)
+    ok, why = core.reportSpellEnded(mob, spell, 'faded', r1.revision, 'selftest late report')
+    check('a late report for the OLDER cast is refused as stale', ok == false and why == 'stale')
+    check('...and the NEWER record survives', core.spellRecord(mob, spell) ~= nil)
+    check('...and no event was emitted for the refused reports', events == eventsBefore)
+
+    ok, why = core.reportSpellEnded(mob, spell, 'woke', r2.revision, 'selftest current')
+    check('a report with the current revision is accepted', ok == true)
+    check('...and core cleared the record', core.spellRecord(mob, spell) == nil)
+    check('...and exactly one onSpellRecordChanged event arrived', events == eventsBefore + 1)
+    check('...carrying the old record (with its revision), no new record, the reason and the detail',
+        lastEvent ~= nil and lastEvent.mob == mob and lastEvent.reason == 'woke' and lastEvent.old ~= nil
+        and lastEvent.old.revision == r2.revision and lastEvent.new == nil and lastEvent.detail == 'selftest current')
+    ok, why = core.reportSpellEnded(mob, spell, 'woke', r2.revision)
+    check('reporting the same thing again does nothing (' .. fmt(why) .. ')', ok == false and why == 'no record')
+    ok, why = core.reportSpellEnded(mob, spell, 'exploded', r2.revision)
+    check('an unknown reason is refused (' .. fmt(why) .. ')', ok == false and why == 'bad reason')
+
+    rt.npcSpellApplied[mob], rt.npcSpellLastCast[mob] = nil, nil
+    if rt.npcSpellRevision then rt.npcSpellRevision[mob] = nil end
+    say('selftest: %d passed, %d failed', passed, failed)
 end
 
 COMMANDS.record = function(args)
@@ -132,7 +190,7 @@ end
 
 function plugin.onInit(coreApi)
     core = coreApi
-    mode, last = nil, nil
+    mode, last, lastEvent = nil, nil, nil
     ticks, tickCalls, events, flakyN = 0, 0, 0, 0
     if core.hasCapability('registerTargetSelector') then
         local ok, why = core.registerTargetSelector({
@@ -189,6 +247,7 @@ end
 
 function plugin.onSpellRecordChanged(mobId, spell, reason, old, new, detail)
     events = events + 1
+    lastEvent = { mob = mobId, spell = spell, reason = reason, old = old, new = new, detail = detail }
     say('onSpellRecordChanged(#%s, %s, %s) old.revision=%s old.expiresAt=%s new=%s detail=%s',
         fmt(mobId), fmt(spell), fmt(reason), fmt(old and old.revision), fmt(old and old.expiresAt), fmt(new), fmt(detail))
 end
