@@ -9,7 +9,7 @@ When new evidence resolves an open question, update the ledger before building o
 Cold start (replace this block as the state changes; read it first):
 
 - The development protocol was adopted on 2026-10-13. This ledger, the decision log and the lessons log were created that day. The decision log holds one retrofit entry, DL-001, covering the agreements of that day; the ledger and lessons log hold no further entries.
-- In progress: moving TAC's logs into `Logs\TAC\` (DL-002), on branch `feat/log-folder`, not merged and not pushed. Built, with passing local tests and a 17-point mutation check. **Nothing is installed in MacroQuest and nothing is verified live.** Next: the developer decides about installing a test build for the live check; the test build's name is still open.
+- In progress: moving TAC's logs into `Logs\TAC\` (DL-002), on branch `feat/log-folder`, not merged and not pushed. Built, with passing local tests and a 17-point mutation check. **Installed 2026-10-13 as test build `v3.2.0-log-folder-1`** (see DL-002 install addendum); **nothing is verified live yet.** Waiting on the developer to restart TAC and turn on Log To File; I then read `Logs\` and `Logs\TAC\` to see where the files went. The previous files are backed up in `C:\Users\legal\TAC-backup-20261013-140007\`.
 - Paused: priority ordering for `onCommand` and `onBetweenPulls` (see `docs/HOOKS.md` sections 3.2, 9 and 10). A design was proposed but nothing was agreed or built.
 
 ## Pending live verification
