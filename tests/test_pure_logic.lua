@@ -19842,6 +19842,11 @@ do
         parseClassLine = parseClassLine }, { __index = _G }))
     local detect = detectorChunk()
     assert_tbl_eq(detect(false, false), { 'War', 'Clr', 'Mag', 'Enc' }, 'detect all four inventory classes')
+    -- A client patch shows the classes two per line ("WAR / PAL"); every one must be detected.
+    rawClasses = 'WAR / PAL\nSHD / MNK'
+    assert_tbl_eq(detect(false, false), { 'War', 'Pal', 'SK', 'Mnk' }, 'classes shown two per line are all detected')
+    rawClasses = 'WAR, CLR\nMAG|ENC'
+    assert_tbl_eq(detect(false, false), { 'War', 'Clr', 'Mag', 'Enc' }, 'other separators between classes are handled too')
     rawClasses = 'WAR\nCLR\nMAG'
     assert_tbl_eq(detect(false, false), { 'War', 'Clr', 'Mag' }, 'three-class detection remains supported')
     rawClasses = 'WAR'

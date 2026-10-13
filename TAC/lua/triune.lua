@@ -1231,6 +1231,16 @@ end
 
 local classesFromInventoryWindow
 do
+    -- The client may show several classes on one line ("WAR / PAL"), so split each line on the
+    -- usual separators before parsing; parseClassLine returns only the first class of a string.
+    local function classLines(text)
+        local out = {}
+        for line in text:gmatch('[^\r\n]+') do
+            for token in line:gmatch('[^/,;|&]+') do out[#out + 1] = token end
+        end
+        return out
+    end
+
     local function scanOneNode(node, found)
         if not node or not node() then return end
         pcall(function()
@@ -1256,7 +1266,7 @@ do
         pcall(function()
             local text = node.Text()
             if text and text ~= '' and text ~= 'NULL' then
-                for line in text:gmatch('[^\r\n]+') do
+                for _, line in ipairs(classLines(text)) do
                     local norm = parseClassLine(line)
                     if norm then
                         local dup = false
@@ -1308,7 +1318,7 @@ do
             if abbrChild and abbrChild() then
                 local text = abbrChild.Text()
                 if text and text ~= '' and text ~= 'NULL' then
-                    for line in text:gmatch('[^\r\n]+') do
+                    for _, line in ipairs(classLines(text)) do
                         local norm = parseClassLine(line)
                         if norm then
                             local dup = false
@@ -1333,7 +1343,7 @@ do
                 if clsChild and clsChild() then
                     local text = clsChild.Text()
                     if text and text ~= '' and text ~= 'NULL' then
-                        for line in text:gmatch('[^\r\n]+') do
+                        for _, line in ipairs(classLines(text)) do
                             local norm = parseClassLine(line)
                             if norm then
                                 local dup = false
@@ -1375,7 +1385,7 @@ do
                     if #found == 0 then
                         local okText, rawText = pcall(function() return listChild.Text() end)
                         if okText and rawText and rawText ~= '' and rawText ~= 'NULL' then
-                            for line in rawText:gmatch('[^\r\n]+') do
+                            for _, line in ipairs(classLines(rawText)) do
                                 local norm = parseClassLine(line)
                                 if norm then
                                     local dup = false
