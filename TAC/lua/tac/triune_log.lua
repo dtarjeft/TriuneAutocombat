@@ -20,6 +20,7 @@ host passes in the config directory and getter closures for the live flags.
 local M = {}
 
 M.LEVELS = { debug = 1, chat = 2, info = 2, warn = 3, error = 4 }
+M.SUBDIR = 'TAC'   -- the folder inside MacroQuest's logs folder that holds TAC's log files
 local LEVEL_TAG = { debug = 'DBG', chat = 'MSG', info = 'INF', warn = 'WRN', error = 'ERR' }
 
 local RING_MAX        = 500              -- lines kept in memory for dump()
@@ -29,6 +30,8 @@ local OPEN_RETRY_SEC  = 30               -- back off after a failed open
 
 local st = {
     configDir      = nil,
+    logsPath       = nil,    -- function() -> MacroQuest's logs folder (or nil); set by the host
+    fs             = nil,    -- { canWrite(dir), mkdir(dir) }; the real ones when nil (tests inject fakes)
     dir            = nil,    -- resolved log directory (probed once)
     version        = '?',
     getFileEnabled = function() return false end,
@@ -170,10 +173,50 @@ local function probeDir(dir)
     return true
 end
 
--- MQ keeps a Logs/ folder next to config/; prefer that, fall back to config/.
+-- Folder creation for the TAC log folder. LuaFileSystem is not bundled with MacroQuest (its docs describe
+-- it as an installable LuaRocks module), so it is looked for with a protected require, as elsewhere in
+-- TAC; without it no folder can be made and the folder is used only if it already exists.
+local function lfsMkdir(path)
+    local ok, lfs = pcall(require, 'lfs')
+    if not ok or type(lfs) ~= 'table' or type(lfs.mkdir) ~= 'function' then return nil, 'lfs is not available' end
+    return lfs.mkdir(path)
+end
+
+local DEFAULT_FS = { canWrite = probeDir, mkdir = lfsMkdir }
+
+-- The folder MacroQuest says holds its logs, without a trailing separator, or nil when it cannot say.
+local function mqLogsDir()
+    if not st.logsPath then return nil end
+    local ok, p = pcall(st.logsPath)
+    if not ok or type(p) ~= 'string' or p == '' then return nil end
+    p = p:gsub('[/\\]+$', '')
+    if p == '' then return nil end
+    return p
+end
+
+-- True when `dir` can be written to; when it cannot and `create` is set, one attempt is made to create it.
+local function usable(dir, create)
+    local fs = st.fs or DEFAULT_FS
+    if fs.canWrite(dir) then return true end
+    if create and fs.mkdir then
+        pcall(fs.mkdir, dir)
+        return fs.canWrite(dir) == true
+    end
+    return false
+end
+
+-- Where the log files go: <MacroQuest logs>/TAC (created when missing), else the MacroQuest logs folder
+-- itself, else the old guess (a Logs/ folder next to config/), else config/, else the working folder.
+-- The answer is worked out once and remembered.
 function M.resolveDir()
     if st.dir then return st.dir end
     local base = st.configDir and tostring(st.configDir):gsub('[/\\]+$', '') or nil
+    local logs = mqLogsDir()
+    if logs then
+        local tac = logs .. '/' .. M.SUBDIR
+        if usable(tac, true) then st.dir = tac; return tac end
+        if usable(logs, false) then st.dir = logs; return logs end
+    end
     local candidates = {}
     if base then
         candidates[#candidates + 1] = base .. '/../Logs'
@@ -182,11 +225,14 @@ function M.resolveDir()
     end
     candidates[#candidates + 1] = '.'
     for _, d in ipairs(candidates) do
-        if probeDir(d) then st.dir = d; return d end
+        if usable(d, false) then st.dir = d; return d end
     end
     st.dir = base or '.'
     return st.dir
 end
+
+-- The log folder, for plugins (core.logDir).
+function M.logDir() return M.resolveDir() end
 
 local function identityTag()
     local server, char = 'unknown', 'unknown'
@@ -410,11 +456,13 @@ end
 -- Setup
 -- ---------------------------------------------------------------------------
 
--- opts: configDir, version, getFileEnabled(), getDebug(), identity() ->
--- server, char; headerInfo() -> { {k, v}, ... }
+-- opts: configDir, logsPath() -> MacroQuest's logs folder, version, getFileEnabled(), getDebug(),
+-- identity() -> server, char; headerInfo() -> { {k, v}, ... }; fs (tests only)
 function M.init(opts)
     opts = opts or {}
     if opts.configDir      then st.configDir = opts.configDir; st.dir = nil end
+    if opts.logsPath       then st.logsPath = opts.logsPath; st.dir = nil end
+    if opts.fs             then st.fs = opts.fs; st.dir = nil end
     if opts.version        then st.version = opts.version end
     if opts.getFileEnabled then st.getFileEnabled = opts.getFileEnabled end
     if opts.getDebug       then st.getDebug = opts.getDebug end
@@ -438,7 +486,7 @@ end
 function M._reset()
     M.close('reset')
     M.unhookPrint()
-    st.dir, st.configDir = nil, nil
+    st.dir, st.configDir, st.logsPath, st.fs = nil, nil, nil, nil
     st.lastOpenFail, st.lastOpenErr = -math.huge, nil
     st.droppedDebug = 0
     M.clearRecent()

@@ -5176,8 +5176,17 @@ end
 -- ============================================================================
 local myName = nil
 
+-- Where MacroQuest keeps its logs. MacroQuest lets the user move that folder, so it is asked, not guessed
+-- (docs: MacroQuest TLO, Path[logs]). nil when it cannot say.
+function runtime.mqLogsPath()
+    local ok, p = pcall(function() return mq.TLO.MacroQuest.Path('logs')() end)
+    if ok and type(p) == 'string' and p ~= '' and p ~= 'NULL' then return p end
+    return nil
+end
+
 tlog.init({
     configDir      = mq.configDir,
+    logsPath       = runtime.mqLogsPath,
     version        = VERSION,
     getFileEnabled = function() return ctrl and ctrl.log_to_file == true end,
     getDebug       = function() return ctrl and ctrl.debug_mode == true end,
@@ -5763,7 +5772,8 @@ runtime.apiManifest = {
     unregisterTargetSelector = { kind = 'registry', tier = 'experimental', since = '1.0' },
     serverTag                = { kind = 'function', tier = 'experimental', since = '1.0' },
     configFilePath           = { kind = 'function', tier = 'experimental', since = '1.0' },
-    spellRecord              = { kind = 'function', tier = 'experimental', since = '1.0' },
+    logDir                   = { kind = 'function', tier = 'experimental', since = '1.0' },
+    spellRecord             = { kind = 'function', tier = 'experimental', since = '1.0' },
     reportSpellEnded         = { kind = 'function', tier = 'experimental', since = '1.0' },
     onSpellRecordChanged     = { kind = 'event',    tier = 'experimental', since = '1.0' },
 }
@@ -7439,6 +7449,10 @@ function runtime.initPluginManager()
             -- copied across on first use).
             serverTag                = runtime.serverTag,
             configFilePath           = runtime.configFilePath,
+            -- Log folder: core.logDir() is where TAC's log files go (MacroQuest's logs folder + TAC,
+            -- created when missing; if that cannot be used, the folder TAC logs to today). Check
+            -- core.hasCapability('logDir') before calling it.
+            logDir                   = function() return tlog.logDir() end,
             -- API version and capability manifest (docs/HOOKS.md): core.apiVersion is a string,
             -- core.hasCapability(name) says whether this build offers a documented entry.
             apiVersion               = runtime.API_VERSION,

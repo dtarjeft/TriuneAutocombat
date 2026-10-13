@@ -20906,6 +20906,147 @@ do
     assert_nil(rt2.npcSpellApplied[999999], 'Suite 118: ...and removes the record it planted')
 end
 
+-- ---------------------------------------------------------------------------
+-- Suite 119: TAC log folder (Logs/TAC). Every expected value cites DL-002 in docs/decision_log.md:
+-- "R1".."R8" are the numbered requirements of that entry.
+-- ---------------------------------------------------------------------------
+do
+    print('--- Suite 119: TAC log folder (Logs/TAC) ---')
+    local L = tlog
+
+    -- A virtual file system: `dirs` are the folders that exist (and can be written to). mkdir
+    -- creates a folder when its parent exists, unless `denyMkdir` or `mkdirRaises` is set.
+    local function vfs(dirs, opts)
+        opts = opts or {}
+        local v = { dirs = {}, mkdirCalls = {}, canWriteCalls = 0 }
+        for _, d in ipairs(dirs) do v.dirs[d] = true end
+        v.fs = {
+            canWrite = function(p) v.canWriteCalls = v.canWriteCalls + 1; return v.dirs[p] == true end,
+        }
+        if not opts.noMkdir then
+            v.fs.mkdir = function(p)
+                v.mkdirCalls[#v.mkdirCalls + 1] = p
+                if opts.mkdirRaises then error('lfs exploded') end
+                if opts.denyMkdir then return nil, 'Permission denied', 13 end
+                local parent = p:match('^(.*)/[^/]+$')
+                if parent and v.dirs[parent] then v.dirs[p] = true; return true end
+                return nil, 'No such file or directory', 2
+            end
+        end
+        return v
+    end
+    local function setup(v, logsPath, configDir)
+        L._reset()
+        L.init({
+            configDir = configDir or '/mq/config', version = 'T', fs = v.fs,
+            logsPath = logsPath,
+            identity = function() return 'TestSrv', 'Suite119' end,
+        })
+        return L
+    end
+    local function logs(p) return function() return p end end
+
+    -- R1, R6: the folder is <MacroQuest logs>/TAC
+    local v = vfs({ '/mq/Logs', '/mq/Logs/TAC' })
+    assert_eq(setup(v, logs('/mq/Logs')).resolveDir(), '/mq/Logs/TAC', 'Suite 119 R1: the log folder is <logs>/TAC when it exists')
+    assert_eq(#v.mkdirCalls, 0, 'Suite 119 R6: a folder that already exists (shipped in the release) is not created again')
+
+    -- R6: TAC creates the folder when it is missing
+    v = vfs({ '/mq/Logs' })
+    assert_eq(setup(v, logs('/mq/Logs')).resolveDir(), '/mq/Logs/TAC', 'Suite 119 R6: a missing folder is created and used')
+    assert_tbl_eq(v.mkdirCalls, { '/mq/Logs/TAC' }, 'Suite 119 R6: mkdir is called once, for <logs>/TAC only')
+    local checksBefore = v.canWriteCalls
+    L.resolveDir()
+    assert_eq(v.canWriteCalls, checksBefore, 'Suite 119: the answer is remembered, so the folders are not probed again')
+    assert_eq(#v.mkdirCalls, 1, 'Suite 119 R6: ...and the folder is not created again')
+
+    -- R5: if the folder cannot be made, fall back as today (flat Logs), without an error
+    v = vfs({ '/mq/Logs' }, { denyMkdir = true })
+    assert_eq(setup(v, logs('/mq/Logs')).resolveDir(), '/mq/Logs', 'Suite 119 R5: a refused mkdir falls back to the logs folder')
+    v = vfs({ '/mq/Logs' }, { mkdirRaises = true })
+    local okCall, got = pcall(function() return setup(v, logs('/mq/Logs')).resolveDir() end)
+    assert_true(okCall, 'Suite 119 R5: an mkdir that raises does not escape: ' .. tostring(got))
+    assert_eq(got, '/mq/Logs', 'Suite 119 R5: ...and falls back to the logs folder')
+    v = vfs({ '/mq/Logs' }, { noMkdir = true })
+    assert_eq(setup(v, logs('/mq/Logs')).resolveDir(), '/mq/Logs', 'Suite 119 R5: without a way to make folders (no lfs) it falls back to the logs folder')
+    v = vfs({ '/mq/Logs', '/mq/Logs/TAC' }, { noMkdir = true })
+    assert_eq(setup(v, logs('/mq/Logs')).resolveDir(), '/mq/Logs/TAC', 'Suite 119 R6: without lfs, a shipped folder is still used')
+
+    -- R7: MacroQuest is asked where the logs folder is; when it cannot say, the old guess chain applies
+    v = vfs({ '/mq/config/../Logs' })
+    assert_eq(setup(v, logs(nil)).resolveDir(), '/mq/config/../Logs', 'Suite 119 R5/R7: no answer from MacroQuest -> the old config/../Logs guess')
+    v = vfs({ '/mq/config/../Logs' })
+    assert_eq(setup(v, function() error('no TLO') end).resolveDir(), '/mq/config/../Logs', 'Suite 119 R5/R7: a failing question is treated as no answer')
+    v = vfs({ '/elsewhere/mqlogs', '/mq/Logs' })
+    assert_eq(setup(v, logs('/elsewhere/mqlogs')).resolveDir(), '/elsewhere/mqlogs/TAC', 'Suite 119 R7: a moved logs folder is honoured, not the config/../Logs guess')
+    assert_eq(v.dirs['/mq/Logs/TAC'], nil, 'Suite 119 R7: ...and nothing is created under the guessed folder')
+
+    -- trailing separators do not matter
+    v = vfs({ '/mq/Logs' })
+    assert_eq(setup(v, logs('/mq/Logs/')).resolveDir(), '/mq/Logs/TAC', 'Suite 119 R1: a trailing slash is dropped')
+    v = vfs({ '/mq/Logs' })
+    assert_eq(setup(v, logs('/mq/Logs\\')).resolveDir(), '/mq/Logs/TAC', 'Suite 119 R1: a trailing backslash is dropped')
+
+    -- R2: the main log, its dump files and its rotation sit in that folder
+    v = vfs({ '/mq/Logs' })
+    setup(v, logs('/mq/Logs'))
+    assert_eq(L.filePath(), '/mq/Logs/TAC/triune_TestSrv_Suite119.log', 'Suite 119 R2: the main log is in Logs/TAC')
+    assert_true(L.dumpPath():match('^/mq/Logs/TAC/triune_dump_TestSrv_Suite119_%d+_%d+%.log$') ~= nil, 'Suite 119 R2: dump files are in Logs/TAC: ' .. L.dumpPath())
+    assert_eq(L.logDir(), '/mq/Logs/TAC', 'Suite 119: logDir() is the same answer, for plugins')
+    L._reset()
+
+    -- the question asked of MacroQuest (R7)
+    local ask = loadFunc(src, 'mqLogsPath', { mq = { TLO = { MacroQuest = { Path = function(which)
+        return function() return which == 'logs' and 'C:\\MQ\\Logs' or 'wrong' end
+    end } } } })
+    assert_eq(ask(), 'C:\\MQ\\Logs', 'Suite 119 R7: core asks MacroQuest.Path(logs)')
+    local function askWith(r) return loadFunc(src, 'mqLogsPath', { mq = { TLO = { MacroQuest = { Path = function() return function() return r end end } } } })() end
+    assert_nil(askWith(''), 'Suite 119 R7: an empty answer is no answer')
+    assert_nil(askWith(nil), 'Suite 119 R7: nil is no answer')
+    assert_nil(askWith('NULL'), 'Suite 119 R7: NULL is no answer')
+    assert_nil(loadFunc(src, 'mqLogsPath', { mq = { TLO = { MacroQuest = { Path = function() error('boom') end } } } })(), 'Suite 119 R7: a failing TLO is no answer')
+
+    -- the core hands plugins the answer, and says so in the manifest
+    local ga = assert(src:find('function pm.getCoreApi()', 1, true), 'missing getCoreApi')
+    local gb = assert(src:find('setmetatable(api, {', ga, true), 'missing end of getCoreApi table')
+    assert_true(src:sub(ga, gb):find('\n%s+logDir%s*=') ~= nil, 'Suite 119: the core API table has logDir')
+    assert_true(src:find("logDir                   = { kind = 'function'", 1, true) ~= nil, 'Suite 119: the manifest lists logDir')
+    assert_true(src:find('logsPath       = runtime.mqLogsPath', 1, true) ~= nil, 'Suite 119 R7: the logger is told how to ask MacroQuest')
+
+    -- R2: the chat plugin's three log writers use the core's folder; with an older core they keep their own behaviour
+    local chatSrc = readFile('TAC/lua/tac/chat.lua')
+    local function chatLogsDir(coreTable, mqPath)
+        return loadFunc(chatSrc, 'logsDir', {
+            core = coreTable,
+            mq = { configDir = '/mq/config', TLO = { MacroQuest = { Path = function() return function() return mqPath end end } } },
+        })
+    end
+    assert_eq(chatLogsDir({ hasCapability = function(n) return n == 'logDir' end, logDir = function() return '/mq/Logs/TAC' end }, '/mq/Logs')(),
+        '/mq/Logs/TAC', 'Suite 119 R2: chat logs go to the core\'s log folder')
+    assert_eq(chatLogsDir({ hasCapability = function() return false end }, '/mq/Logs')(),
+        '/mq/Logs', 'Suite 119: an older core (no logDir) leaves chat on MacroQuest.Path(logs)')
+    assert_eq(chatLogsDir({ hasCapability = function() return true end, logDir = function() return nil end }, '/mq/Logs')(),
+        '/mq/Logs', 'Suite 119 R5: a core that has no answer leaves chat on MacroQuest.Path(logs)')
+    assert_eq(chatLogsDir({ hasCapability = function() return true end, logDir = function() error('boom') end }, '/mq/Logs')(),
+        '/mq/Logs', 'Suite 119 R5: a core that raises leaves chat on MacroQuest.Path(logs)')
+    assert_eq(chatLogsDir(nil, nil)(), '/mq/config', 'Suite 119 R5: with neither, chat falls back to config as today')
+    assert_true(chatSrc:find("string.format('%s/tac_chat_trace_%s.txt', logsDir()", 1, true) ~= nil, 'Suite 119 R2: the chat trace file uses the shared folder')
+    assert_true(chatSrc:find("string.format('%s/tac_chat_capture_%s.txt', logsDir()", 1, true) ~= nil, 'Suite 119 R2: the chat capture file uses the shared folder')
+    assert_true(chatSrc:find("string.format('%s/tac_chat_%s_%s_%s.txt', logsDir()", 1, true) ~= nil, 'Suite 119 R2: the chat tab logs use the shared folder')
+    -- R3: chat history is state, not a log, and stays in config
+    local historyLine = chatSrc:match('[^\n]*triune_chat_history_%%s%.txt[^\n]*') or ''
+    assert_true(historyLine:find('mq.configDir', 1, true) ~= nil and historyLine:find('logsDir', 1, true) == nil,
+        'Suite 119 R3: the chat history path is built from the config folder, not the log folder (checked in the source line)')
+
+    -- R6: the release ships the folder, R8: the README says where the logs are
+    local keep = readFile('TAC/Logs/TAC/README.txt')
+    assert_true(#keep > 0 and keep:find('TAC', 1, true) ~= nil, 'Suite 119 R6: the release ships TAC/Logs/TAC/ with a placeholder file')
+    local readme = readFile('README.md')
+    assert_true(readme:find('the `Logs/TAC/` folder inside your MacroQuest folder (`triune_<server>_<char>.log`', 1, true) ~= nil, 'Suite 119 R8: the README bug-report advice points at Logs/TAC/')
+    assert_true(readme:find('| `Logs/TAC/triune_*.log` |', 1, true) ~= nil, 'Suite 119 R8: the README file table lists Logs/TAC/')
+    assert_true(readme:find('| `Logs/triune_*.log` |', 1, true) == nil and readme:find('your MacroQuest `Logs/` folder', 1, true) == nil, 'Suite 119 R8: the README no longer says the logs are in the flat Logs folder')
+end
+
 print(string.format('\n=== Results: %d passed, %d failed ===', pass, fail))
 if fail > 0 then
     print('\nFailures:')
