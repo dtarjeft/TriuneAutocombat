@@ -118,7 +118,7 @@ Type `/ac help` in game for the full list.
 
 - **Not moving or pulling?** Look at the Status tab. It shows whether MQ2Nav and MQ2MoveUtils are loaded and whether the zone has a navmesh, with buttons to load or reload them.
 - **Stuck on terrain?** Triune remembers where it got stuck and routes around it next time. Clear those spots under **Settings -> Navigation**.
-- **Need to report a bug?** Turn on **Log To File** (`/ac log on`) and, when it happens, run `/ac dump`. Attach the files from your MacroQuest `Logs/` folder (`triune_<server>_<char>.log` and `triune_dump_...log`). `/ac debug` prints extra detail to chat.
+- **Need to report a bug?** Turn on **Log To File** (`/ac log on`) and, when it happens, run `/ac dump`. Attach the files from the `Logs/TAC/` folder inside your MacroQuest folder (`triune_<server>_<char>.log` and `triune_dump_...log`). `/ac debug` prints extra detail to chat.
 - **Game feels slow with Lua scripts?** Triune sets MQ2Lua's `turboNum` to 10000 on first start (the default of 500 makes every Lua script crawl). If you set it higher yourself, Triune leaves it alone.
 - **A plugin broke?** It is isolated - it shows an error under Settings -> Plugins and the rest keeps running. Fix or disable it there.
 
@@ -132,7 +132,7 @@ All paths are inside your MacroQuest folder.
 |---|---|
 | `config/triune_loadout_<server>_<char>.lua` | Each character's settings and loadouts. Never overwritten by updates. |
 | `config/triune_chat_<Name>.lua` | Chat Windows layout and colours, per character. |
-| `Logs/triune_*.log` | Diagnostic logs (when Log To File is on). |
+| `Logs/TAC/triune_*.log` | Diagnostic logs (when Log To File is on), `/ac dump` files and the Chat Windows logs. TAC creates the folder if it is missing. Log files from older versions stay in `Logs/`. |
 | `lua/triune.lua` | The bot itself. |
 | `lua/tac/*.lua` | The plugins listed above. Drop your own `.lua` plugin here and it loads. |
 | `resources/gamedb/` | The offline game database (in both release zips). |

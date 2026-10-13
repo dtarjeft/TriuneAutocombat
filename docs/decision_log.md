@@ -86,3 +86,19 @@ Not yet decided from the kit review: whether the ledger gets a Dependencies sect
 ---
 
 **Addendum to DL-002, 2026-10-13 — design choice 1 approved.** The developer chose Option A in their own words ("A"): one shared function decides the log folder. It lives in `tac/triune_log.lua`, which already manages log folders, and the chat plugin reads it through the core plugin API (a new manifest entry, with the chat plugin keeping its current behavior when the entry is absent). The function asks MacroQuest for the logs location, adds `TAC`, creates the folder when it is missing and `lfs` is available (under `pcall`), checks that it can be written, remembers the answer, and on failure falls back as today. Worst case stated to the developer: chat and core get out of step and chat logs fall back to flat `Logs`; no log is lost. The API entry's name and the function's exact shape are implementation choices, still to be made and shown. Still open: the version and name of a test build of this feature.
+
+**Addendum to DL-002, 2026-10-13 — built locally on `feat/log-folder`; not installed, not live-tested.**
+- **What was built (implementation choices, made by Claude):**
+  - `triune_log.lua`: `resolveDir()` tries `<MacroQuest logs>/TAC` (creating it once with `lfs.mkdir` under `pcall` when it is missing), then the logs folder itself, then the old guess chain (`config/../Logs`, `config/../logs`, `config`, `.`). The answer is remembered. New `logDir()`; `M.SUBDIR = 'TAC'`. The logger takes a `logsPath` function and, for tests only, an `fs` table (`canWrite`, `mkdir`).
+  - `triune.lua`: `runtime.mqLogsPath()` asks `MacroQuest.Path('logs')` (empty, `NULL`, nil and errors count as no answer); new core API entry `logDir` (experimental, since 1.0).
+  - `chat.lua`: one `logsDir()` shared by the tab logs, the trace and the capture file; it uses `core.logDir()` when `core.hasCapability('logDir')`, else the old behaviour. The two help strings name `Logs/TAC/`. Chat history is untouched.
+  - `TAC/Logs/TAC/README.txt` ships the folder in the release zips (`git archive` of `TAC/`). `README.md` and `CHANGELOG.md` updated.
+- **Evidence (local tier only):** `tests/test_pure_logic.lua` Suite 119, 45 new assertions, each citing a DL-002 requirement; suite result 8473 passed and 2 failed (Suite 86 and Suite 103, the known failures; baseline before the change was 8428 passed and the same 2). Mutation check of 17 deliberate defects (scratch script, not in the repo): all 17 caught, 2 of them by crashing the run. Two mutations first survived (chat history moved into the log folder; one README line reverted); the tests were tightened and both are now caught. LuaJIT parse of the four Lua files, the version check (3.2 = 3.2) and the theme check pass. `luac5.1` and `luacheck` are not installed, so the CI lint has not been run on this change.
+- **Not verified, and not to be described as confirmed:**
+  - that `lfs.mkdir` creates `Logs\TAC` in the running game, including with the mixed separator in `C:\...\Logs/TAC`;
+  - that creating the folder does not stall the client;
+  - that `MacroQuest.Path('logs')` returns a usable path when TAC first opens a log;
+  - that the Chat plugin picks up `core.logDir` in the running game (the tests use a fake core);
+  - that the placeholder file extracts into `Logs\TAC\` from a real release zip;
+  - that `luacheck` and `luac5.1` accept the change.
+- **Open:** the name and version of a test build (DL-001). The method for the live check: install, run TAC with Log To File on, and look for the files in `Logs\TAC\`; no staged scenario is needed.

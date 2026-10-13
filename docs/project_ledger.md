@@ -9,22 +9,29 @@ When new evidence resolves an open question, update the ledger before building o
 Cold start (replace this block as the state changes; read it first):
 
 - The development protocol was adopted on 2026-10-13. This ledger, the decision log and the lessons log were created that day. The decision log holds one retrofit entry, DL-001, covering the agreements of that day; the ledger and lessons log hold no further entries.
-- First planned piece of work: move TAC's logs out of `config` and into the MacroQuest `Logs` folder. Nothing investigated or built yet.
+- In progress: moving TAC's logs into `Logs\TAC\` (DL-002), on branch `feat/log-folder`, not merged and not pushed. Built, with passing local tests and a 17-point mutation check. **Nothing is installed in MacroQuest and nothing is verified live.** Next: the developer decides about installing a test build for the live check; the test build's name is still open.
 - Paused: priority ordering for `onCommand` and `onBetweenPulls` (see `docs/HOOKS.md` sections 3.2, 9 and 10). A design was proposed but nothing was agreed or built.
 
 ## Pending live verification
 
-Implemented but not yet confirmed in the live game. Nothing yet.
+Implemented but not yet confirmed in the live game.
+
+- `Logs\TAC\` for the main log, dump files, chat tab logs, chat trace and chat capture (DL-002, `feat/log-folder`). Local tests only. Unverified: that `lfs.mkdir` creates the folder in the running game and does not stall the client; that `MacroQuest.Path('logs')` is usable when the log first opens; that the Chat plugin uses `core.logDir` in the game; that a release zip extracts the placeholder into `Logs\TAC\`.
 
 ## Resolved behavior
 
 Only behavior we have actually agreed upon.
 
+- TAC's logs go to `Logs\TAC\` (requirements in DL-002: agreed, built locally, not yet verified live). Chat history stays in `config`; old log files stay where they are.
 - Test builds are named `v3.2.0-<feature>-<N>`: the base version, the feature, then a counter that rises with each build of that feature (developer, 2026-10-13).
 
 ## Confirmed live/system facts
 
-Facts established through testing, source inspection, logs, or documentation. Nothing recorded yet.
+Facts established through testing, source inspection, logs, or documentation.
+
+- MacroQuest's docs say the logs folder is configurable and must be read from `${MacroQuest.Path[logs]}` (`reference/data-types/datatype-macroquest.md`, docs commit `a85c4a6`, read 2026-10-13).
+- `lfs` is not bundled with MacroQuest; its docs describe it as a LuaRocks module installed through PackageMan (`lua/luarocks-modules.md`). LuaFileSystem 1.9.0 is installed on the developer's machine and its manual documents `lfs.mkdir` (read 2026-10-13).
+- Before DL-002, TAC wrote the main log to `config/../Logs` (a guess) and the chat logs to `MacroQuest.Path('logs')`, and nothing in TAC created folders (code reading, 2026-10-13).
 
 ## Open implementation details
 
