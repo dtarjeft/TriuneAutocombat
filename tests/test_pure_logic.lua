@@ -21137,7 +21137,7 @@ do
         assert_true(pm.plugins.p120_bad ~= nil and pm.plugins.p120_bad.enabled, 'Suite 120 D2: ' .. bad[2] .. ' still loads the plugin')
     end
     local last = warnLines()
-    assert_true(last[#last]:find('p120_bad', 1, true) ~= nil, 'Suite 120 D2: the warning names the plugin: ' .. tostring(last[#last]))
+    assert_true(#last > 0 and last[#last]:find('p120_bad', 1, true) ~= nil, 'Suite 120 D2: the warning names the plugin: ' .. tostring(last[#last]))
 
     -- D3 and HOOKS 3.2: the order. Load order is c, a, b, e, d; the expected order is b, c, a, e, d, so neither the load
     -- order nor an ordering by id alone can explain a pass (b and c tie at 10 and load in the opposite order to their ids).
