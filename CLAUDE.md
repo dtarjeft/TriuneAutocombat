@@ -6,9 +6,14 @@ These notes record how the owner works and what was agreed, so a new session doe
 1. `.agents/AGENTS.md`: the project's own rules (inherited from the original author; still in force). It holds the **mandatory**
    CHANGELOG and README update rules, the version rules, the Lua 5.1 compatibility rules, the ImGui rules, the theme rule, the
    200-local-variable limit and the binary-files policy. This file adds to it and does not replace it.
-2. `docs/HOOKS.md`: the plugin API contract (tiers, events, decisions, registries, failure handling) and, in section 10, what is
+2. `docs/Development_Protocol.txt`: **the development protocol, mandatory.** How design, decisions, tests, diagnostics and handoff are
+   done, and what may be asked of the owner. It governs how this file's other rules are applied. Agreed so far for this project:
+   test builds are named `v3.2.0-<feature>-<N>` (base version, feature, then a counter that goes up with each build of that feature);
+   the decision log and project ledger it requires do not exist yet and must be created; the owner will keep the sibling-project list
+   in `docs/sibling-project.txt` (section 21 of the protocol); new logs go in the MacroQuest `Logs` folder, not `config`.
+3. `docs/HOOKS.md`: the plugin API contract (tiers, events, decisions, registries, failure handling) and, in section 10, what is
    implemented and what is not.
-3. `README.md` and `CHANGELOG.md`.
+4. `README.md` and `CHANGELOG.md`.
 
 ## Who and where
 
