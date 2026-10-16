@@ -4725,6 +4725,10 @@ do
             OtherZone = no,
             Offline = no,
             PctHPs = function() return world.hp[id] or 100 end,
+            Distance3D = function() return world.distances[id] or 20 end,
+            TargetOfTarget = { ID = function() return id == mobId and meId or 0 end },
+            AggroHolder = { ID = function() return id == mobId and meId or 0 end },
+            PctAggro = function() return id == mobId and 100 or 0 end,
         })
     end
     local me = spawns[meId]
@@ -4748,6 +4752,10 @@ do
     me.SpellReady = function() return callable({}, function() return world.spellReady ~= false end) end
     me.AltAbilityReady = function() return callable({}, function() return world.aaReady ~= false end) end
     me.Gem = function() return callable({}, function() return 1 end) end
+    me.XTargetSlots = function() return 1 end
+    me.XTarget = function()
+        return world.hostileAvailable and spawns[mobId] or callable({}, no)
+    end
     local function aa()
         return callable({
             ID = function() return 42 end,
@@ -4798,14 +4806,18 @@ do
     local mockMq = {
         TLO = {
             Me = me,
-            Target = {
+            Target = callable({
                 ID = function() return world.target end,
+                Type = function() return spawns[world.target].Type() end,
+                CleanName = function() return spawns[world.target].CleanName() end,
+                Distance3D = function() return spawns[world.target].Distance3D() end,
+                TargetOfTarget = { ID = function() return world.target == mobId and meId or 0 end },
                 BuffsPopulated = function()
                     local ready = world.cacheReadyAt and world.clock >= world.cacheReadyAt
                     if ready then cachedBuffs(world.target) end
                     return ready == true
                 end,
-            },
+            }, function() return world.target > 0 and 'Target' or nil end),
             Spawn = function(id) return spawns[id] or callable({}, no) end,
             Spell = function(name) return spells[name] or callable({}, no) end,
             Group = {
@@ -4855,6 +4867,9 @@ do
         isHostileTarget = function(id) return id == mobId end,
         isSpawnAlive = function(id) return spawns[id] ~= nil end,
         isIgnored = no, isSpawnMyPet = no, isAnyPet = no,
+        isUnreachable = no, isGroupOrRaidMember = function(id) return id ~= mobId end,
+        isSpawnPetOrPlayer = function(id) return id ~= mobId end,
+        xtSlotCounts = yes, stopMoving = noop, pursuit = {},
         isCombat = yes, buffActive = no, bardKeepSinging = no,
         hasSpellReagents = function() return world.reagents ~= false end,
         isGemMatching = function() return world.memmed ~= false end,
@@ -4906,6 +4921,12 @@ do
     runtime.stopMovementForCast, runtime.noteAAEffectStarted = noop, noop
     runtime.checkStuck, runtime.checkCombatStall, runtime.checkGemMemSync, runtime.decayZoneHazards = noop, noop, noop, noop
     runtime.wpBeginTick = noop
+    runtime.forcedTargetId = no
+    runtime.checkAggroSwitch = real('checkAggroSwitch')
+    runtime.checkMeshIsolation = function()
+        world.afterPriority = world.afterPriority + 1
+        return true
+    end
     runtime.isMoveActive, runtime.aaGroupBusy = no, no
     runtime.aaTabOrder = function() return {} end
     runtime.sortedAAEntries = real('sortedAAEntries')
@@ -4923,6 +4944,8 @@ do
         world.cacheReadyAt, world.cacheDelay, world.extraBuffs, world.messages = nil, nil, nil, {}
         world.itemReady, world.spellReady, world.aaReady, world.hasItem = true, true, true, true
         world.mana, world.memmed, world.reagents, world.groupSize, world.distances = 100, true, true, 1, {}
+        world.hostileAvailable, world.afterPriority = false, 0
+        ctrl.mode, ctrl.submode, ctrl.manual_auto_xtarget = 'Assist', 'Chase', true
         world.castMs = castMs == nil and 2500 or castMs
         world.casting, world.firedTarget, world.firedCommand, world.onDelay = nil, nil, nil, nil
         world.attacking, world.itemSpell, world.aaSpell = true, entry.spell, entry.spell
@@ -4931,6 +4954,7 @@ do
         runtime.restoreTargetId = nil
         runtime.groupCureProbe, runtime.groupCureObserved, runtime.groupCureRetryAt = nil, nil, nil
         runtime.nextGroupCureWarningAt = nil
+        runtime.lastAggroSwitchAt = nil
         tracker.activeSpell, tracker.activeTargetId, tracker.activeKind, tracker.targetRequired = nil, nil, nil, nil
         tracker.wasCasting, tracker.failed, tracker.castStartTime = false, false, 0
         loadout.gems, loadout.aas, loadout.actions, loadout.discs = nil, nil, nil, nil
@@ -5245,6 +5269,70 @@ do
     assert_eq(cured[2], allyId, 'Me, then Group advances to the first afflicted group member')
     assert_eq(cured[3], otherAllyId, 'Me, then Group advances to the next afflicted group member')
     assert_eq(world.target, mobId, 'full caster/group cure sequence restores combat targeting')
+
+    for _, mode in ipairs({ 'Manual', 'Puller' }) do
+        for _, selector in ipairs({ 'F: Me, then Group', 'F: Group, then Me' }) do
+            local entry = { name = cure.name, spell = cure.spell, target = selector, when = cure.when, pct = 100 }
+            local label = mode .. ' / ' .. selector
+            reset(entry)
+            ctrl.mode, ctrl.submode = mode, 'Hunt'
+            world.feed, world.cacheDelay, world.hostileAvailable = false, 0.3, true
+            world.counters[allyId] = { curse = 3 }
+            combatTick()
+            assert_eq(world.target, allyId, label .. ': combat tick starts the group inspection')
+            local probe = runtime.groupCureProbe
+            assert_true(probe ~= nil, label .. ': inspection is pending before buff data arrives')
+            world.clock = world.clock + 0.2
+            combatTick()
+            assert_eq(world.target, allyId, label .. ': automatic aggro targeting preserves the inspected ally')
+            assert_eq(runtime.groupCureProbe, probe, label .. ': delayed data does not cancel the probe')
+            assert_nil(runtime.lastAggroSwitchAt, label .. ': hostile aggro switch is deferred while inspecting')
+            assert_nil(world.firedCommand, label .. ': no cure is fired before buff data arrives')
+            assert_eq(world.afterPriority, 0, label .. ': pending probe holds later mode targeting')
+            world.clock = world.clock + 0.2
+            combatTick()
+            assert_true(world.casting ~= nil, label .. ': real combat tick cures after delayed buff data arrives')
+            assert_nil(runtime.groupCureProbe, label .. ': successful inspection is consumed')
+            if world.casting then checkHeldAndRestored(allyId, label .. ' delayed cure') end
+
+            reset(entry)
+            ctrl.mode, ctrl.submode = mode, 'Hunt'
+            world.feed, world.cacheDelay, world.hostileAvailable = false, 10, true
+            loadout.clickies = { entry, emergencyHeal }
+            combatTick()
+            assert_eq(world.target, allyId, label .. ': emergency scenario begins with an ally inspection')
+            world.clock, world.hp[meId], world.itemSpell = world.clock + 0.2, 30, emergencyHeal.spell
+            combatTick()
+            assert_eq(tracker.activeSpell, emergencyHeal.spell, label .. ': emergency HP heal preempts inspection')
+            assert_eq(tracker.activeTargetId, meId, label .. ': preempting heal records the caster as recipient')
+            assert_eq(world.firedTarget, mobId, label .. ': preemption restores the hostile before the self-heal')
+            assert_nil(runtime.groupCureProbe, label .. ': emergency preemption releases the probe')
+            assert_nil(runtime.lastAggroSwitchAt, label .. ': emergency heal runs before automatic aggro selection')
+            assert_nil(runtime.restoreTargetId, label .. ': self-heal does not restore the inspected ally')
+            combatTick()
+            finishCast()
+            assert_eq(world.target, mobId, label .. ': emergency heal completion preserves the hostile')
+
+            reset(entry)
+            ctrl.mode, ctrl.submode = mode, 'Hunt'
+            world.feed, world.cacheDelay, world.hostileAvailable = false, 10, true
+            combatTick()
+            world.clock = world.clock + 0.6
+            combatTick()
+            assert_nil(runtime.groupCureProbe, label .. ': real combat tick still times out a probe')
+            assert_eq(world.target, mobId, label .. ': timeout restores the original hostile')
+            assert_true(table.concat(world.messages):find('inspection timed out', 1, true),
+                label .. ': hostile availability does not turn a timeout into cancellation')
+            assert_nil(world.firedCommand, label .. ': timeout does not blindly cast')
+
+            loadout.clickies = {}
+            world.target, world.afterPriority, runtime.lastAggroSwitchAt = allyId, 0, nil
+            combatTick()
+            assert_eq(world.target, mobId, label .. ': ordinary aggro targeting resumes without a pending probe')
+            assert_eq(runtime.lastAggroSwitchAt, world.clock, label .. ': normal targeting uses the real aggro switch')
+            assert_eq(world.afterPriority, 1, label .. ': normal targeting can proceed to the remaining combat tick')
+        end
+    end
 
     local loopSource = extractFunction(src, 'runMainLoop')
     assert_true(loopSource:find('elseif not ctrl.running then%s+runtime.finishGroupCureProbe%('),

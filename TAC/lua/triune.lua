@@ -23547,9 +23547,6 @@ local function combatTick()
         runtime.nextHazardDecayAt = os.time() + 60
     end
     runtime.checkGemMemSync()
-    if (ctrl.mode == 'Manual' and ctrl.manual_auto_xtarget ~= false) or ctrl.mode == 'Puller' then
-        checkAggroSwitch()
-    end
 
     -- ========================================================================
     -- HEALING PRIORITY DISPATCH
@@ -23558,6 +23555,11 @@ local function combatTick()
     -- ========================================================================
     if runtime.processHealPriority and runtime.processHealPriority() then
         return
+    end
+
+    -- Heal dispatch holds pending cure-inspection targets while still allowing emergency heals.
+    if (ctrl.mode == 'Manual' and ctrl.manual_auto_xtarget ~= false) or ctrl.mode == 'Puller' then
+        checkAggroSwitch()
     end
 
     -- Mesh isolation recovery owns movement while it runs; the mode logic

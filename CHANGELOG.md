@@ -1,5 +1,11 @@
 # Triune AutoCombat Change Log
 
+## 2026-10-16
+
+- Hold automatic aggro switching until group cure inspection releases its ally target, so delayed buff data can arrive without cancelling the probe. Emergency HP heals still preempt inspection, and normal targeting resumes after completion or timeout (`TAC/lua/triune.lua`, `tests/test_pure_logic.lua`).
+
+---
+
 ## 2026-10-11
 
 - **Canonical Version Bump to 3.2 (`TAC/lua/triune.lua`, `README.md`, `TAC/lua/tac/hud_unitframes.lua`, `tests/test_pure_logic.lua`, `.agents/AGENTS.md`, `RELEASES.md`).** Release of the code-review fixes below plus the new GM Commands plugin. Bumped the version across the main script, the README, the unit-frame window title fallbacks, the test suites and the AGENTS.md examples; `RELEASES.md` has the `## 3.2` summary the release workflow (which now requires it) turns into the GitHub release page. Tag the release as `v3.2`.
