@@ -4,6 +4,8 @@
 
 - Hold automatic aggro switching until group cure inspection releases its ally target, so delayed buff data can arrive without cancelling the probe. Emergency HP heals still preempt inspection, and normal targeting resumes after completion or timeout (`TAC/lua/triune.lua`, `tests/test_pure_logic.lua`).
 
+- Make ordered friendly selectors use each recipient's actual buff state, inspecting unavailable or stale group buff data instead of blindly rebuffing. Resolve AA/item effect metadata and ranges, support idle off-bar buff inspection before downtime memorization, and retain per-recipient HP heal ordering, caster-only conditions, emergency healing, explicit Box Network buff recipients, and target restoration (`TAC/lua/triune.lua`, `tests/test_pure_logic.lua`).
+
 ---
 
 ## 2026-10-11
