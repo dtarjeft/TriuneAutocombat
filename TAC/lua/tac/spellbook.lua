@@ -68,15 +68,14 @@ local function refresh()
     mq = core.mq
     -- Mirror the core's live class list (core owns detection / persistence).
     local mine = core.myClasses
-    if type(mine) == 'table' and #mine > 0 then
-        state.myClasses = mine
-    end
+    state.myClasses = type(mine) == 'table' and mine or {}
     -- Only classes with a spellbook get a tab; melee-only classes are dropped.
     -- Rebuilt only when the class list actually changes (this runs every
     -- tick and every frame).
     local sig = table.concat(state.myClasses, '/')
     if sig ~= state.classSig then
         state.classSig = sig
+        state.selectedSpell = nil -- the old selection may belong to a removed class
         local casters = {}
         for _, cls in ipairs(state.myClasses) do
             if not NON_CASTER[tostring(cls):upper()] then
@@ -907,7 +906,7 @@ local function drawWindow()
     end
     core.postBeginWindow('spellbook')
 
-    ImGui.TextColored(0.4, 0.8, 1.0, 1.0, "ACTIVE GESTALT TRIO:")
+    ImGui.TextColored(0.4, 0.8, 1.0, 1.0, "ACTIVE CLASSES:")
     ImGui.SameLine()
 
     local tabs = state.casterClasses

@@ -399,8 +399,27 @@ local function echo(msg)
     rt.echoAt = os.time()
 end
 
+-- Folder for the chat log files (tab logs, draw trace, capture). A core that offers logDir gives
+-- Logs/TAC; with an older core, or one that has no answer, it is MacroQuest's logs folder as before,
+-- then config.
+local function logsDir()
+    local dir
+    if core and core.hasCapability and core.hasCapability('logDir') then
+        local ok, d = pcall(core.logDir)
+        if ok and type(d) == 'string' and d ~= '' then dir = d end
+    end
+    if not dir then
+        pcall(function()
+            local p = mq.TLO.MacroQuest.Path('logs')()
+            if p and p ~= '' then dir = tostring(p) end
+        end)
+    end
+    if not dir then dir = (mq and mq.configDir) or 'config' end
+    return (dir:gsub('[/\\]+$', ''))
+end
+
 -- Draw trace (/tacchat trace on): the last TRACE_MAX scope steps, dumped to
--- logs/tac_chat_trace_<Name>.txt when a draw error happens. Takes a format
+-- Logs/TAC/tac_chat_trace_<Name>.txt when a draw error happens. Takes a format
 -- string plus arguments so nothing is built while the trace is off.
 local TRACE_MAX = 300
 local function trace(fmt, ...)
@@ -414,15 +433,9 @@ end
 local function traceDump(reason)
     local t = rt.trace
     if not t then return end
-    local dir
-    pcall(function()
-        local pth = mq.TLO.MacroQuest.Path('logs')()
-        if pth and pth ~= '' then dir = tostring(pth) end
-    end)
-    dir = (dir or (mq and mq.configDir) or 'config'):gsub('[/\\]+$', '')
     local name = 'Default'
     pcall(function() local n = mq.TLO.Me.CleanName(); if n and n ~= '' then name = tostring(n) end end)
-    local path = string.format('%s/tac_chat_trace_%s.txt', dir, name)
+    local path = string.format('%s/tac_chat_trace_%s.txt', logsDir(), name)
     local f = io.open(path, 'w')
     if not f then return end
     f:write('-- Triune Chat draw trace, ' .. os.date() .. '\n-- frame step (oldest first)\n')
@@ -858,7 +871,8 @@ local function configPath()
         local n = mq.TLO.Me.CleanName()
         if n and n ~= '' then name = tostring(n) end
     end)
-    rt.configPath = string.format('%s/triune_chat_%s.lua', (mq and mq.configDir) or 'config', name)
+    rt.configPath = (core and core.configFilePath and core.configFilePath('triune_chat', name, 'lua'))
+        or string.format('%s/triune_chat_%s.lua', (mq and mq.configDir) or 'config', name)
     return rt.configPath
 end
 
@@ -1654,12 +1668,11 @@ local function collapsePanes(win)
     end
 end
 
-local logsDirCached
 local function safeFileName(s)
     return (tostring(s):gsub('[^%w%-_]+', '_'))
 end
 
--- Per-tab log files: logs/tac_chat_<Char>_<tab>_<YYYYMMDD>.txt, one per day.
+-- Per-tab log files: Logs/TAC/tac_chat_<Char>_<tab>_<YYYYMMDD>.txt, one per day.
 local function tabLogWrite(win, tab, st, entry)
     local day = os.date('%Y%m%d')
     if st.logFile and st.logDay ~= day then
@@ -1669,17 +1682,9 @@ local function tabLogWrite(win, tab, st, entry)
     if not st.logFile then
         -- A failed open is retried after a pause, not on every line.
         if st.logRetryAt and os.time() < st.logRetryAt then return end
-        if not logsDirCached then
-            local dir
-            pcall(function()
-                local p = mq.TLO.MacroQuest.Path('logs')()
-                if p and p ~= '' then dir = tostring(p) end
-            end)
-            logsDirCached = (dir or (mq and mq.configDir) or 'config'):gsub('[/\\]+$', '')
-        end
         local name = 'Default'
         pcall(function() local n = mq.TLO.Me.CleanName(); if n and n ~= '' then name = tostring(n) end end)
-        local path = string.format('%s/tac_chat_%s_%s_%s.txt', logsDirCached, safeFileName(name), safeFileName(tab.name), day)
+        local path = string.format('%s/tac_chat_%s_%s_%s.txt', logsDir(), safeFileName(name), safeFileName(tab.name), day)
         st.logFile = io.open(path, 'a')
         st.logDay = day
         if not st.logFile then
@@ -1890,16 +1895,6 @@ end
 -- ----------------------------------------------------------------------------
 -- Capture / logging
 -- ----------------------------------------------------------------------------
-local function logsDir()
-    local dir
-    pcall(function()
-        local p = mq.TLO.MacroQuest.Path('logs')()
-        if p and p ~= '' then dir = tostring(p) end
-    end)
-    if not dir then dir = (mq and mq.configDir) or 'config' end
-    return (dir:gsub('[/\\]+$', ''))
-end
-
 local function myName()
     local name = 'Default'
     pcall(function()
@@ -1961,7 +1956,9 @@ local registeredEvents = {}
 H.FIELDS = 7
 
 function H.path()
-    return string.format('%s/triune_chat_history_%s.txt', ((mq and mq.configDir) or 'config'):gsub('[/\\]+$', ''), safeFileName(myName()))
+    local name = safeFileName(myName())
+    if core and core.configFilePath then return core.configFilePath('triune_chat_history', name, 'txt') end
+    return string.format('%s/triune_chat_history_%s.txt', ((mq and mq.configDir) or 'config'):gsub('[/\\]+$', ''), name)
 end
 
 -- Fields are tab-separated; a backslash and every control byte (the \x12 of
@@ -3689,7 +3686,7 @@ local function drawTabPage(win, tab)
         if not log then TB.closeLog(win, tab) end
         markDirty()
     end
-    if ImGui.IsItemHovered and ImGui.IsItemHovered() then core.setTooltip('Appends this tab\'s lines to logs/tac_chat_<Name>_<tab>_<date>.txt') end
+    if ImGui.IsItemHovered and ImGui.IsItemHovered() then core.setTooltip('Appends this tab\'s lines to Logs/TAC/tac_chat_<Name>_<tab>_<date>.txt') end
     local notify = ImGui.Checkbox('Notifications only##tabNotify', tab.notifyOnly == true)
     if notify ~= (tab.notifyOnly == true) then
         tab.notifyOnly = notify or nil
@@ -5332,7 +5329,7 @@ function chatCommand(sub, arg1, arg2)
             print('\ay[Triune Chat]\ax draw trace off')
         else
             rt.trace = { steps = {}, n = 0, frame = 0 }
-            print('\ag[Triune Chat]\ax draw trace on; the last ' .. TRACE_MAX .. ' steps are written to logs/tac_chat_trace_<Name>.txt on a draw error (or /tacchat trace dump)')
+            print('\ag[Triune Chat]\ax draw trace on; the last ' .. TRACE_MAX .. ' steps are written to Logs/TAC/tac_chat_trace_<Name>.txt on a draw error (or /tacchat trace dump)')
             if on == 'dump' then traceDump('manual dump') end
         end
         return

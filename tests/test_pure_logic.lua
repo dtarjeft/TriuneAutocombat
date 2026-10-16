@@ -4988,6 +4988,7 @@ do
     runtime.isClickieReady = real('isClickieReady')
     runtime.useClickie = real('useClickie')
     runtime.castGem = real('castGem')
+    runtime.touchSpellRecord = function() end -- the real one stamps a revision on each spell record
     runtime.fireAA = real('fireAA')
     runtime.processHealPriority = real('processHealPriority')
     runtime.hasDowntimeAggroThreat = function() return world.inCombat end
@@ -7076,6 +7077,7 @@ do
     testRuntime.conditionMet = yes
     testRuntime.countNPCXtarget = function() return #mockXTarget end
     testRuntime.npcCastCounts, testRuntime.npcSpellApplied, testRuntime.npcSpellLastCast = {}, {}, {}
+    testRuntime.touchSpellRecord = function() end
 
     -- 1. DoT casting across multiple XTarget enemies (Sicken)
     local t1 = testRuntime.resolveAllEnemiesTargetId('Sicken', 'in combat', 100, 'Shm', { kind = 'dot' })
@@ -11036,6 +11038,7 @@ do
     local ctrl88 = { plugins = {} }
     local saveCount = 0
     local env = {
+        unregisterTargetSelectorsByOwner = function() return 0 end,
         ctrl = ctrl88,
         mq = mockMq,
         ImGui = mockImGui,
@@ -11221,12 +11224,46 @@ do
         assert_eq(savedHook, 1, 'Suite 88: pm.onLoadoutSaved dispatches to plugins')
         aa.instance.onLoadoutSaved = realSaved
 
-        -- A hook that throws flags the plugin and stops dispatching to it
-        aa.instance.onCommand = function() error('cmd boom') end
+        -- A failing hook is not a failing plugin (docs/HOOKS.md 4.4): it is counted, three in a row switch that hook off,
+        -- a success starts the count again, and a reload switches it back on. Nothing the plugin registered is swept.
+        -- (state lives in one field of `sandbox`: this file's main chunk is at Lua's 200-local limit)
+        sandbox.hk = { swept = {}, calls = 0, n = 0 }
+        sandbox.runtime.unregisterTargetSelectorsByOwner = function(owner) local sw = sandbox.hk.swept; sw[#sw + 1] = owner; return 0 end
+        aa.instance.onCommand = function() sandbox.hk.calls = sandbox.hk.calls + 1; error('cmd boom') end
         assert_eq(pm.onCommand('autoaa', { 'autoaa' }), false, 'Suite 88: a throwing hook does not count as handled')
-        assert_eq(aa.status, 'Error', 'Suite 88: a throwing hook flags the plugin as Error')
+        assert_eq(aa.status, 'Active', 'Suite 88: a throwing hook does not flag the plugin as Error')
+        assert_eq(pm.hookEnabled(aa, 'onCommand'), true, 'Suite 88: one failure leaves the hook on')
+        pm.onCommand('autoaa', { 'autoaa' })
+        assert_eq(pm.hookEnabled(aa, 'onCommand'), true, 'Suite 88: two failures leave the hook on')
+        pm.onCommand('autoaa', { 'autoaa' })
+        assert_eq(pm.hookEnabled(aa, 'onCommand'), false, 'Suite 88: three failures in a row switch the hook off')
+        assert_eq(sandbox.hk.calls, 3, 'Suite 88: the hook ran three times')
+        pm.onCommand('autoaa', { 'autoaa' })
+        assert_eq(sandbox.hk.calls, 3, 'Suite 88: a hook that is switched off is not called again')
+        assert_eq(aa.status, 'Active', 'Suite 88: the plugin stays active')
+        assert_eq(#sandbox.hk.swept, 0, 'Suite 88: a hook failure sweeps no registrations')
         pm.reloadPlugin('auto_aa')
-        assert_eq(aa.status, 'Active', 'Suite 88: reload recovers the plugin after a hook error')
+        assert_eq(aa.status, 'Active', 'Suite 88: reload keeps the plugin active')
+        assert_eq(pm.hookEnabled(aa, 'onCommand'), true, 'Suite 88: a reload switches the hook back on')
+
+        -- a success starts the count again: fail, fail, succeed, fail, fail leaves the hook on
+        sandbox.hk.n = 0
+        aa.instance.onCommand = function()
+            sandbox.hk.n = sandbox.hk.n + 1
+            if sandbox.hk.n == 3 then return false end
+            error('cmd boom')
+        end
+        for _ = 1, 5 do pm.onCommand('autoaa', { 'autoaa' }) end
+        assert_eq(sandbox.hk.n, 5, 'Suite 88: all five calls ran')
+        assert_eq(pm.hookEnabled(aa, 'onCommand'), true, 'Suite 88: a success in between resets the count')
+
+        -- a fatal failure (a draw error) puts the plugin in Error and sweeps its registrations
+        aa.instance.onDrawUI = function() error('draw boom') end
+        pm.drawUI()
+        assert_eq(aa.status, 'Error', 'Suite 88: a draw error is fatal for the plugin')
+        assert_eq(sandbox.hk.swept[#sandbox.hk.swept], 'auto_aa', 'Suite 88: ...and sweeps what it registered')
+        pm.reloadPlugin('auto_aa')
+        assert_eq(aa.status, 'Active', 'Suite 88: reload recovers the plugin after a fatal error')
     end
 
     -- 11. Spellbook plugin (was the standalone triune_spellbook.lua script)
@@ -11672,6 +11709,7 @@ do
         local mqDelays = {}
         mockMq.delay = function(ms) mqDelays[#mqDelays + 1] = ms end
         local env = {
+            unregisterTargetSelectorsByOwner = function() return 0 end,
             ctrl = { plugins = {} }, mq = mockMq, ImGui = mockImGui,
             UI = { accent = noop, setTooltip = noop, pushTheme = noop, popTheme = noop, preBeginWindow = noop, postBeginWindow = noop,
                    drawStatusProgressBar = noop, drawSpellIcon = function() return false end,
@@ -12280,6 +12318,21 @@ do
     slots, extra = F.getMultiPetList()
     assert_eq(#extra, 0, 'Suite 92: name-dup: extras never repeat a name shown in a slot')
 
+    -- Four pet classes retain their own slots, including the fourth pet.
+    resetWorld({ 'Nec', 'Mag', 'Bst', 'Enc' }, { Nec = 'Bones', Mag = 'Fire', Bst = 'Tiger', Enc = 'Animation' })
+    addPet(201, 'Bones'); addPet(202, 'Fire'); addPet(203, 'Tiger'); addPet(204, 'Animation')
+    F.reconcilePets()
+    slots, extra = F.getMultiPetList()
+    assert_eq(#slots, 4, 'Suite 92: four classes get four pet slots')
+    assert_eq(#extra, 0, 'Suite 92: fourth class pet is not an extra')
+    for i, cls in ipairs({ 'Nec', 'Mag', 'Bst', 'Enc' }) do
+        assert_eq(slots[i].cls, cls, 'Suite 92: four-pet class order ' .. i)
+        assert_eq(slots[i].petId, 200 + i, 'Suite 92: each class owns its pet ' .. i)
+    end
+    assert_eq(slots[4].scope, 'enc', 'Suite 92: fourth pet retains its command scope')
+    world.spawns[204].dead = true; tick()
+    assert_true(F.isPetMissingForClass('Enc'), 'Suite 92: fourth class can summon a replacement')
+
     -- D. Learned names map pets back to their classes after a restart
     resetWorld({ 'Mag', 'Nec', 'War' }, { Mag = 'Xobarb', Nec = 'Gebann' })
     addPet(100, 'Gebann', { race = 'Unknown', dist = 3 })
@@ -12590,6 +12643,7 @@ do
     }
     package.loaded['mq'] = mockMq
     local env = {
+        unregisterTargetSelectorsByOwner = function() return 0 end,
         ctrl = { plugins = {} }, mq = mockMq,
         ImGui = setmetatable({ Button = function() return false end, SmallButton = function() return false end, Checkbox = function(_, v) return v end, IsItemHovered = function() return false end, BeginTable = function() return false end }, { __index = function() return noop end }),
         UI = { accent = noop, setTooltip = noop, pushTheme = noop, popTheme = noop, preBeginWindow = noop, postBeginWindow = noop,
@@ -12678,6 +12732,17 @@ do
     assert_true(tostring(S.err):find('mq.exit', 1, true) ~= nil, 'Suite 92: reason names mq.exit')
     mockMq.exit(); assert_eq(S.exits, 1, 'Suite 92: original mq.exit restored afterwards')
     pm.scripts['exits_at_load.lua'] = nil
+
+    -- 1c. A plugin whose onInit fails is in Error, and what it registered before failing is swept (rolled back)
+    S.swept = {}
+    rt.unregisterTargetSelectorsByOwner = function(owner) S.swept[#S.swept + 1] = owner; return 0 end
+    S.path = writeJunk('fails_in_init.lua', "return { id = 'fails_in_init', name = 'Fails in init', defaultEnabled = true, onInit = function() error('init boom') end }\n")
+    pm.loadPlugin('fails_in_init.lua', S.path)
+    assert_true(pm.plugins.fails_in_init ~= nil, 'Suite 92: the plugin is registered')
+    assert_eq(pm.plugins.fails_in_init.status, 'Error', 'Suite 92: a failing onInit puts the plugin in Error')
+    assert_eq(S.swept[#S.swept], 'fails_in_init', 'Suite 92: ...and what it registered is swept at once')
+    pm.plugins.fails_in_init = nil -- (later checks expect no junk plugin to stay registered)
+    for k, id in ipairs(pm.pluginOrder) do if id == 'fails_in_init' then table.remove(pm.pluginOrder, k); break end end
 
     -- 1c. UI-triggered lifecycle work is queued and runs from pm.tick (main coroutine), never in the render callback
     S.ran = {}
@@ -20564,6 +20629,196 @@ do
     assert_true(zoneSaves >= 3, 'Suite 112: Set / Clear / radius all update the zone entry')
 end
 
+-- Four-class detection and manual selection exercise the production functions.
+do
+    print('--- Four-class support ---')
+    local rawClasses = 'WAR\nCLR\nMAG\nENC'
+    local child = setmetatable({ Text = function() return rawClasses end }, { __call = function() return true end })
+    local window = setmetatable({ Open = function() return true end,
+        Child = function(name) return name == 'IW_ClassAbbr' and child or nil end },
+        { __call = function() return true end })
+    local detectorCode = src:match('(local classesFromInventoryWindow\ndo\n.-)\nlocal function detectClasses')
+    local detectorChunk = assert(loadstring(detectorCode .. '\nreturn classesFromInventoryWindow'))
+    setfenv(detectorChunk, setmetatable({ mq = { TLO = { Window = function() return window end } },
+        parseClassLine = parseClassLine }, { __index = _G }))
+    local detect = detectorChunk()
+    assert_tbl_eq(detect(false, false), { 'War', 'Clr', 'Mag', 'Enc' }, 'detect all four inventory classes')
+    -- A client patch shows the classes two per line ("WAR / PAL"); every one must be detected.
+    rawClasses = 'WAR / PAL\nSHD / MNK'
+    assert_tbl_eq(detect(false, false), { 'War', 'Pal', 'SK', 'Mnk' }, 'classes shown two per line are all detected')
+    rawClasses = 'WAR, CLR\nMAG|ENC'
+    assert_tbl_eq(detect(false, false), { 'War', 'Clr', 'Mag', 'Enc' }, 'other separators between classes are handled too')
+    rawClasses = 'WAR\nCLR\nMAG'
+    assert_tbl_eq(detect(false, false), { 'War', 'Clr', 'Mag' }, 'three-class detection remains supported')
+    rawClasses = 'WAR'
+    assert_tbl_eq(detect(false, false), { 'War' }, 'single-class detection remains supported')
+
+    local classes, edits, calls, saves = { 'War', 'Clr', 'Mag' }, {}, 0, 0
+    local collect = loadFunc(src, 'collectEntry', { myClasses = classes, loadout = {}, ctrl = {} })
+    local saved
+    local pickerSrc = src:gsub('function UI%.drawClassPicker%(', 'local function drawClassPicker(')
+    local draw = loadFunc(pickerSrc, 'drawClassPicker', {
+        myClasses = classes, UI = { px = function(n) return n end },
+        runtime = { saveLoadout = function() saves = saves + 1; saved = collect().classes end },
+        ImGuiTreeNodeFlags = { DefaultOpen = 0 }, MUTED = {}, accent = function() end,
+        ImGui = { CollapsingHeader = function() return true end, TextDisabled = function() end,
+            SetNextItemWidth = function() end, SameLine = function() end, Button = function() return false end,
+            Combo = function(id, current) calls = calls + 1; return edits[id] or current end },
+    })
+    edits['##cls4'] = 15 -- Enc
+    draw()
+    assert_eq(calls, 4, 'picker exposes four class selectors')
+    assert_tbl_eq(classes, { 'War', 'Clr', 'Mag', 'Enc' }, 'add a fourth class')
+    assert_tbl_eq(saved, { 'War', 'Clr', 'Mag', 'Enc' }, 'loadout collection preserves all four classes')
+    local reloaded = assert(loadstring('return ' .. serializeToString(saved)))()
+    assert_tbl_eq(reloaded, { 'War', 'Clr', 'Mag', 'Enc' }, 'four classes survive loadout serialization')
+    edits = { ['##cls2'] = 1 }; draw()
+    assert_tbl_eq(classes, { 'War', 'Mag', 'Enc' }, 'clearing an earlier slot preserves the fourth class')
+    edits = { ['##cls3'] = 1 }; draw()
+    assert_tbl_eq(classes, { 'War', 'Mag' }, 'clear the last selected class')
+    assert_eq(saves, 3, 'each edit saves the loadout')
+    local color = loadFunc(src, 'classColor', { myClasses = { 'War', 'Clr', 'Mag', 'Enc' } })
+    local r, g, b = color('Enc')
+    assert_tbl_eq({ r, g, b }, { 0.75, 0.55, 1.00 }, 'fourth class gets its own color')
+    local title
+    local fullGuiSrc = src:gsub('function UI%.drawFullGui%(', 'local function drawFullGui(')
+    local noop = function() end
+    local gui = loadFunc(fullGuiSrc, 'drawFullGui', {
+        open = true, ctrl = {}, myClasses = { 'War', 'Clr', 'Mag', 'Enc' }, myName = 'Tester', VERSION = 'test',
+        ImGuiCond = { FirstUseEver = 0 }, ImGuiWindowFlags = { HorizontalScrollbar = 0 },
+        UI = { px = function(n) return n end, pushTheme = noop, popTheme = noop,
+            preBeginWindow = noop, preEndWindow = noop, windowFlags = function(_, f) return f end },
+        ImGui = { SetNextWindowSize = noop, End = noop,
+            Begin = function(t) title = t; return true, false end },
+    })
+    gui()
+    assert_true(title:find('(War / Clr / Mag / Enc)', 1, true) ~= nil, 'window title includes the fourth class')
+end
+
+do
+    print('--- Fourth-class spell gems, AA and discipline tabs, and abilities ---')
+    local classes = { 'War', 'Clr', 'Mag', 'Enc' }
+    local data = { spells = { Enc = { { 'Fourth Spell', 20, 1, 'buff' }, { 'Too High', 80, 1, 'buff' } } },
+        aas = { Enc = { [10] = { { 'Fourth AA', 10 } } } },
+        discs = { Enc = { { 'Fourth Disc', 20 } } }, ALIAS_CLASS_MAP = {} }
+    local rt = { PURE_MELEE = { War = true }, filteredSpellsCache = {} }
+    local env = { myClasses = classes, DATA = data, runtime = rt, ctrl = { scribed_only = true }, lvlMin = 1, lvlMax = 60,
+        isDisciplineSpell = function() return false end, isScribed = function(n) return n == 'Fourth Spell' end,
+        mapTLOCategoryToKind = function() return 'other' end }
+    env.lookupSpells = loadFunc(src, 'lookupSpells', env)
+    local filter = loadFunc(src, 'filteredSpells', env)
+    local names, lookup = filter('Enc')
+    assert_eq(#names, 1, 'gem filter includes the fourth class and respects scribed/level filters')
+    assert_eq(lookup[1].name, 'Fourth Spell', 'fourth-class spell is selectable')
+    assert_eq(rt.filteredSpellsCache.Enc.indexOf['Fourth Spell'], 2, 'gem combo indexes the fourth-class spell')
+    local info = loadFunc(src, 'spellClassInfo', env)
+    local cls, bene, kind = info('Fourth Spell')
+    assert_eq(cls, 'Enc', 'Import Bar assigns spells to the fourth class')
+    assert_true(bene and kind == 'buff', 'fourth-class spell retains its casting defaults')
+    -- Use the production class-option block, including its iteration.
+    local optsCode = src:match('(local classOpts = {.-\n                for _, c in ipairs%(myClasses%) do classOpts%[#classOpts %+ 1%] = c end)')
+    local optionChunk = assert(loadstring(optsCode .. '\nreturn classOpts'))
+    setfenv(optionChunk, setmetatable({ myClasses = classes }, { __index = _G }))
+    assert_tbl_eq(optionChunk(), { '--', 'War', 'Clr', 'Mag', 'Enc' }, 'spell gem class selector includes slot four')
+
+    local noop = function() end
+    local pushed = {}
+    local imgui = setmetatable({ BeginTabItem = function() return true end, BeginChild = function() return true end,
+        PushID = function(id) pushed[#pushed + 1] = tostring(id) end,
+        Checkbox = function(_, v) return v end, Button = function() return false end,
+        IsItemHovered = function() return false end }, { __index = function() return noop end })
+    local loadout = { aas = {}, discs = {} }
+    local uiEnv = { myClasses = classes, DATA = data, loadout = loadout, ctrl = { aa_purchased_only = true, disc_trained_only = true },
+        runtime = { hasAA = function(n) return n == 'Fourth AA' end, hasDisc = function(n) return n == 'Fourth Disc' end },
+        UI = { px = function(n) return n end }, ImGui = imgui, ImGuiStyleVar = {},
+        aaTier = aaTier, fmtSec = function(n) return tostring(n) end,
+        classColor = function() return 1, 1, 1, 1 end, isFeignDeathAbility = function() return false end }
+    for _, tab in ipairs({ 'drawAATab', 'drawDiscTab' }) do
+        local tabSrc = src:gsub('function UI%.' .. tab .. '%(', 'local function ' .. tab .. '(')
+        loadFunc(tabSrc, tab, uiEnv)()
+    end
+    -- 3.2 draws unsaved rows with a throwaway default and stores them only once enabled, so the
+    -- check is that each tab drew a row for the fourth class, not that it wrote a loadout entry.
+    local function drewRow(part)
+        for _, id in ipairs(pushed) do if id:find(part, 1, true) then return true end end
+        return false
+    end
+    assert_true(drewRow('_Enc_Fourth AA'), 'activated AA tab includes purchased AAs from slot four')
+    assert_true(drewRow('discEncFourth Disc'), 'disciplines tab includes trained discs from slot four')
+    local order = loadFunc(src, 'aaTabOrder', { myClasses = classes, DATA = data, runtime = {}, aaTier = aaTier })()
+    assert_eq(order['Fourth AA'], 1, 'combat AA ordering includes slot four')
+    local skills = loadFunc(src, 'getClientAbilities', { myClasses = classes, CLASS_ACTIONS = { Enc = { 'Fourth Skill' }, racial = {}, universal = {} },
+        mq = { TLO = { Me = {} } }, hasActionSkill = function() return true end, ctrl = { action_trained_only = true } })()
+    assert_eq(skills[1].cls, 'Enc', 'abilities list includes slot four skills')
+end
+
+do
+    print('--- Fourth-class spellbook tabs and spell lists ---')
+    local book = assert(loadfile('TAC/lua/tac/spellbook.lua'))()
+    local api = { myClasses = { 'Clr', 'Dru', 'Mag', 'Enc' }, ctrl = {}, runtime = {}, ImGui = {},
+        DATA = { spells = { Enc = { { 'Fourth Book Spell', 20, 1, 'buff' } } } },
+        normalizeSpellName = function(n) return n:lower() end, cleanSpellName = function(n) return n end,
+        mq = { TLO = { Me = { Book = function() return function() return nil end end }, Spell = function() return nil end } } }
+    book.onInit(api)
+    assert_tbl_eq(book.state.casterClasses, { 'Clr', 'Dru', 'Mag', 'Enc' }, 'spellbook exposes four caster tabs')
+    assert_eq(book.getClassSpells('Enc')[1][1], 'Fourth Book Spell', 'spellbook database contains fourth-class spells')
+    api.ctrl.show_spellbook = true
+    book.getActiveClassSpells('Enc')
+    for _ = 1, 7 do book.onTick() end
+    local spells = book.getActiveClassSpells('Enc')
+    assert_eq(spells[1].name, 'Fourth Book Spell', 'fourth-class browser builds and publishes its spell list')
+    api.ctrl.show_spellbook = false
+    book.state.activeClassTab = 4; book.state.selectedSpell = spells[1]
+    api.myClasses = { 'Clr', 'Dru', 'Mag', 'Shm' }; book.onTick()
+    assert_nil(book.state.selectedSpell, 'replacing the fourth class clears the old selected spell')
+    assert_eq(book.state.casterClasses[4], 'Shm', 'fourth caster tab updates after replacement')
+    api.myClasses = { 'War', 'Clr', 'Mag', 'Enc' }; book.onTick()
+    assert_tbl_eq(book.state.casterClasses, { 'Clr', 'Mag', 'Enc' }, 'melee filtering retains the fourth class caster')
+    assert_eq(book.state.activeClassTab, 3, 'removed caster tabs clamp the active tab')
+    api.myClasses = {}; book.onTick()
+    assert_eq(#book.state.casterClasses, 0, 'clearing classes clears all spellbook tabs')
+    assert_eq(#book.state.myClasses, 0, 'spellbook follows an empty live class list')
+    book.onDestroy()
+end
+
+do
+    print('--- Fourth-class Auto AA restrictions and rescans ---')
+    local plugin = assert(loadfile('TAC/lua/tac/auto_aa.lua'))()
+    local api = { myClasses = { 'War', 'Clr', 'Mag' }, ctrl = {}, runtime = {}, ImGui = {},
+        DATA = { aas = { Enc = { { 'Fourth Combat AA' } } } },
+        mq = { TLO = { Me = { AltAbility = function() return nil end }, AltAbility = function() return nil end } } }
+    plugin.onInit(api)
+    local engine = plugin.AA
+    engine.AA_CLASS_RESTRICTIONS = { ['Fourth Class AA'] = { Enc = true } }
+    engine.CLASS_SPECIFIC_ABILITIES = { Enc = { 'Fourth Class AA' } }
+    engine.ARCHETYPE_RESTRICTIONS = { ['Fourth Caster AA'] = 'caster' }
+    engine.ARCHETYPE_CLASSES = { caster = { Enc = true } }
+    assert_eq(engine.isAAAllowedForPlayer('Fourth Class AA'), false, 'AA restriction rejects an unselected class')
+    api.myClasses[4] = 'Enc'
+    assert_true(engine.isAAAllowedForPlayer('Fourth Class AA'), 'fourth class satisfies the AA class restriction')
+    assert_true(engine.isAAAllowedForPlayer('Fourth Caster AA'), 'fourth class satisfies the AA archetype restriction')
+    engine.recordScannedAA = function(list, found, name)
+        if not found[name] and engine.isAAAllowedForPlayer(name) then
+            found[name] = true; list[#list + 1] = { name = name, maxRank = 1 }
+        end
+    end
+    engine.getAAWindow = function() return nil end
+    engine.readSpecialTabNamesFromUI = function() return {} end
+    local scans, scan = 0, engine.scanPlayerAAs
+    engine.scanPlayerAAs = function(force) scans = scans + 1; return scan(force) end
+    plugin.onTick()
+    assert_eq(scans, 1, 'adding the fourth class queues a scan on the tick')
+    assert_true(engine.scannedAAMap['Fourth Combat AA'], 'AA scan includes fourth-class combat AAs')
+    assert_true(engine.scannedAAMap['Fourth Class AA'], 'AA scan includes fourth-class training catalog')
+    assert_true(engine.scannedAAMap['Fourth Caster AA'], 'AA scan includes fourth-class archetype AAs')
+    plugin.onTick()
+    assert_eq(scans, 1, 'unchanged classes do not cause repeated scans')
+    api.myClasses[4] = nil; plugin.onTick()
+    assert_eq(scans, 2, 'removing the fourth class refreshes the AA scan')
+    assert_nil(engine.scannedAAMap['Fourth Class AA'], 'removed class AA leaves the scan')
+    plugin.onDestroy()
+end
+
 
 -- ============================================================================
 -- Suite 113: GM Commands plugin (tac/gm_commands.lua) -- reference data,
@@ -20912,6 +21167,804 @@ do
     end
 
     print = origPrint
+end
+
+-- ---------------------------------------------------------------------------
+-- Suite 114: Target selector registry
+-- ---------------------------------------------------------------------------
+do
+    print('--- Suite 114: Target selector registry ---')
+    local text = readFile('TAC/lua/triune.lua'):gsub('\r\n', '\n')
+    local function slice(startPat, endPat)
+        local s = assert(text:find(startPat, 1, true), 'missing: ' .. startPat)
+        local e = assert(text:find(endPat, s, true), 'missing: ' .. endPat)
+        return text:sub(s, e - 1)
+    end
+    local regCode = slice('local function builtinTargetBase', '-- Local Theme & Common Helpers')
+    local uiCode = slice('UI.targetOptsCache = {}', 'function UI.targetCombo(')
+    local resolveCode = slice("elseif b == 'All Enemies' then", "    if not id or id <= 0 then return nil end")
+
+    local printed = {}
+    local function newWorld()
+        local COMBO_OPTIONS = {
+            FRIENDLY = { 'Myself', 'Main Assist', 'Pet' },
+            ENEMY    = { 'Current Target', 'Assist Target', 'All Enemies' },
+            TARGETS  = { 'F: Myself', 'F: Main Assist', 'F: Pet', 'E: Current Target', 'E: Assist Target', 'E: All Enemies' },
+        }
+        local runtime = { targetSelectors = {}, targetSelectorVersion = 0 }
+        local UI = {}
+        local env = setmetatable({
+            COMBO_OPTIONS = COMBO_OPTIONS, runtime = runtime, UI = UI,
+            print = function(...) printed[#printed + 1] = table.concat({ ... }, ' ') end,
+        }, { __index = _G })
+        local chunk = assert((loadstring or load)(
+            'runtime.targetSelectors = {}\nruntime.targetSelectorVersion = 0\n'
+            .. regCode .. '\n' .. uiCode .. '\nreturn true', 'suite112'))
+        setfenv(chunk, env)
+        chunk()
+        return runtime, COMBO_OPTIONS, UI
+    end
+    local function indexOf(list, v)
+        for i, x in ipairs(list) do if x == v then return i end end
+        return nil
+    end
+
+    -- registering
+    local runtime, OPTS, UI = newWorld()
+    local seen
+    local ok, err = runtime.registerTargetSelector({
+        owner = 'mez', label = 'Mez Target', help = 'h',
+        resolve = function(ctx) seen = ctx; return 321 end,
+    })
+    assert_eq(ok, true, 'registry: a valid selector registers')
+    assert_eq(OPTS.TARGETS[#OPTS.TARGETS], 'E: Mez Target', 'registry: enemy selector goes after the last E: entry')
+    assert_eq(OPTS.TARGETS[indexOf(OPTS.TARGETS, 'E: Mez Target') - 1], 'E: All Enemies', 'registry: ...next to the other enemy targets')
+    assert_eq(runtime.targetSelectorVersion, 1, 'registry: version bumps on register')
+
+    ok = runtime.registerTargetSelector({ owner = 'mez', label = 'Mez Target', resolve = function() return 1 end })
+    assert_eq(ok, true, 'registry: the same owner may register the same label again')
+    local n = 0
+    for _, v in ipairs(OPTS.TARGETS) do if v == 'E: Mez Target' then n = n + 1 end end
+    assert_eq(n, 1, 'registry: re-registering does not duplicate the dropdown entry')
+    runtime.registerTargetSelector({ owner = 'mez', label = 'Mez Target', resolve = function(ctx) seen = ctx; return 321 end })
+
+    ok, err = runtime.registerTargetSelector({ owner = 'other', label = 'Mez Target', resolve = function() return 1 end })
+    assert_eq(ok, false, 'registry: another owner cannot take a registered label')
+    assert_true(tostring(err):find('already registered'), 'registry: the refusal says why')
+
+    for _, bad in ipairs({ 'Current Target', 'Pet', 'Myself', 'Target', 'All Enemies', 'Self' }) do
+        assert_eq((runtime.registerTargetSelector({ label = bad, resolve = function() return 1 end })), false,
+            'registry: built-in name refused: ' .. bad)
+    end
+    assert_eq((runtime.registerTargetSelector({ label = '', resolve = function() return 1 end })), false, 'registry: empty label refused')
+    assert_eq((runtime.registerTargetSelector({ label = 'E: Thing', resolve = function() return 1 end })), false, 'registry: side prefix in the label refused')
+    assert_eq((runtime.registerTargetSelector({ label = 'X', resolve = 'nope' })), false, 'registry: non-function resolve refused')
+    assert_eq((runtime.registerTargetSelector({ label = 'X', side = 'Z', resolve = function() return 1 end })), false, 'registry: bad side refused')
+    assert_eq((runtime.registerTargetSelector(nil)), false, 'registry: nil spec refused')
+
+    runtime.registerTargetSelector({ owner = 'buffs', label = 'Group Pick', side = 'F', resolve = function() return 9 end })
+    assert_eq(OPTS.TARGETS[indexOf(OPTS.TARGETS, 'F: Group Pick') - 1], 'F: Pet', 'registry: friendly selector goes after the last F: entry')
+
+    -- running a selector
+    local id = runtime.runTargetSelector('Mez Target', 'E: Mez Target', 'Enc', 'in combat', 'Dazzle', 100, { kind = 'util' })
+    assert_eq(id, 321, 'run: returns the selector\'s spawn id')
+    assert_eq(seen.spellName, 'Dazzle', 'run: the spell name reaches the selector')
+    assert_eq(seen.cls, 'Enc', 'run: the class reaches the selector')
+    assert_eq(seen.when, 'in combat', 'run: the When reaches the selector')
+    assert_eq(seen.entry.kind, 'util', 'run: the entry reaches the selector')
+    assert_eq(seen.token, 'E: Mez Target', 'run: the token reaches the selector')
+    assert_nil(runtime.runTargetSelector('Missing', 'E: Missing'), 'run: unknown label gives no target')
+    for _, ret in ipairs({ 0, -4, 'abc' }) do
+        runtime.registerTargetSelector({ owner = 'mez', label = 'Mez Target', resolve = function() return ret end })
+        assert_nil(runtime.runTargetSelector('Mez Target', 'E: Mez Target'), 'run: ' .. tostring(ret) .. ' is no target')
+    end
+    runtime.registerTargetSelector({ owner = 'mez', label = 'Mez Target', resolve = function() return nil end })
+    assert_nil(runtime.runTargetSelector('Mez Target', 'E: Mez Target'), 'run: nil is no target')
+    printed = {}
+    runtime.registerTargetSelector({ owner = 'mez', label = 'Mez Target', resolve = function() error('boom') end })
+    assert_nil(runtime.runTargetSelector('Mez Target', 'E: Mez Target'), 'run: an erroring selector gives no target')
+    assert_nil(runtime.runTargetSelector('Mez Target', 'E: Mez Target'), 'run: ...every time')
+    assert_eq(#printed, 1, 'run: the error is reported once, not on every call')
+
+    -- unknown plugin-form tokens fail closed; legacy values keep the old behavior
+    runtime.registerTargetSelector({ owner = 'mez', label = 'Mez Target', resolve = function() return 5 end })
+    assert_eq(runtime.isUnknownSelectorToken('E: Mez Target', 'Mez Target'), false, 'unknown: a registered selector is known')
+    runtime.unregisterTargetSelector('Mez Target', 'mez')
+    assert_eq(runtime.isUnknownSelectorToken('E: Mez Target', 'Mez Target'), true, 'unknown: an unregistered E: token is unknown')
+    assert_eq(runtime.isUnknownSelectorToken('F: Whatever', 'Whatever'), true, 'unknown: an unregistered F: token is unknown')
+    assert_eq(runtime.isUnknownSelectorToken('Target', 'Current Target'), false, 'unknown: legacy "Target" has no side prefix')
+    assert_eq(runtime.isUnknownSelectorToken('', ''), false, 'unknown: an empty token keeps the old behavior')
+    assert_eq(runtime.isUnknownSelectorToken(nil, ''), false, 'unknown: a missing token keeps the old behavior')
+    assert_eq(runtime.isUnknownSelectorToken('S: Self', 'S: Self'), false, 'unknown: an old non-E/F prefix keeps the old behavior')
+    assert_eq(runtime.isUnknownSelectorToken('E: Mez Target', ''), false, 'unknown: an empty base is not treated as unknown')
+
+    -- unregistering
+    runtime.registerTargetSelector({ owner = 'mez', label = 'Mez Target', resolve = function() return 5 end })
+    runtime.registerTargetSelector({ owner = 'mez', label = 'Second', resolve = function() return 6 end })
+    local v0 = runtime.targetSelectorVersion
+    assert_eq(runtime.unregisterTargetSelector('Mez Target', 'someone-else'), false, 'unregister: wrong owner refused')
+    assert_eq(runtime.unregisterTargetSelectorsByOwner('mez'), 2, 'unregister: by owner removes all of that owner\'s selectors')
+    assert_nil(indexOf(OPTS.TARGETS, 'E: Mez Target'), 'unregister: dropdown entry removed')
+    assert_nil(indexOf(OPTS.TARGETS, 'E: Second'), 'unregister: every entry removed')
+    assert_true(indexOf(OPTS.TARGETS, 'F: Group Pick'), 'unregister: other owners untouched')
+    assert_true(runtime.targetSelectorVersion > v0, 'unregister: version bumps')
+    assert_eq(runtime.unregisterTargetSelector('Nope'), false, 'unregister: unknown label is a no-op')
+    assert_eq(runtime.unregisterTargetSelectorsByOwner(nil), 0, 'unregister: nil owner removes nothing')
+
+    -- the dropdown keeps a token that is not in the list
+    runtime, OPTS, UI = newWorld()
+    local list, idx, extra = UI.targetComboOptions('F: Pet')
+    assert_eq(list, OPTS.TARGETS, 'combo: a known token uses the real list')
+    assert_eq(OPTS.TARGETS[idx], 'F: Pet', 'combo: ...at its own index')
+    assert_eq(extra, false, 'combo: ...with no extra item')
+    local list2, idx2, extra2 = UI.targetComboOptions('E: Mez Target')
+    assert_eq(extra2, true, 'combo: an unknown token gets an extra item')
+    assert_eq(list2[idx2], 'E: Mez Target (unavailable)', 'combo: ...labelled unavailable')
+    assert_eq(idx2, #list2, 'combo: ...selected, at the end')
+    assert_eq(#list2, #OPTS.TARGETS + 1, 'combo: the real list is otherwise unchanged')
+    assert_nil(indexOf(OPTS.TARGETS, 'E: Mez Target (unavailable)'), 'combo: the real list is not polluted')
+    local list3 = UI.targetComboOptions('E: Mez Target')
+    assert_eq(list3, list2, 'combo: the unavailable-token list is cached between frames')
+    runtime.registerTargetSelector({ owner = 'mez', label = 'Other', resolve = function() return 1 end })
+    local list4 = UI.targetComboOptions('E: Mez Target')
+    assert_true(list4 ~= list2, 'combo: the cache refreshes when the registry changes')
+    assert_eq(#list4, #OPTS.TARGETS + 1, 'combo: ...and includes the new entry')
+    runtime.registerTargetSelector({ owner = 'mez', label = 'Mez Target', resolve = function() return 1 end })
+    local list5, idx5, extra5 = UI.targetComboOptions('E: Mez Target')
+    assert_eq(extra5, false, 'combo: once the plugin registers, the token is a normal entry again')
+    assert_eq(list5[idx5], 'E: Mez Target', 'combo: ...selected normally')
+
+    -- resolveTargetId: the dispatch branch text
+    assert_true(resolveCode:find('runtime.targetSelectors[b]', 1, true), 'resolve: registered selectors are dispatched')
+    assert_true(resolveCode:find('isUnknownSelectorToken(token, b)', 1, true), 'resolve: unknown plugin-form tokens are checked')
+    assert_true(resolveCode:find('return nil', 1, true), 'resolve: ...and return no target')
+    assert_true(resolveCode:find('id = mq.TLO.Target.ID()', 1, true), 'resolve: other values keep the current-target fallback')
+end
+
+-- ---------------------------------------------------------------------------
+-- Suite 115: Per-server config files -- the same character on two servers must not share one file
+-- ---------------------------------------------------------------------------
+do
+    print('--- Suite 115: Per-server config files ---')
+    local text = readFile('TAC/lua/triune.lua'):gsub('\r\n', '\n')
+    local a = assert(text:find('-- Server name for per-server config files.', 1, true), 'missing serverTag block')
+    local b = assert(text:find('function runtime.loadAll()', a, true), 'missing loadAll')
+    local code = text:sub(a, b - 1)
+    local dir = (os.getenv('TMPDIR') or '/tmp') .. '/triune_junk_plugins'
+    os.execute('mkdir -p "' .. dir .. '"')
+
+    local function value(v) return function() return v end end
+    local function world(src)
+        local mq = { configDir = dir, TLO = {
+            MacroQuest = { Server = src.mqFails and function() error('no MacroQuest.Server') end or value(src.mq) },
+            EverQuest = { ServerName = value(src.eq) },
+            Zone = { Server = value(src.zone) },
+        } }
+        local env = setmetatable({ runtime = {}, mq = mq, myName = 'Kylaeris' }, { __index = _G })
+        local chunk = assert(loadstring(code))
+        setfenv(chunk, env)
+        chunk()
+        return env.runtime
+    end
+    local function put(path, body) local fh = assert(io.open(path, 'wb')); fh:write(body); fh:close() end
+    local function get(path) local fh = io.open(path, 'rb'); if not fh then return nil end; local d = fh:read('*a'); fh:close(); return d end
+
+    -- the tag
+    assert_eq(world({ mq = 'ratquest', eq = '', zone = '' }).serverTag(), 'ratquest', 'Suite 115: serverTag reads MacroQuest.Server()')
+    assert_eq(world({ mq = '', eq = 'Some Server', zone = '' }).serverTag(), 'Some_Server', 'Suite 115: ...falls back to EverQuest.ServerName() and sanitizes it')
+    assert_eq(world({ mq = '', eq = '', zone = 'zsrv' }).serverTag(), 'zsrv', 'Suite 115: ...then Zone.Server()')
+    assert_eq(world({ mqFails = true, eq = 'eqsrv', zone = '' }).serverTag(), 'eqsrv', 'Suite 115: a probe that throws is skipped')
+    assert_eq(world({ mq = 'NULL', eq = '', zone = '' }).serverTag(), '', 'Suite 115: NULL counts as unknown')
+    assert_eq(world({ mq = '', eq = '', zone = '' }).serverTag(), '', 'Suite 115: no source knows the server -> empty')
+
+    -- plugin config paths
+    local legacyChat = dir .. '/triune_chat_Kylaeris.lua'
+    local ratChat = dir .. '/triune_chat_ratquest_Kylaeris.lua'
+    os.remove(legacyChat); os.remove(ratChat)
+    assert_eq(world({ mq = '', eq = '', zone = '' }).configFilePath('triune_chat', 'Kylaeris', 'lua'), legacyChat, 'Suite 115: unknown server keeps the old file name')
+    local rt = world({ mq = 'ratquest', eq = '', zone = '' })
+    assert_eq(rt.configFilePath('triune_chat', 'Kylaeris', 'lua'), ratChat, 'Suite 115: a known server puts the server in the file name')
+    assert_nil(get(ratChat), 'Suite 115: no old file -> nothing is created')
+    put(legacyChat, 'LEGACY')
+    assert_eq(rt.configFilePath('triune_chat', 'Kylaeris', 'lua'), ratChat, 'Suite 115: same path with an old file present')
+    assert_eq(get(ratChat), 'LEGACY', 'Suite 115: the old file is copied to the per-server name on first use')
+    assert_eq(get(legacyChat), 'LEGACY', 'Suite 115: ...and left in place')
+    put(ratChat, 'RATQUEST EDIT')
+    rt.configFilePath('triune_chat', 'Kylaeris', 'lua')
+    assert_eq(get(ratChat), 'RATQUEST EDIT', 'Suite 115: an existing per-server file is never overwritten')
+    put(legacyChat, 'LEGACY CHANGED')
+    assert_eq(get(ratChat), 'RATQUEST EDIT', 'Suite 115: later changes to the old file do not leak in')
+    local trio = dir .. '/triune_chat_multiclass_Kylaeris.lua'
+    os.remove(trio)
+    world({ mq = 'multiclass', eq = '', zone = '' }).configFilePath('triune_chat', 'Kylaeris', 'lua')
+    assert_eq(get(trio), 'LEGACY CHANGED', 'Suite 115: another server gets its own copy, so the two servers diverge')
+    os.remove(legacyChat); os.remove(ratChat); os.remove(trio)
+
+    -- the loadout file
+    local legacyLoad = dir .. '/triune_loadout__Kylaeris.lua'
+    local ratLoad = dir .. '/triune_loadout_ratquest_Kylaeris.lua'
+    os.remove(legacyLoad); os.remove(ratLoad)
+    assert_eq(world({ mq = '', eq = '', zone = '' }).loadoutFilePath(), legacyLoad, 'Suite 115: loadout with an unknown server keeps triune_loadout__<char>.lua')
+    put(legacyLoad, 'return { Kylaeris = {} }')
+    assert_eq(world({ mq = 'ratquest', eq = '', zone = '' }).loadoutFilePath(), ratLoad, 'Suite 115: loadout path carries the server')
+    assert_eq(get(ratLoad), 'return { Kylaeris = {} }', 'Suite 115: the loadout is copied from the shared file on first use')
+    put(ratLoad, 'return { Kylaeris = { changed = true } }')
+    world({ mq = 'ratquest', eq = '', zone = '' }).loadoutFilePath()
+    assert_eq(get(ratLoad), 'return { Kylaeris = { changed = true } }', 'Suite 115: ...and never overwritten afterwards')
+    assert_eq(world({ mq = '', eq = 'ratquest', zone = '' }).loadoutFilePath(), ratLoad, 'Suite 115: a server known only from EverQuest.ServerName() gives the same path')
+    os.remove(legacyLoad); os.remove(ratLoad)
+
+    -- wiring
+    local api = text:match('serverTag%s*=%s*runtime%.serverTag')
+    assert_true(api ~= nil and text:find('configFilePath           = runtime.configFilePath', 1, true) ~= nil, 'Suite 115: the plugin core API exposes serverTag and configFilePath')
+    for _, p in ipairs({ 'TAC/lua/tac/chat.lua', 'TAC/lua/tac/dps.lua' }) do
+        local ptxt = readFile(p)
+        assert_true(ptxt:find('core.configFilePath(', 1, true) ~= nil, 'Suite 115: ' .. p .. ' builds its config path through the core')
+    end
+end
+
+-- ---------------------------------------------------------------------------
+-- Suite 116: Plugin API version and capability manifest
+-- ---------------------------------------------------------------------------
+do
+    print('--- Suite 116: Plugin API version and capabilities ---')
+    local text = readFile('TAC/lua/triune.lua'):gsub('\r\n', '\n')
+    local a = assert(text:find('-- Plugin API version and capability manifest', 1, true), 'missing manifest block')
+    local b = assert(text:find('-- Server name for per-server config files.', a, true), 'missing end of manifest block')
+    local code = text:sub(a, b - 1)
+    local function world()
+        local env = setmetatable({ runtime = {} }, { __index = _G })
+        local chunk = assert(loadstring(code))
+        setfenv(chunk, env)
+        chunk()
+        return env.runtime
+    end
+
+    local rt = world()
+    assert_eq(type(rt.API_VERSION), 'string', 'Suite 116: the API version is a string')
+    assert_true(rt.API_VERSION:match('^%d+%.%d+$') ~= nil, 'Suite 116: ...of the form MAJOR.MINOR')
+    local info = rt.apiVersionInfo()
+    assert_true(info.major >= 1, 'Suite 116: apiVersionInfo gives the numeric major')
+
+    -- 1.10 is newer than 1.9 and is not the same as 1.1 (as numbers they would be)
+    rt.API_VERSION = '1.10'
+    info = rt.apiVersionInfo()
+    assert_true(info.major == 1 and info.minor == 10, 'Suite 116: "1.10" parses as major 1, minor 10')
+    assert_eq(rt.apiAtLeast(1, 9), true, 'Suite 116: 1.10 is at least 1.9')
+    assert_eq(rt.apiAtLeast(1, 10), true, 'Suite 116: 1.10 is at least 1.10')
+    assert_eq(rt.apiAtLeast(1, 11), false, 'Suite 116: 1.10 is not at least 1.11')
+    assert_eq(rt.apiAtLeast(2, 0), false, 'Suite 116: 1.10 is not at least 2.0')
+    assert_eq(rt.apiAtLeast(1), true, 'Suite 116: the minor defaults to 0')
+    assert_eq(rt.apiAtLeast(0, 99), true, 'Suite 116: an older major is always satisfied')
+    rt.API_VERSION = '1.1'
+    assert_eq(rt.apiAtLeast(1, 10), false, 'Suite 116: 1.1 is not at least 1.10')
+    assert_eq(rt.apiAtLeast('x', 1), false, 'Suite 116: a non-number is never satisfied')
+    assert_eq(rt.apiAtLeast(nil, nil), false, 'Suite 116: nil is never satisfied')
+
+    -- the manifest
+    local valid = { stable = true, experimental = true }
+    local kinds = { value = true, ['function'] = true, registry = true, event = true, hook = true }
+    local count = 0
+    for name, e in pairs(rt.apiManifest) do
+        count = count + 1
+        assert_true(valid[e.tier] == true, 'Suite 116: manifest tier for ' .. name)
+        assert_true(kinds[e.kind] == true, 'Suite 116: manifest kind for ' .. name)
+        assert_true(type(e.since) == 'string' and e.since:match('^%d+%.%d+$') ~= nil, 'Suite 116: manifest version for ' .. name)
+    end
+    assert_true(count >= 9, 'Suite 116: the manifest lists the first entries')
+    assert_eq(rt.apiManifest.registerTargetSelector.tier, 'experimental', 'Suite 116: the target registry is experimental')
+    assert_eq(rt.apiManifest.hasCapability.tier, 'stable', 'Suite 116: the capability check itself is stable')
+
+    -- every non-event entry has a key in the core API table, and hasCapability is wired
+    local ga = assert(text:find('function pm.getCoreApi()', 1, true), 'missing getCoreApi')
+    local gb = assert(text:find('setmetatable(api, {', ga, true), 'missing end of getCoreApi table')
+    local apiText = text:sub(ga, gb)
+    for name, e in pairs(rt.apiManifest) do
+        if e.kind ~= 'event' and e.kind ~= 'hook' and name ~= 'hasCapability' then
+            assert_true(apiText:find('\n%s+' .. name .. '%s*=') ~= nil, 'Suite 116: the core API table has ' .. name)
+        end
+    end
+    assert_true(apiText:find('api.hasCapability = function(name)', 1, true) ~= nil, 'Suite 116: the core API table gets hasCapability')
+end
+
+-- ---------------------------------------------------------------------------
+-- Suite 117: Spell records -- revisions, copies and reports
+-- ---------------------------------------------------------------------------
+do
+    print('--- Suite 117: Spell records ---')
+    local text = readFile('TAC/lua/triune.lua'):gsub('\r\n', '\n')
+    local a = assert(text:find('-- Spell records (docs/HOOKS.md, section 5)', 1, true), 'missing spell record block')
+    local b = assert(text:find('-- Server name for per-server config files.', a, true), 'missing end of spell record block')
+    local code = text:sub(a, b - 1)
+    local function world()
+        local events = {}
+        local rt = { npcSpellApplied = {}, npcSpellLastCast = {}, npcSpellRevision = {}, spellRecordGen = 0,
+            pluginManager = { onSpellRecordChanged = function(...) events[#events + 1] = { ... } end } }
+        local env = setmetatable({ runtime = rt }, { __index = _G })
+        local chunk = assert(loadstring(code))
+        setfenv(chunk, env)
+        chunk()
+        -- what the two write sites in core do for a cast issued now
+        function rt.cast(mob, spell, at, expires)
+            rt.npcSpellLastCast[mob] = rt.npcSpellLastCast[mob] or {}
+            rt.npcSpellLastCast[mob][spell] = at
+            rt.touchSpellRecord(mob, spell)
+            rt.npcSpellApplied[mob] = rt.npcSpellApplied[mob] or {}
+            rt.npcSpellApplied[mob][spell] = expires
+        end
+        return rt, events
+    end
+
+    -- the accessor returns a copy
+    local rt, events = world()
+    assert_nil(rt.spellRecord(5, 'Mesmerize'), 'Suite 117: no record -> nil')
+    rt.cast(5, 'Mesmerize', 100, 112)
+    local rec = rt.spellRecord(5, 'Mesmerize')
+    assert_true(rec.castAt == 100 and rec.expiresAt == 112 and rec.revision ~= nil, 'Suite 117: the record has castAt, expiresAt and a revision')
+    rec.expiresAt = 9999; rec.revision = 'x'
+    assert_eq(rt.npcSpellApplied[5].Mesmerize, 112, 'Suite 117: changing the returned copy does not change the shared table')
+    assert_true(rt.spellRecord(5, 'Mesmerize').revision ~= 'x', 'Suite 117: ...or the revision')
+
+    -- report validation
+    local r1 = rt.spellRecord(5, 'Mesmerize').revision
+    local ok, why = rt.reportSpellEnded(5, 'Mesmerize', 'exploded', r1)
+    assert_true(ok == false and why == 'bad reason', 'Suite 117: an unknown reason is refused')
+    ok, why = rt.reportSpellEnded(nil, 'Mesmerize', 'failed', r1)
+    assert_true(ok == false and why == 'bad arguments', 'Suite 117: a missing mob id is refused')
+    ok, why = rt.reportSpellEnded(5, '', 'failed', r1)
+    assert_true(ok == false and why == 'bad arguments', 'Suite 117: an empty spell name is refused')
+    ok, why = rt.reportSpellEnded(6, 'Mesmerize', 'failed', r1)
+    assert_true(ok == false and why == 'no record', 'Suite 117: a report for a mob with no record changes nothing')
+    ok, why = rt.reportSpellEnded(5, 'Mesmerize', 'failed', nil)
+    assert_true(ok == false and why == 'stale', 'Suite 117: a report with no revision is refused')
+    ok, why = rt.reportSpellEnded(5, 'Mesmerize', 'failed', r1 + 1000)
+    assert_true(ok == false and why == 'stale', 'Suite 117: a report with another revision is refused')
+    assert_eq(#events, 0, 'Suite 117: refused reports emit no event')
+    assert_eq(rt.npcSpellApplied[5].Mesmerize, 112, 'Suite 117: ...and clear nothing')
+
+    -- a good report
+    ok = rt.reportSpellEnded(5, 'Mesmerize', 'woke', r1, 'hit by the tank')
+    assert_eq(ok, true, 'Suite 117: a report with the current revision is accepted')
+    assert_nil(rt.npcSpellApplied[5].Mesmerize, 'Suite 117: ...and core clears the record')
+    assert_eq(#events, 1, 'Suite 117: one event after the change')
+    local ev = events[1]
+    assert_true(ev[1] == 5 and ev[2] == 'Mesmerize' and ev[3] == 'woke', 'Suite 117: the event carries mob, spell and reason')
+    assert_true(ev[4].revision == r1 and ev[4].expiresAt == 112 and ev[5] == nil, 'Suite 117: ...the old record (with its revision) and no new record')
+    assert_eq(ev[6], 'hit by the tank', 'Suite 117: ...and the detail as the last argument')
+    ok, why = rt.reportSpellEnded(5, 'Mesmerize', 'woke', r1)
+    assert_true(ok == false and why == 'no record', 'Suite 117: reporting the same thing twice is a no-op')
+    assert_eq(#events, 1, 'Suite 117: ...with no second event')
+
+    -- a late report must not clear a newer cast of the same spell on the same mob
+    rt.cast(5, 'Mesmerize', 130, 142)
+    local r2 = rt.spellRecord(5, 'Mesmerize').revision
+    assert_true(r2 ~= r1, 'Suite 117: a recast gets a new revision')
+    ok, why = rt.reportSpellEnded(5, 'Mesmerize', 'faded', r1)
+    assert_true(ok == false and why == 'stale', 'Suite 117: a delayed report for the older cast is ignored')
+    assert_eq(rt.npcSpellApplied[5].Mesmerize, 142, 'Suite 117: ...and the newer record survives')
+    assert_eq(#events, 1, 'Suite 117: ...with no event')
+
+    -- the counter survives a wholesale reset, so nothing before the reset can match anything after it
+    local before = rt.spellRecordGen
+    rt.npcSpellApplied, rt.npcSpellLastCast, rt.npcSpellRevision = {}, {}, {}
+    assert_eq(rt.spellRecordGen, before, 'Suite 117: a reset of the tables leaves the counter alone')
+    rt.cast(5, 'Mesmerize', 200, 212)
+    local r3 = rt.spellRecord(5, 'Mesmerize').revision
+    assert_true(r3 > r2, 'Suite 117: a record made after a reset has a later revision')
+    ok, why = rt.reportSpellEnded(5, 'Mesmerize', 'failed', r2)
+    assert_true(ok == false and why == 'stale', 'Suite 117: a report from before the reset cannot clear a record after it')
+
+    -- a reused spawn id: a report about the dead mob must not hit the new one
+    rt.npcSpellApplied[5] = nil
+    rt.cast(5, 'Mesmerize', 300, 312)
+    local r4 = rt.spellRecord(5, 'Mesmerize').revision
+    assert_true(r4 ~= r3 and r4 > r3, 'Suite 117: the new mob that reuses id 5 gets a new revision')
+    ok, why = rt.reportSpellEnded(5, 'Mesmerize', 'faded', r3)
+    assert_true(ok == false and why == 'stale', 'Suite 117: a stale report about the old mob is ignored')
+    assert_eq(rt.npcSpellApplied[5].Mesmerize, 312, 'Suite 117: ...and the new mob keeps its record')
+
+    -- other spells and mobs are independent
+    rt.cast(5, 'Dazzle', 310, 400)
+    rt.cast(6, 'Mesmerize', 310, 322)
+    local rd, rm = rt.spellRecord(5, 'Dazzle').revision, rt.spellRecord(6, 'Mesmerize').revision
+    assert_true(rd ~= r4 and rm ~= r4 and rd ~= rm, 'Suite 117: revisions differ across spells and mobs')
+    rt.reportSpellEnded(5, 'Dazzle', 'faded', rd)
+    assert_true(rt.npcSpellApplied[5].Mesmerize == 312 and rt.npcSpellApplied[6].Mesmerize == 322, 'Suite 117: ending one record leaves the others')
+
+    -- core wiring (source level): both write sites stamp a revision, both resets clear revisions, the counter is never reset
+    local _, stamps = text:gsub('runtime%.touchSpellRecord%(id, [%w%.]+%)', '')
+    assert_eq(stamps, 2, 'Suite 117: both places where core writes a record stamp a revision')
+    local _, resets = text:gsub('runtime%.npcSpellRevision = {}', '')
+    assert_true(resets >= 2, 'Suite 117: both wholesale resets of the spell tables also reset the revisions')
+    local _, gens = text:gsub('spellRecordGen%s*=%s*0', '')
+    assert_eq(gens, 1, 'Suite 117: the generation counter is initialised once and never reset')
+    assert_true(text:find('copy(old), copy(new), detail', 1, true) ~= nil, 'Suite 117: each plugin receives its own copies of the old and new record')
+end
+
+-- ---------------------------------------------------------------------------
+-- Suite 118: tools/api_probe.lua (the throwaway in-game probe) still loads and its commands run
+-- ---------------------------------------------------------------------------
+do
+    print('--- Suite 118: API probe plugin ---')
+    local lines = {}
+    local chunk = assert(loadfile('tools/api_probe.lua'))
+    setfenv(chunk, setmetatable({ print = function(...) lines[#lines + 1] = table.concat({ ... }, ' ') end }, { __index = _G }))
+    local probe = chunk()
+    assert_eq(probe.id, 'api_probe', 'Suite 118: the probe has an id')
+    assert_eq(probe.defaultEnabled, false, 'Suite 118: the probe is off by default')
+
+    local registered, record = nil, { castAt = 100, expiresAt = 160, revision = 7 }
+    local reported = {}
+    local core = {
+        apiVersion = '1.0', apiVersionInfo = { major = 1, minor = 0 },
+        api = { a = { tier = 'stable' }, b = { tier = 'experimental' } },
+        apiAtLeast = function(ma, mi) return ma == 1 and (mi or 0) <= 0 end,
+        hasCapability = function(name) return name ~= 'notAThing' end,
+        registerTargetSelector = function(spec) registered = spec; return true end,
+        spellRecord = function(mob, spell) return record end,
+        reportSpellEnded = function(mob, spell, reason, rev, detail) reported[#reported + 1] = { rev = rev, detail = detail }; return rev == 7, rev ~= 7 and 'stale' or nil end,
+        runtime = { npcSpellApplied = { [5] = { Mesmerize = 160 } } },
+        mq = { TLO = { Target = { ID = function() return 5 end } } },
+        ImGui = { TextWrapped = function() end },
+    }
+    probe.onInit(core)
+    assert_true(registered ~= nil and registered.owner == 'api_probe' and registered.label == 'Probe Target', 'Suite 118: onInit registers E: Probe Target for its owner')
+    assert_nil(registered.resolve(), 'Suite 118: the probe selector never picks a target')
+
+    local function run(...) return probe.onCommand('probe', { 'probe', ... }) end
+    assert_eq(probe.onCommand('other', { 'other' }), false, 'Suite 118: other commands are left alone')
+    for _, sub in ipairs({ 'help', 'version', 'status', 'bogus' }) do
+        assert_eq(run(sub), true, 'Suite 118: probe ' .. sub .. ' is handled')
+    end
+    lines = {}
+    run('record')
+    local joined = table.concat(lines, '\n')
+    assert_true(joined:find('Mesmerize on #5', 1, true) and joined:find('revision=7', 1, true), 'Suite 118: "probe record" lists the target\'s records')
+    run('report', 'stale')
+    run('report', 'current')
+    assert_eq(reported[1].rev, -1, 'Suite 118: "report stale" sends a revision that cannot match')
+    assert_eq(reported[2].rev, 7, 'Suite 118: "report current" sends the current revision')
+
+    -- failure modes
+    run('fail')
+    assert_true(not pcall(probe.onTick), 'Suite 118: "probe fail" makes onTick throw')
+    run('flaky')
+    local thrown = 0
+    for _ = 1, 12 do if not pcall(probe.onTick) then thrown = thrown + 1 end end
+    assert_eq(thrown, 8, 'Suite 118: "probe flaky" fails two ticks in three for twelve ticks')
+    assert_true(pcall(probe.onTick), 'Suite 118: ...and stops by itself')
+    run('drawfail')
+    assert_true(not pcall(probe.onDrawUI), 'Suite 118: "probe drawfail" makes onDrawUI throw once')
+    assert_true(pcall(probe.onDrawUI), 'Suite 118: ...only once')
+    probe.onSpellRecordChanged(5, 'Mesmerize', 'woke', record, nil, 'x')
+    probe.onDrawSettings()
+
+    -- "probe selftest" against core's real spell record functions (sliced from the source)
+    local text = readFile('TAC/lua/triune.lua'):gsub('\r\n', '\n')
+    local a = assert(text:find('-- Spell records (docs/HOOKS.md, section 5)', 1, true), 'missing spell record block')
+    local b = assert(text:find('-- Server name for per-server config files.', a, true), 'missing end of spell record block')
+    local rt2 = { npcSpellApplied = {}, npcSpellLastCast = {}, npcSpellRevision = {}, spellRecordGen = 0 }
+    local ch = assert(loadstring(text:sub(a, b - 1)))
+    setfenv(ch, setmetatable({ runtime = rt2 }, { __index = _G }))
+    ch()
+    rt2.pluginManager = { onSpellRecordChanged = function(...) probe.onSpellRecordChanged(...) end }
+    local core2 = { hasCapability = function() return true end, registerTargetSelector = function() return true end,
+        spellRecord = rt2.spellRecord, reportSpellEnded = rt2.reportSpellEnded, runtime = rt2,
+        mq = core.mq, ImGui = core.ImGui }
+    probe.onInit(core2)
+    lines = {}
+    run('selftest')
+    local out = table.concat(lines, '\n')
+    assert_true(out:find('FAIL', 1, true) == nil, 'Suite 118: "probe selftest" reports no failure against core\'s real functions')
+    assert_true(out:find('selftest: 13 passed, 0 failed', 1, true) ~= nil, 'Suite 118: ...and runs all of its checks')
+    assert_nil(rt2.npcSpellApplied[999999], 'Suite 118: ...and removes the record it planted')
+end
+
+-- ---------------------------------------------------------------------------
+-- Suite 119: TAC log folder (Logs/TAC). Every expected value cites DL-002 in docs/decision_log.md:
+-- "R1".."R8" are the numbered requirements of that entry.
+-- ---------------------------------------------------------------------------
+do
+    print('--- Suite 119: TAC log folder (Logs/TAC) ---')
+    local L = tlog
+
+    -- A virtual file system: `dirs` are the folders that exist (and can be written to). mkdir
+    -- creates a folder when its parent exists, unless `denyMkdir` or `mkdirRaises` is set.
+    local function vfs(dirs, opts)
+        opts = opts or {}
+        local v = { dirs = {}, mkdirCalls = {}, canWriteCalls = 0 }
+        for _, d in ipairs(dirs) do v.dirs[d] = true end
+        v.fs = {
+            canWrite = function(p) v.canWriteCalls = v.canWriteCalls + 1; return v.dirs[p] == true end,
+        }
+        if not opts.noMkdir then
+            v.fs.mkdir = function(p)
+                v.mkdirCalls[#v.mkdirCalls + 1] = p
+                if opts.mkdirRaises then error('lfs exploded') end
+                if opts.denyMkdir then return nil, 'Permission denied', 13 end
+                local parent = p:match('^(.*)/[^/]+$')
+                if parent and v.dirs[parent] then v.dirs[p] = true; return true end
+                return nil, 'No such file or directory', 2
+            end
+        end
+        return v
+    end
+    local function setup(v, logsPath, configDir)
+        L._reset()
+        L.init({
+            configDir = configDir or '/mq/config', version = 'T', fs = v.fs,
+            logsPath = logsPath,
+            identity = function() return 'TestSrv', 'Suite119' end,
+        })
+        return L
+    end
+    local function logs(p) return function() return p end end
+
+    -- R1, R6: the folder is <MacroQuest logs>/TAC
+    local v = vfs({ '/mq/Logs', '/mq/Logs/TAC' })
+    assert_eq(setup(v, logs('/mq/Logs')).resolveDir(), '/mq/Logs/TAC', 'Suite 119 R1: the log folder is <logs>/TAC when it exists')
+    assert_eq(#v.mkdirCalls, 0, 'Suite 119 R6: a folder that already exists (shipped in the release) is not created again')
+
+    -- R6: TAC creates the folder when it is missing
+    v = vfs({ '/mq/Logs' })
+    assert_eq(setup(v, logs('/mq/Logs')).resolveDir(), '/mq/Logs/TAC', 'Suite 119 R6: a missing folder is created and used')
+    assert_tbl_eq(v.mkdirCalls, { '/mq/Logs/TAC' }, 'Suite 119 R6: mkdir is called once, for <logs>/TAC only')
+    local checksBefore = v.canWriteCalls
+    L.resolveDir()
+    assert_eq(v.canWriteCalls, checksBefore, 'Suite 119: the answer is remembered, so the folders are not probed again')
+    assert_eq(#v.mkdirCalls, 1, 'Suite 119 R6: ...and the folder is not created again')
+
+    -- R5: if the folder cannot be made, fall back as today (flat Logs), without an error
+    v = vfs({ '/mq/Logs' }, { denyMkdir = true })
+    assert_eq(setup(v, logs('/mq/Logs')).resolveDir(), '/mq/Logs', 'Suite 119 R5: a refused mkdir falls back to the logs folder')
+    v = vfs({ '/mq/Logs' }, { mkdirRaises = true })
+    local okCall, got = pcall(function() return setup(v, logs('/mq/Logs')).resolveDir() end)
+    assert_true(okCall, 'Suite 119 R5: an mkdir that raises does not escape: ' .. tostring(got))
+    assert_eq(got, '/mq/Logs', 'Suite 119 R5: ...and falls back to the logs folder')
+    v = vfs({ '/mq/Logs' }, { noMkdir = true })
+    assert_eq(setup(v, logs('/mq/Logs')).resolveDir(), '/mq/Logs', 'Suite 119 R5: without a way to make folders (no lfs) it falls back to the logs folder')
+    v = vfs({ '/mq/Logs', '/mq/Logs/TAC' }, { noMkdir = true })
+    assert_eq(setup(v, logs('/mq/Logs')).resolveDir(), '/mq/Logs/TAC', 'Suite 119 R6: without lfs, a shipped folder is still used')
+
+    -- R7: MacroQuest is asked where the logs folder is; when it cannot say, the old guess chain applies
+    v = vfs({ '/mq/config/../Logs' })
+    assert_eq(setup(v, logs(nil)).resolveDir(), '/mq/config/../Logs', 'Suite 119 R5/R7: no answer from MacroQuest -> the old config/../Logs guess')
+    v = vfs({ '/mq/config/../Logs' })
+    assert_eq(setup(v, function() error('no TLO') end).resolveDir(), '/mq/config/../Logs', 'Suite 119 R5/R7: a failing question is treated as no answer')
+    v = vfs({ '/elsewhere/mqlogs', '/mq/Logs' })
+    assert_eq(setup(v, logs('/elsewhere/mqlogs')).resolveDir(), '/elsewhere/mqlogs/TAC', 'Suite 119 R7: a moved logs folder is honoured, not the config/../Logs guess')
+    assert_eq(v.dirs['/mq/Logs/TAC'], nil, 'Suite 119 R7: ...and nothing is created under the guessed folder')
+
+    -- trailing separators do not matter
+    v = vfs({ '/mq/Logs' })
+    assert_eq(setup(v, logs('/mq/Logs/')).resolveDir(), '/mq/Logs/TAC', 'Suite 119 R1: a trailing slash is dropped')
+    v = vfs({ '/mq/Logs' })
+    assert_eq(setup(v, logs('/mq/Logs\\')).resolveDir(), '/mq/Logs/TAC', 'Suite 119 R1: a trailing backslash is dropped')
+
+    -- R2: the main log, its dump files and its rotation sit in that folder
+    v = vfs({ '/mq/Logs' })
+    setup(v, logs('/mq/Logs'))
+    assert_eq(L.filePath(), '/mq/Logs/TAC/triune_TestSrv_Suite119.log', 'Suite 119 R2: the main log is in Logs/TAC')
+    assert_true(L.dumpPath():match('^/mq/Logs/TAC/triune_dump_TestSrv_Suite119_%d+_%d+%.log$') ~= nil, 'Suite 119 R2: dump files are in Logs/TAC: ' .. L.dumpPath())
+    assert_eq(L.logDir(), '/mq/Logs/TAC', 'Suite 119: logDir() is the same answer, for plugins')
+    L._reset()
+
+    -- the question asked of MacroQuest (R7)
+    local ask = loadFunc(src, 'mqLogsPath', { mq = { TLO = { MacroQuest = { Path = function(which)
+        return function() return which == 'logs' and 'C:\\MQ\\Logs' or 'wrong' end
+    end } } } })
+    assert_eq(ask(), 'C:\\MQ\\Logs', 'Suite 119 R7: core asks MacroQuest.Path(logs)')
+    local function askWith(r) return loadFunc(src, 'mqLogsPath', { mq = { TLO = { MacroQuest = { Path = function() return function() return r end end } } } })() end
+    assert_nil(askWith(''), 'Suite 119 R7: an empty answer is no answer')
+    assert_nil(askWith(nil), 'Suite 119 R7: nil is no answer')
+    assert_nil(askWith('NULL'), 'Suite 119 R7: NULL is no answer')
+    assert_nil(loadFunc(src, 'mqLogsPath', { mq = { TLO = { MacroQuest = { Path = function() error('boom') end } } } })(), 'Suite 119 R7: a failing TLO is no answer')
+
+    -- the core hands plugins the answer, and says so in the manifest
+    local ga = assert(src:find('function pm.getCoreApi()', 1, true), 'missing getCoreApi')
+    local gb = assert(src:find('setmetatable(api, {', ga, true), 'missing end of getCoreApi table')
+    assert_true(src:sub(ga, gb):find('\n%s+logDir%s*=') ~= nil, 'Suite 119: the core API table has logDir')
+    assert_true(src:find("logDir                   = { kind = 'function'", 1, true) ~= nil, 'Suite 119: the manifest lists logDir')
+    assert_true(src:find('logsPath       = runtime.mqLogsPath', 1, true) ~= nil, 'Suite 119 R7: the logger is told how to ask MacroQuest')
+
+    -- R2: the chat plugin's three log writers use the core's folder; with an older core they keep their own behaviour
+    local chatSrc = readFile('TAC/lua/tac/chat.lua')
+    local function chatLogsDir(coreTable, mqPath)
+        return loadFunc(chatSrc, 'logsDir', {
+            core = coreTable,
+            mq = { configDir = '/mq/config', TLO = { MacroQuest = { Path = function() return function() return mqPath end end } } },
+        })
+    end
+    assert_eq(chatLogsDir({ hasCapability = function(n) return n == 'logDir' end, logDir = function() return '/mq/Logs/TAC' end }, '/mq/Logs')(),
+        '/mq/Logs/TAC', 'Suite 119 R2: chat logs go to the core\'s log folder')
+    assert_eq(chatLogsDir({ hasCapability = function() return false end }, '/mq/Logs')(),
+        '/mq/Logs', 'Suite 119: an older core (no logDir) leaves chat on MacroQuest.Path(logs)')
+    assert_eq(chatLogsDir({ hasCapability = function() return true end, logDir = function() return nil end }, '/mq/Logs')(),
+        '/mq/Logs', 'Suite 119 R5: a core that has no answer leaves chat on MacroQuest.Path(logs)')
+    assert_eq(chatLogsDir({ hasCapability = function() return true end, logDir = function() error('boom') end }, '/mq/Logs')(),
+        '/mq/Logs', 'Suite 119 R5: a core that raises leaves chat on MacroQuest.Path(logs)')
+    assert_eq(chatLogsDir(nil, nil)(), '/mq/config', 'Suite 119 R5: with neither, chat falls back to config as today')
+    assert_true(chatSrc:find("string.format('%s/tac_chat_trace_%s.txt', logsDir()", 1, true) ~= nil, 'Suite 119 R2: the chat trace file uses the shared folder')
+    assert_true(chatSrc:find("string.format('%s/tac_chat_capture_%s.txt', logsDir()", 1, true) ~= nil, 'Suite 119 R2: the chat capture file uses the shared folder')
+    assert_true(chatSrc:find("string.format('%s/tac_chat_%s_%s_%s.txt', logsDir()", 1, true) ~= nil, 'Suite 119 R2: the chat tab logs use the shared folder')
+    -- R3: chat history is state, not a log, and stays in config
+    local historyLine = chatSrc:match('[^\n]*triune_chat_history_%%s%.txt[^\n]*') or ''
+    assert_true(historyLine:find('mq.configDir', 1, true) ~= nil and historyLine:find('logsDir', 1, true) == nil,
+        'Suite 119 R3: the chat history path is built from the config folder, not the log folder (checked in the source line)')
+
+    -- R6: the release ships the folder, R8: the README says where the logs are
+    local keep = readFile('TAC/Logs/TAC/README.txt')
+    assert_true(#keep > 0 and keep:find('TAC', 1, true) ~= nil, 'Suite 119 R6: the release ships TAC/Logs/TAC/ with a placeholder file')
+    local readme = readFile('README.md')
+    assert_true(readme:find('the `Logs/TAC/` folder inside your MacroQuest folder (`triune_<server>_<char>.log`', 1, true) ~= nil, 'Suite 119 R8: the README bug-report advice points at Logs/TAC/')
+    assert_true(readme:find('| `Logs/TAC/triune_*.log` |', 1, true) ~= nil, 'Suite 119 R8: the README file table lists Logs/TAC/')
+    assert_true(readme:find('| `Logs/triune_*.log` |', 1, true) == nil and readme:find('your MacroQuest `Logs/` folder', 1, true) == nil, 'Suite 119 R8: the README no longer says the logs are in the flat Logs folder')
+end
+
+-- ---------------------------------------------------------------------------
+-- Suite 120: plugin priority for onCommand and onBetweenPulls. Every expected value cites docs/decision_log.md
+-- DL-003 ("D1".."D4" are its four approved design choices) or docs/HOOKS.md section 3.2.
+-- ---------------------------------------------------------------------------
+do
+    print('--- Suite 120: plugin hook priority ---')
+    local noop = function() end
+    local passthrough = function(_, v) return v end
+    local env = {
+        unregisterTargetSelectorsByOwner = function() return 0 end,
+        ctrl = { plugins = {} },
+        mq = { event = noop, unevent = noop, cmd = noop, cmdf = noop, TLO = {
+            Me = { Combat = function() return false end, CombatState = function() return 'ACTIVE' end, Invited = function() return false end },
+            Target = { ID = function() return 0 end },
+            Window = function() return { Open = function() return false end } end,
+            Spawn = function() return setmetatable({}, { __call = function() return false end }) end,
+        } },
+        ImGui = setmetatable({ Checkbox = passthrough, SliderFloat = passthrough, SliderInt = passthrough, Combo = passthrough,
+            Button = function() return false end, SmallButton = function() return false end, IsItemHovered = function() return false end,
+            BeginTable = function() return false end }, { __index = function() return noop end }),
+        UI = { px = function(n) return n end, accent = noop, setTooltip = noop, pushTheme = noop, popTheme = noop,
+            preBeginWindow = noop, postBeginWindow = noop, drawStatusProgressBar = noop, drawSpellIcon = function() return false end,
+            getConColorRgb = function() return { 1, 1, 1, 1 } end, resolveTargetOfTarget = function() return nil end },
+        VERSION = '3.2', DATA = {}, loadout = {}, scriptDir = './',
+        GOLD = { 1, 1, 1, 1 }, ARC = { 1, 1, 1, 1 }, MUTED = { 1, 1, 1, 1 }, GOOD = { 1, 1, 1, 1 }, WARN = { 1, 1, 1, 1 }, ERR = { 1, 1, 1, 1 },
+        saveLoadout = noop, print = noop,
+        idxOf = function(tbl, val) for i, v in ipairs(tbl) do if v == val then return i end end return 0 end,
+        fmtSec = function(v) return tostring(v) .. 's' end, parseDurationSec = function() return 0 end,
+        cleanSpellName = function(n) return tostring(n or '') end, normalizeSpellName = function(n) return tostring(n or ''):lower() end,
+    }
+    local initPM = loadFunc(src, 'initPluginManager', env)
+    local rt = debug.getfenv(initPM).runtime
+    rt.saveLoadout = env.saveLoadout
+    initPM()
+    local pm = rt.pluginManager
+    local dir = (os.getenv('TMPDIR') or '/tmp') .. '/triune_junk_plugins'
+
+    local made = {}
+    -- Writes a plugin file whose `priority` is the Lua expression `priExpr` (nil leaves the field out) and loads it.
+    local function put(id, priExpr, file)
+        local path = dir .. '/' .. (file or ('prio120_' .. id .. '.lua'))
+        local fh = assert(io.open(path, 'w'))
+        fh:write(string.format("return { id = %q, name = %q, %s onCommand = function() return false end, onBetweenPulls = function() return false end, wantsCombatHold = function() return false end }\n",
+            id, id, priExpr and ('priority = ' .. priExpr .. ',') or ''))
+        fh:close()
+        made[#made + 1] = path
+        pm.loadPlugin(path:match('[^/]+$'), path)
+        return path
+    end
+    -- Replaces the three hooks with recorders; `answer` is the id that answers true (or nil for nobody).
+    local calls
+    local function record(ids, answer)
+        calls = {}
+        for _, id in ipairs(ids) do
+            for _, hook in ipairs({ 'onCommand', 'onBetweenPulls', 'wantsCombatHold' }) do
+                pm.plugins[id].instance[hook] = function() calls[#calls + 1] = id; return id == answer end
+            end
+        end
+    end
+    local function order() return table.concat(calls, ',') end
+    local function warnLines()
+        local out = {}
+        for _, l in ipairs(tlog.recent()) do if l:find('WRN %[plugins%]') then out[#out + 1] = l end end
+        return out
+    end
+
+    -- D1, D2: what core reads from the plugin table
+    local function priOf(id, expr)
+        local before = #warnLines()
+        put(id, expr)
+        return pm.plugins[id].priority, #warnLines() - before
+    end
+    local v, w = priOf('p120_num', '10')
+    assert_eq(v, 10, 'Suite 120 D1: priority = 10 is read from the plugin table'); assert_eq(w, 0, 'Suite 120 D2: ...with no warning')
+    v, w = priOf('p120_none', nil)
+    assert_eq(v, 0, 'Suite 120 D1: a missing priority is 0'); assert_eq(w, 0, 'Suite 120 D2: ...with no warning')
+    v, w = priOf('p120_neg', '-5')
+    assert_eq(v, -5, 'Suite 120 D2: a negative number is valid'); assert_eq(w, 0, 'Suite 120 D2: ...with no warning')
+    v, w = priOf('p120_frac', '2.5')
+    assert_eq(v, 2.5, 'Suite 120 D2: a fraction is valid'); assert_eq(w, 0, 'Suite 120 D2: ...with no warning')
+    v, w = priOf('p120_big', '1e300')
+    assert_eq(v, 1e300, 'Suite 120 D2: there is no range limit'); assert_eq(w, 0, 'Suite 120 D2: ...and no warning')
+    for _, bad in ipairs({ { "'10'", 'a numeric string' }, { "'high'", 'a word' }, { '0/0', 'NaN' }, { '1/0', 'infinity' },
+        { '-1/0', 'minus infinity' }, { '{}', 'a table' }, { 'true', 'a boolean' }, { 'false', 'false' } }) do
+        v, w = priOf('p120_bad', bad[1])
+        assert_eq(v, 0, 'Suite 120 D2: ' .. bad[2] .. ' counts as 0')
+        assert_eq(w, 1, 'Suite 120 D2: ' .. bad[2] .. ' gives exactly one warning per load')
+        assert_true(pm.plugins.p120_bad ~= nil and pm.plugins.p120_bad.enabled, 'Suite 120 D2: ' .. bad[2] .. ' still loads the plugin')
+    end
+    local last = warnLines()
+    assert_true(#last > 0 and last[#last]:find('p120_bad', 1, true) ~= nil, 'Suite 120 D2: the warning names the plugin: ' .. tostring(last[#last]))
+
+    -- D3 and HOOKS 3.2: the order. Load order is c, a, b, e, d; the expected order is b, c, a, e, d, so neither the load
+    -- order nor an ordering by id alone can explain a pass (b and c tie at 10 and load in the opposite order to their ids).
+    local ids = { 'p120_c', 'p120_a', 'p120_b', 'p120_e', 'p120_d' }
+    put('p120_c', '10'); put('p120_a', '5'); put('p120_b', '10'); put('p120_e', nil); put('p120_d', '-1')
+    local expected = 'p120_b,p120_c,p120_a,p120_e,p120_d'
+    local function onlyMine(s) local out = {}; for id in s:gmatch('[^,]+') do if id:find('^p120_[a-e]$') then out[#out + 1] = id end end; return table.concat(out, ',') end
+    record(ids, nil)
+    assert_eq(pm.onCommand('zz120', {}), false, 'Suite 120: nobody answers -> not handled')
+    assert_eq(onlyMine(order()), expected, 'Suite 120 D3/HOOKS 3.2: onCommand runs highest priority first, ties by id, missing = 0')
+    record(ids, nil)
+    pm.onBetweenPulls()
+    assert_eq(onlyMine(order()), expected, 'Suite 120 D3/HOOKS 3.2: onBetweenPulls is ordered the same way')
+    record(ids, 'p120_c')
+    assert_eq(pm.onCommand('zz120', {}), true, 'Suite 120 D3: the first truthy answer handles the command')
+    assert_eq(onlyMine(order()), 'p120_b,p120_c', 'Suite 120 D3: ...and nobody after it is called')
+    record(ids, 'p120_b')
+    pm.onBetweenPulls()
+    assert_eq(onlyMine(order()), 'p120_b', 'Suite 120 D3: the highest priority can answer first for onBetweenPulls')
+    record(ids, nil)
+    pm.combatHold()
+    assert_eq(onlyMine(order()), 'p120_c,p120_a,p120_b,p120_e,p120_d', 'Suite 120 D3: wantsCombatHold stays in load order (priority does not apply)')
+
+    -- D3: eligibility is unchanged
+    record(ids, nil)
+    pm.plugins.p120_b.enabled = false
+    pm.plugins.p120_c.status = 'Error'
+    pm.plugins.p120_a.hookOff = { onCommand = true }
+    pm.onCommand('zz120', {})
+    assert_eq(onlyMine(order()), 'p120_e,p120_d', 'Suite 120 D3: disabled, errored and switched-off plugins are skipped')
+    pm.plugins.p120_b.enabled = true; pm.plugins.p120_c.status = 'Active'; pm.plugins.p120_a.hookOff = nil
+
+    -- D3: a hook that errors is skipped and the next plugin still answers (HOOKS 3.2 safe default)
+    record(ids, 'p120_c')
+    pm.plugins.p120_b.instance.onCommand = function() calls[#calls + 1] = 'p120_b'; error('boom') end
+    assert_eq(pm.onCommand('zz120', {}), true, 'Suite 120 D3: a failing higher-priority hook does not stop the next plugin')
+    assert_eq(onlyMine(order()), 'p120_b,p120_c', 'Suite 120 D3: ...it was called, failed, and the next one answered')
+
+    -- D3 reload consequence: an edited file takes effect when the plugin is reloaded, not before
+    put('p120_a', '5')
+    record(ids, nil)
+    local pathA = dir .. '/prio120_p120_a.lua'
+    put('p120_a', '99') -- rewrites the file and loads it again: a reload
+    record(ids, nil)
+    pm.onCommand('zz120', {})
+    assert_eq(onlyMine(order()), 'p120_a,p120_b,p120_c,p120_e,p120_d', 'Suite 120 D3: a reloaded plugin runs at its new priority')
+    local fh = assert(io.open(pathA, 'w')); fh:write("return { id = 'p120_a', name = 'p120_a', priority = -50, onCommand = function() return false end }\n"); fh:close()
+    record(ids, nil)
+    pm.onCommand('zz120', {})
+    assert_eq(onlyMine(order()), 'p120_a,p120_b,p120_c,p120_e,p120_d', 'Suite 120 D3: editing the file does not change a plugin that is already loaded')
+    pm.restartAll()
+    assert_eq(pm.plugins.p120_a.priority, 99, 'Suite 120 D3: restartAll does not re-read the file')
+    pm.reloadPlugin('p120_a')
+    assert_eq(pm.plugins.p120_a.priority, -50, 'Suite 120 D3: reloadPlugin re-reads it')
+
+    -- D4: the capability. The manifest is a separate block of triune.lua; load it as Suite 116 does.
+    do
+        local text = src:gsub('\r\n', '\n')
+        local a = assert(text:find('-- Plugin API version and capability manifest', 1, true), 'missing manifest block')
+        local b = assert(text:find('-- Server name for per-server config files.', a, true), 'missing end of manifest block')
+        local menv = setmetatable({ runtime = {} }, { __index = _G })
+        local chunk = assert(loadstring(text:sub(a, b - 1)))
+        setfenv(chunk, menv)
+        chunk()
+        rt.apiManifest = menv.runtime.apiManifest
+    end
+    assert_eq(pm.getCoreApi().hasCapability('hookPriority'), true, 'Suite 120 D4: core.hasCapability("hookPriority") is true')
+    assert_eq(pm.getCoreApi().hasCapability('hookPriorityX'), false, 'Suite 120 D4: ...and false for a name that is not offered')
+    assert_eq(rt.apiManifest.hookPriority and rt.apiManifest.hookPriority.kind, 'value', 'Suite 120 D4: the manifest entry is a value')
+    assert_eq(rt.apiManifest.hookPriority and rt.apiManifest.hookPriority.tier, 'experimental', 'Suite 120 D4: ...in the experimental tier')
+    assert_eq(rt.apiManifest.hookPriority and rt.apiManifest.hookPriority.since, '1.0', 'Suite 120 D4: ...since 1.0')
+
+    for _, p in ipairs(made) do os.remove(p) end
 end
 
 print(string.format('\n=== Results: %d passed, %d failed ===', pass, fail))
