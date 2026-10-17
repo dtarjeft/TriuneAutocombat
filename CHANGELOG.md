@@ -4,6 +4,8 @@
 
 - Repair Box Network cure reports: include each character's own affliction flags when client counter totals are zero, preserve unknown reads, and expire counter data by heartbeat age rather than unrelated message traffic. Fresh same-server, same-zone peer reports drive ordered cures without inspection and release pending inspection; older zero-only reports retain the existing fallback. Add report/freshness details to `/ac net debug`. Update both `lua/triune.lua` and `lua/tac/boxnet.lua` on participating characters (`README.md`, `tests/test_pure_logic.lua`).
 
+- Use complete Box Network 1.2.0 long-buff/song reports for ordered missing-buff decisions, avoiding inspection-only groupmate targeting while retaining explicit cast targets. Preserve ranked-name matching, remaining-time refresh checks, unknown/stale/older-peer fallback and emergency healing; sufficient fresh reports release pending buff inspection. Validate sparse-slot scans and report completeness, reuse them for explicit buff requests, and expose report status in `/ac net debug`. Update core and plugin on each participating character (`TAC/lua/triune.lua`, `TAC/lua/tac/boxnet.lua`, `README.md`, `tests/test_pure_logic.lua`).
+
 ---
 
 ## Unreleased (after 3.2)

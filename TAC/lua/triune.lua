@@ -18077,9 +18077,32 @@ end
 
 function runtime.groupBuffStatus(targetId, name, minSec)
     if not name or name == '' or name == 'NULL' then return nil end
+    minSec = tonumber(minSec) or 0
+    local function matches(buffName)
+        return buffName == name or (type(buffName) == 'string' and
+            (buffName:lower() == name:lower() or isGemMatching(buffName, name)))
+    end
+    local bn = runtime.boxnetApi()
+    if bn and type(bn.peerBuffs) == 'function' then
+        local peerName = nil
+        pcall(function() peerName = mq.TLO.Spawn(targetId).CleanName() end)
+        local ok, reported, age = pcall(bn.peerBuffs, peerName, runtime.BOXNET_FRESH_SEC or 3.0)
+        if ok and type(reported) == 'table' and type(age) == 'number' and age >= 0 and age < math.huge then
+            for _, b in ipairs(reported) do
+                if matches(b.name) then
+                    local remaining = math.max(0, b.duration - age)
+                    if minSec > 0 then
+                        if remaining > minSec then return true end
+                    elseif b.duration == 0 or remaining > 0 then
+                        return true
+                    end
+                end
+            end
+            return false
+        end
+    end
     local buffs = runtime.cachedGroupBuffs(targetId)
     if not buffs then return nil end
-    minSec = tonumber(minSec) or 0
     for _, b in ipairs(buffs) do
         local buffName = nil
         pcall(function() buffName = b.Name() end)
@@ -18087,7 +18110,7 @@ function runtime.groupBuffStatus(targetId, name, minSec)
             pcall(function() buffName = b.Spell.Name() end)
         end
         if not buffName or buffName == '' then return nil end
-        if buffName == name then
+        if matches(buffName) then
             local remaining = -1
             pcall(function() remaining = tonumber(b.Duration.TotalSeconds()) or -1 end)
             if minSec > 0 and remaining >= 0 then return remaining > minSec end
@@ -18276,9 +18299,8 @@ function runtime.processGroupCureProbe()
     end
     local ready = false
     pcall(function() ready = (mq.TLO.Target.ID() or 0) == probe.id and mq.TLO.Target.BuffsPopulated() == true end)
-    -- Cure status can arrive over Box Network while target buffs are pending.
-    if (ready or probe.when ~= 'missing buff')
-        and not runtime.groupCureNeedsProbe(probe.id, probe.when, probe.spell, probe.entry) then
+    -- Cure or buff status can arrive over Box Network while target buffs are pending.
+    if not runtime.groupCureNeedsProbe(probe.id, probe.when, probe.spell, probe.entry) then
         if ready then
             runtime.groupCureObserved = runtime.groupCureObserved or {}
             runtime.groupCureObserved[probe.id] = os.clock()

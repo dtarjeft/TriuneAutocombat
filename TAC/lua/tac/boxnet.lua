@@ -48,7 +48,7 @@
 local plugin = {
     id                 = 'boxnet',
     name               = 'Box Network',
-    version            = '1.1.0',
+    version            = '1.2.0',
     author             = 'Triune',
     description        = 'Actors-based communication between your boxed characters: peer roster with live vitals, remote /ac commands, Camp Here, and a message API for other plugins.',
     defaultEnabled     = true,
@@ -68,6 +68,9 @@ local ctrl, ImGui, mq = nil, nil, nil  ---@type table, table, table
 -- ----------------------------------------------------------------------------
 local PROTOCOL_VERSION   = 1
 local COUNTER_SCHEMA     = 1
+local BUFF_SCHEMA        = 1
+local LONG_BUFF_SLOTS    = 42 -- same full client array as the Effects window
+local SONG_SLOT_FALLBACK = 30
 local COUNTER_MEMBERS    = {
     poison     = { counter = 'CountersPoison', flag = 'Poisoned' },
     disease    = { counter = 'CountersDisease', flag = 'Diseased' },
@@ -227,6 +230,40 @@ local function myCounters()
         counters[key] = count -- nil is unknown, not a clean zero
     end
     return counters
+end
+
+local function myBuffs()
+    if tlo(function() return mq.TLO.MacroQuest.GameState() end, '') ~= 'INGAME' then return nil, 'not in game' end
+    local songSlots = tonumber(tlo(function() return mq.TLO.Me.MaxSongSlots() end, nil))
+    if not songSlots or songSlots < 1 or songSlots > 60 or songSlots % 1 ~= 0 then songSlots = SONG_SLOT_FALLBACK end
+    local entries, total = {}, 0
+    for _, slots in ipairs({ { 'Buff', 'CountBuffs', LONG_BUFF_SLOTS }, { 'Song', 'CountSongs', songSlots } }) do
+        local expected = counterNumber(tonumber(tlo(function() return mq.TLO.Me[slots[2]]() end, nil)))
+        if not expected or expected % 1 ~= 0 or expected > slots[3] then return nil, slots[2] .. ' unavailable' end
+        local found = 0
+        -- Counts are not slot bounds: buffs and songs can occupy sparse slots.
+        for i = 1, slots[3] do
+            local ok, name, duration, present = pcall(function()
+                local b = mq.TLO.Me[slots[1]](i)
+                local value = b and b()
+                if value == nil or value == false or value == '' or value == 'NULL' then return nil end
+                return b.Name(), tonumber(b.Duration.TotalSeconds()), true
+            end)
+            if not ok then return nil, slots[1] .. ' slot ' .. i .. ' read failed' end
+            if present then
+                if type(name) ~= 'string' or name == '' or lower(name) == 'null' or lower(name) == 'nil'
+                    or counterNumber(duration) == nil then
+                    return nil, slots[1] .. ' slot ' .. i .. ' incomplete'
+                end
+                found = found + 1
+                entries[#entries + 1] = { name = name, duration = duration }
+            end
+        end
+        if found ~= expected then return nil, slots[1] .. ' count mismatch' end
+        total = total + expected
+    end
+    table.sort(entries, function(a, b) return a.name < b.name end)
+    return { schema = BUFF_SCHEMA, complete = true, count = total, entries = entries }
 end
 
 local function myDzInstanceKey()
@@ -466,6 +503,26 @@ end
 -- ----------------------------------------------------------------------------
 local function peerKey(name) return lower(name) end
 
+local function validateBuffReport(report)
+    if type(report) ~= 'table' or report.schema ~= BUFF_SCHEMA or report.complete ~= true then return nil end
+    local count = counterNumber(report.count)
+    if not count or count % 1 ~= 0 or count > LONG_BUFF_SLOTS + 60 or type(report.entries) ~= 'table' then return nil end
+    local n = 0
+    for i in pairs(report.entries) do
+        if type(i) ~= 'number' or i % 1 ~= 0 or i < 1 or i > count then return nil end
+        n = n + 1
+    end
+    if n ~= count then return nil end
+    local entries = {}
+    for i = 1, count do
+        local b = report.entries[i]
+        if type(b) ~= 'table' or type(b.name) ~= 'string' or b.name == ''
+            or lower(b.name) == 'null' or lower(b.name) == 'nil' or counterNumber(b.duration) == nil then return nil end
+        entries[i] = { name = b.name, duration = b.duration }
+    end
+    return { schema = BUFF_SCHEMA, complete = true, count = count, entries = entries }
+end
+
 -- A peer's heartbeat is untrusted input: keep only the shapes the API and the
 -- window rely on (target = table with a numeric id, classes = strings,
 -- counters = table). Returns nil for anything that is not a table.
@@ -502,6 +559,10 @@ local function validateHeartbeat(hb)
         end
     end
     hb.counters = next(counters) and counters or nil
+    local buffs = hb.buffs
+    hb.buffs = validateBuffReport(buffs)
+    if buffs ~= nil and not hb.buffs then hb.buffError = 'invalid or incomplete buff report' end
+    if type(hb.buffError) ~= 'string' then hb.buffError = nil end
     if hb.pet ~= nil and type(hb.pet) ~= 'table' then hb.pet = nil end
     return hb
 end
@@ -650,6 +711,7 @@ local function sampleFingerprint()
     local zone = myZone()
     local me = myName()
     local gameState = tlo(function() return mq.TLO.MacroQuest.GameState() end, '')
+    local buffs, buffError = myBuffs()
     local inDynamicZone = lower(tlo(function() return mq.TLO.DynamicZone.Member(me).Status() end, '')) == 'in dynamic zone'
     local s = {
         zone     = zone,
@@ -666,6 +728,8 @@ local function sampleFingerprint()
         gameState = gameState,
         -- Detrimental counters so other boxes can cure us without NetBots / EQBC.
         counters = gameState == 'INGAME' and myCounters() or {},
+        buffs = buffs,
+        buffError = buffError,
     }
     if tid > 0 then
         -- One PctHPs read serves both the reported hp and the engaged flag.
@@ -706,6 +770,8 @@ local function snapshot(sample)
         counters = sample.counters,
         counterSchema = COUNTER_SCHEMA,
         gameState = sample.gameState,
+        buffs = sample.buffs,
+        buffError = sample.buffError,
     }
     local classes = core.myClasses
     if type(classes) == 'table' then
@@ -740,6 +806,8 @@ local function fingerprint(s)
     local tid = s.targetId or 0
     local engaged = 'nil'
     if tid > 0 then engaged = tostring(s.engaged == true) end
+    local buffs = { s.buffs and 'complete' or (s.buffError or 'unknown') }
+    for _, b in ipairs(s.buffs and s.buffs.entries or {}) do buffs[#buffs + 1] = #b.name .. ':' .. b.name end
     return table.concat({
         s.zone or '', s.dzInstanceKey or '', tostring(s.inDynamicZone), s.mode or '', s.submode or '', tostring(s.running), tostring(s.burn),
         s.ma or '', tostring(tid), engaged,
@@ -748,6 +816,7 @@ local function fingerprint(s)
         tostring(c.disease == nil and 'unknown' or c.disease > 0),
         tostring(c.curse == nil and 'unknown' or c.curse > 0),
         tostring(c.corruption == nil and 'unknown' or c.corruption > 0),
+        table.concat(buffs, '|'),
     }, '|')
 end
 
@@ -910,12 +979,10 @@ end
 
 -- Names of the buffs currently on us, so the other box only casts what we lack.
 local function myBuffNames()
+    local report, why = myBuffs()
+    if not report then return nil, why end
     local names = {}
-    local n = tlo(function() return mq.TLO.Me.BuffCount() end, 0)
-    for i = 1, (tonumber(n) or 0) do
-        local nm = tlo(function() return mq.TLO.Me.Buff(i).Name() end, nil)
-        if nm and nm ~= '' then names[#names + 1] = tostring(nm) end
-    end
+    for _, b in ipairs(report.entries) do names[#names + 1] = b.name end
     return names
 end
 
@@ -924,7 +991,9 @@ end
 -- runtime.enqueueBoxBuffRequest in triune.lua). Nothing to do with Buffbot.
 local function sendBuffRequest(scope)
     if not net.actor then return false, net.err or 'not connected' end
-    local data = { buffs = myBuffNames() }
+    local names, why = myBuffNames()
+    if not names then return false, 'buff state unavailable: ' .. tostring(why) end
+    local data = { buffs = names }
     local kind, name = resolveScope(scope)
     if kind == 'name' then
         local peer = findPeer(name)
@@ -1278,6 +1347,16 @@ function api.peerFresh(name, maxAgeSec)
     return p, age
 end
 
+local function usablePeer(name, maxAgeSec)
+    local p, age = api.peerFresh(name, maxAgeSec)
+    if not p or not isTrusted({ character = p.name }) then return nil end
+    if tlo(function() return mq.TLO.MacroQuest.GameState() end, '') ~= 'INGAME' then return nil end
+    if p.hb.gameState ~= nil and p.hb.gameState ~= 'INGAME' then return nil end
+    local server = myServer()
+    if server == '' or lower(p.server) ~= lower(server) then return nil end
+    return p, age
+end
+
 -- The peer's current target as reported by its own client: { id, name, hp,
 -- type, engaged, age }. `false` when the peer is fresh but has no target,
 -- nil when there is no fresh same-zone peer to ask.
@@ -1317,14 +1396,18 @@ end
 -- Known peer counters, plus their validated schema. A positive value can be
 -- presence-only (1); an absent key is unknown. Legacy zeros are not evidence.
 function api.peerCounters(name, maxAgeSec)
-    local p = api.peerFresh(name, maxAgeSec)
+    local p = usablePeer(name, maxAgeSec)
     if not p or type(p.hb.counters) ~= 'table' then return nil end
-    if not isTrusted({ character = p.name }) then return nil end
-    if tlo(function() return mq.TLO.MacroQuest.GameState() end, '') ~= 'INGAME' then return nil end
-    if (p.hb.counterSchema == COUNTER_SCHEMA or p.hb.gameState ~= nil) and p.hb.gameState ~= 'INGAME' then return nil end
-    local server = myServer()
-    if server == '' or lower(p.server) ~= lower(server) then return nil end
+    if p.hb.counterSchema == COUNTER_SCHEMA and p.hb.gameState ~= 'INGAME' then return nil end
     return p.hb.counters, COUNTER_SCHEMA
+end
+
+-- A complete buff/song list and its receipt age. Empty means known-empty;
+-- nil means unknown. Consumers age remaining seconds on their own clock.
+function api.peerBuffs(name, maxAgeSec)
+    local p, age = usablePeer(name, maxAgeSec)
+    if not p or p.hb.gameState ~= 'INGAME' or not p.hb.buffs then return nil end
+    return p.hb.buffs.entries, age
 end
 -- Whether a message from `sender` (the actors sender table; `payload` is
 -- the envelope when the transport gave no sender) may drive this box: the
@@ -1868,12 +1951,17 @@ function plugin.onCommand(cmd, args)
         local sample = sampleFingerprint()
         print(string.format('  cure report: plugin %s  schema %d  server %s  state %s  %s',
             plugin.version, COUNTER_SCHEMA, myServer(), sample.gameState, counterText(sample.counters)))
+        print(string.format('  buff report: schema %d  complete %s  count %s  %s', BUFF_SCHEMA,
+            tostring(sample.buffs ~= nil), tostring(sample.buffs and sample.buffs.count or '?'), sample.buffError or ''))
         for _, p in ipairs(peerList()) do
             local hb = p.hb or {}
             local age = p.heartbeatAt and string.format('%.1fs', nowSec() - p.heartbeatAt) or '?'
             print(string.format('  cure peer %s: server %s  zone %s  state %s  schema %s  age %s  usable %s  %s',
                 p.name, tostring(p.server or '?'), tostring(hb.zone or '?'), tostring(hb.gameState or '?'),
                 tostring(hb.counterSchema or 'legacy'), age, tostring(api.peerCounters(p.name) ~= nil), counterText(hb.counters)))
+            print(string.format('  buff peer %s: schema %s  count %s  age %s  usable %s  %s',
+                p.name, tostring(hb.buffs and hb.buffs.schema or '?'), tostring(hb.buffs and hb.buffs.count or '?'),
+                age, tostring(api.peerBuffs(p.name) ~= nil), hb.buffError or ''))
         end
         local shown = 0
         for _, e in ipairs(net.log) do

@@ -4925,6 +4925,13 @@ do
     env.baseTok = real('baseTok')
     env.sungKey = real('sungKey')
     env.bardKeepSinging = real('bardKeepSinging')
+    env.cleanSpellName = real('cleanSpellName')
+    env.normalizeSpellName = real('normalizeSpellName')
+    local matchSpellNames = real('isGemMatching')
+    env.isGemMatching = function(slotOrName, name)
+        if type(slotOrName) == 'string' then return matchSpellNames(slotOrName, name) end
+        return world.memmed ~= false
+    end
     runtime.getBuffRemainingSeconds = real('getBuffRemainingSeconds')
     env.hasNamedBuff = real('hasNamedBuff')
     env.buffActive = real('buffActive')
@@ -4988,7 +4995,7 @@ do
     runtime.isClickieReady = real('isClickieReady')
     runtime.useClickie = real('useClickie')
     runtime.castGem = real('castGem')
-    runtime.touchSpellRecord = function() end -- the real one stamps a revision on each spell record
+    runtime.touchSpellRecord = real('touchSpellRecord')
     runtime.fireAA = real('fireAA')
     runtime.processHealPriority = real('processHealPriority')
     runtime.hasDowntimeAggroThreat = function() return world.inCombat end
@@ -5006,7 +5013,7 @@ do
         world.clock, world.target, world.lockedOut = 100, original == nil and mobId or original, false
         world.counters, world.hp = {}, {}
         world.cached, world.cachedAt, world.cacheAge, world.feed = {}, {}, 0, true
-        world.buffs, world.cachedBuffs, world.ranges = {}, {}, {}
+        world.buffs, world.songs, world.cachedBuffs, world.ranges = {}, {}, {}, {}
         world.dead, world.absent, world.otherZone, world.offline = {}, {}, {}, {}
         world.inCombat, world.pctMana, world.aaName = true, 100, nil
         world.memCalls, world.memSpell = 0, nil
@@ -5016,6 +5023,7 @@ do
         world.hostileAvailable, world.afterPriority = false, 0
         ctrl.mode, ctrl.submode, ctrl.manual_auto_xtarget = 'Assist', 'Chase', true
         ctrl.downtime_buffing, ctrl.min_mana_pct = true, 0
+        ctrl.buff_refresh_sec = 45
         world.castMs = castMs == nil and 2500 or castMs
         world.casting, world.firedTarget, world.firedCommand, world.onDelay = nil, nil, nil, nil
         world.attacking, world.itemSpell, world.aaSpell = true, entry.spell, entry.spell
@@ -5741,6 +5749,8 @@ do
     -- actor inboxes. The ally spawn deliberately has no character-only members.
     local function networkPair()
         local clients, plugins, characters = {}, {}, {}
+        local ids = { meId, allyId }
+        if (world.groupSize or 1) >= 2 then ids[#ids + 1] = otherAllyId end
         local oldManager = runtime.pluginManager
         local function copy(value)
             if type(value) ~= 'table' then return value end
@@ -5751,7 +5761,7 @@ do
             end
             return out
         end
-        for _, id in ipairs({ meId, allyId }) do
+        for _, id in ipairs(ids) do
             local own = {
                 ID = function() return id end,
                 CleanName = spawns[id].CleanName,
@@ -5762,6 +5772,22 @@ do
                 own[members.flag] = function()
                     if (counter(id, members.boxnet) or 0) > 0 then return 'Affliction ' .. members.boxnet end
                     return nil
+                end
+            end
+            for _, kind in ipairs({ 'Buff', 'Song' }) do
+                local function effects() return (kind == 'Buff' and world.buffs[id] or world.songs[id]) or {} end
+                own[kind == 'Buff' and 'CountBuffs' or 'CountSongs'] = function()
+                    local count = 0
+                    for _ in pairs(effects()) do count = count + 1 end
+                    return count
+                end
+                own[kind] = function(index)
+                    local slot = 0
+                    for name, remaining in pairs(effects()) do
+                        slot = slot + 1
+                        if index == slot then return buff(spells[name], remaining) end
+                    end
+                    return buff(nil)
                 end
             end
             characters[id] = own
@@ -5794,7 +5820,7 @@ do
         end
         local pair = { support = plugins[meId], tank = plugins[allyId], tankMe = characters[allyId] }
         function pair.pump()
-            pair.tank.onTick()
+            for _, id in ipairs(ids) do if id ~= meId then plugins[id].onTick() end end
             pair.support.onTick()
         end
         function pair.close()
@@ -5950,6 +5976,158 @@ do
         combatTick()
         assert_eq(world.firedCommand, '/useitem "' .. entry.name .. '"', selector .. ': non-network fallback still executes the cure')
         if world.firedCommand then checkHeldAndRestored(allyId, selector .. ' stale-peer fallback') end
+        pair.close()
+    end
+
+    -- DL-005: complete real heartbeat reports replace discovery-only buff targeting.
+    for _, surface in ipairs({ 'gem', 'aa', 'clickie' }) do
+        for _, selector in ipairs({ 'F: Me, then Group', 'F: Group, then Me' }) do
+            local entry = { name = 'Network Buff Clickie', spell = 'Armor of Faith', kind = 'buff',
+                target = selector, when = 'missing buff', pct = 100, enabled = true, cls = 'Clr', gem = 1 }
+            for _, scenario in ipairs({
+                { me = true, ally = true },
+                { me = true, ally = false, expected = allyId },
+                { me = false, ally = true, expected = meId },
+                { me = false, ally = false, expected = selector == 'F: Me, then Group' and meId or allyId },
+                { me = true, ally = true, group = 2, expected = otherAllyId },
+            }) do
+                local name = configureFriendly(surface, entry)
+                world.groupSize = scenario.group or 1
+                world.buffs[meId] = scenario.me and { [entry.spell] = 360 } or {}
+                world.buffs[allyId] = scenario.ally and { [entry.spell] = 360 } or {}
+                local pair = networkPair()
+                local label = surface .. ' / ' .. selector .. ' / heartbeat buffs'
+                assert_eq(runtime.groupBuffStatus(allyId, entry.spell), scenario.ally,
+                    label .. ': complete own-character reports distinguish present from missing')
+                assert_eq(friendlyRecipient(entry, name), scenario.expected, label .. ': first eligible recipient follows the ordered rule')
+                assert_nil(runtime.groupCureProbe, label .. ': known peer status does not queue discovery')
+                assert_eq(world.target, mobId, label .. ': evaluating buff reports leaves the hostile selected')
+                local fired = fireFriendly(surface, entry, name)
+                assert_eq(fired, scenario.expected ~= nil, label .. ': real entry point casts only a missing buff')
+                if fired and scenario.expected then
+                    checkHeldAndRestored(scenario.expected, label .. ' actual buff cast')
+                    world.buffs[meId], world.buffs[allyId], world.buffs[otherAllyId] =
+                        { [entry.spell] = 360 }, { [entry.spell] = 360 }, { [entry.spell] = 360 }
+                    world.clock, world.firedCommand = world.clock + 0.3, nil
+                    pair.pump()
+                    assert_nil(friendlyRecipient(entry, name), label .. ': a fresh satisfied update stops redundant selection')
+                    assert_eq(fireFriendly(surface, entry, name), false, label .. ': satisfied updates prevent another cast')
+                    assert_nil(world.firedCommand, label .. ': satisfied updates emit no command')
+                    assert_nil(runtime.groupCureProbe, label .. ': satisfied updates do not start inspections')
+                elseif not scenario.expected then
+                    assert_nil(world.firedCommand, label .. ': already-buffed group emits no cast command')
+                end
+                pair.close()
+            end
+        end
+    end
+
+    addSpell('Armor of Faith Rk. II', {}, 'Single', true, 60)
+    for _, selector in ipairs({ 'F: Me, then Group', 'F: Group, then Me' }) do
+        local entry = { name = 'Reported Buff Clickie', spell = 'Armor of Faith', kind = 'buff',
+            target = selector, when = 'missing buff', pct = 100, enabled = true, cls = 'Clr' }
+        local name = configureFriendly('clickie', entry)
+        world.buffs[meId], world.songs[allyId] = { [entry.spell] = 360 }, { ['Armor of Faith Rk. II'] = 60 }
+        local pair = networkPair()
+        assert_eq(runtime.groupBuffStatus(allyId, entry.spell), true, selector .. ': ranked songs satisfy the existing spell-name matcher')
+        assert_nil(friendlyRecipient(entry, name), selector .. ': a matching reported song skips the recipient without inspection')
+        assert_nil(runtime.groupCureProbe, selector .. ': a song does not require targeting to discover it')
+        assert_eq(world.target, mobId, selector .. ': song discovery retains the hostile')
+        world.songs[allyId] = {}
+        world.clock = world.clock + 0.3
+        pair.pump()
+        assert_eq(friendlyRecipient(entry, name), allyId, selector .. ': a fresh song-removal heartbeat makes the recipient eligible')
+        assert_nil(runtime.groupCureProbe, selector .. ': confirmed song removal needs no inspection')
+        assert_true(fireFriendly('clickie', entry, name), selector .. ': the removed song can be replaced through the actual clickie')
+        if world.firedCommand then checkHeldAndRestored(allyId, selector .. ' reported song removal') end
+        pair.close()
+
+        name = configureFriendly('clickie', entry)
+        world.buffs[meId] = { [entry.spell] = 360 }
+        world.buffs[allyId], world.inCombat = { [entry.spell] = 46 }, false
+        pair = networkPair()
+        assert_eq(runtime.groupBuffStatus(allyId, entry.spell, 45), true, selector .. ': a newly reported buff exceeds the refresh threshold')
+        world.clock = world.clock + 1.5 -- read the same report without another heartbeat
+        assert_eq(runtime.groupBuffStatus(allyId, entry.spell, 45), false, selector .. ': remaining time ages locally across the refresh threshold')
+        assert_eq(friendlyRecipient(entry, name), allyId, selector .. ': out-of-combat refresh uses the recipient duration')
+        assert_nil(runtime.groupCureProbe, selector .. ': sufficient duration data avoids discovery targeting')
+        world.inCombat = true
+        assert_nil(friendlyRecipient(entry, name), selector .. ': the out-of-combat refresh window is not applied in combat')
+        pair.close()
+
+        for _, status in ipairs({ 'present', 'missing' }) do
+            name = configureFriendly('clickie', entry)
+            world.buffs[meId] = { [entry.spell] = 360 }
+            world.cacheDelay, world.hostileAvailable = 10, true
+            assert_nil(friendlyRecipient(entry, name), selector .. ': unavailable data initially queues buff inspection')
+            combatTick()
+            assert_eq(world.target, allyId, selector .. ': old pending inspection has selected the recipient')
+            world.buffs[allyId] = status == 'present' and { [entry.spell] = 360 } or {}
+            pair = networkPair()
+            combatTick()
+            assert_nil(runtime.groupCureProbe, selector .. ': a fresh ' .. status .. ' report releases obsolete buff inspection')
+            assert_eq(world.target, mobId, selector .. ': report completion restores the inspection target without waiting for buffs')
+            assert_nil(runtime.groupCureObserved and runtime.groupCureObserved[allyId],
+                selector .. ': network reports do not falsely mark target buffs populated')
+            assert_eq(fireFriendly('clickie', entry, name), status == 'missing',
+                selector .. ': fresh inspection replacement casts only when missing')
+            if status == 'missing' and world.firedCommand then checkHeldAndRestored(allyId, selector .. ' newly reported missing buff') end
+            pair.close()
+        end
+
+        for _, status in ipairs({ 'legacy', 'partial', 'truncated', 'failed', 'stale' }) do
+            name = configureFriendly('clickie', entry)
+            world.buffs[meId], world.cacheDelay = { [entry.spell] = 360 }, 0.2
+            pair = networkPair()
+            local report = { schema = 1, complete = true, count = 0, entries = {} }
+            if status == 'legacy' then report = nil
+            elseif status == 'partial' then report.complete = false
+            elseif status == 'truncated' then report.count = 1
+            elseif status == 'failed' then
+                pair.tankMe.CountBuffs = function() error('buff count unavailable') end
+            end
+            if status == 'failed' then
+                pair.tank.sendHeartbeat(true)
+            elseif status ~= 'stale' then
+                pair.tank.api.broadcast('heartbeat', { zone = 'gfaydark', gameState = 'INGAME', buffs = report })
+            else
+                world.clock = world.clock + 3.1
+                pair.tank.api.broadcast('test:activity', {})
+            end
+            pair.support.onTick()
+            assert_nil(runtime.groupBuffStatus(allyId, entry.spell), selector .. ': ' .. status .. ' buff data remains unknown')
+            assert_nil(friendlyRecipient(entry, name), selector .. ': ' .. status .. ' report cannot prove a missing buff')
+            assert_true(runtime.groupCureProbe ~= nil, selector .. ': ' .. status .. ' report retains supported inspection fallback')
+            assert_eq(world.target, mobId, selector .. ': unknown data does not itself issue a target command')
+            combatTick()
+            world.clock = world.clock + 0.3
+            combatTick()
+            assert_true(fireFriendly('clickie', entry, name), selector .. ': ' .. status .. ' fallback can still cast an inspected missing buff')
+            if world.firedCommand then checkHeldAndRestored(allyId, selector .. ' ' .. status .. ' buff fallback') end
+            pair.close()
+        end
+
+        name = configureFriendly('gem', entry)
+        world.buffs[meId] = { [entry.spell] = 360 }
+        world.inCombat, world.memmed, world.spellReady = false, false, false
+        pair = networkPair()
+        runtime.processDowntimeBuffing()
+        assert_eq(world.memCalls, 1, selector .. ': fresh missing peer buff can start an off-bar swap without discovery')
+        assert_nil(runtime.groupCureProbe, selector .. ': known peer data bypasses downtime inspection')
+        assert_eq(world.target, mobId, selector .. ': memorization does not target the recipient merely to inspect it')
+        runtime.tickPendingDowntimeReady()
+        assert_eq(world.firedCommand, '/cast "' .. entry.spell .. '"', selector .. ': memorized buff actually casts for the reported recipient')
+        if world.firedCommand then checkHeldAndRestored(allyId, selector .. ' network downtime buff') end
+        pair.close()
+
+        name = configureFriendly('clickie', entry)
+        world.buffs[meId], world.hp[meId], world.itemSpell = { [entry.spell] = 360 }, 30, emergencyHeal.spell
+        loadout.clickies = { entry, emergencyHeal }
+        pair = networkPair()
+        combatTick()
+        assert_eq(tracker.activeSpell, emergencyHeal.spell, selector .. ': emergency HP heal wins over a known missing network buff')
+        assert_eq(world.firedTarget, mobId, selector .. ': emergency self-heal retains hostile redirection')
+        assert_nil(runtime.groupCureProbe, selector .. ': network buff detection never delays emergency healing')
         pair.close()
     end
 
@@ -13244,9 +13422,21 @@ end
             name = name, zone = opts.zone or 'gfaydark', pid = opts.pid or (#boxes + 1) * 100,
             cmds = {}, saves = 0, hp = opts.hp or 100, mana = opts.mana or 80, endur = 90,
             targetId = 0, targetName = nil, x = opts.x or 10, y = opts.y or 20, z = opts.z or 5,
-            groupMembers = {},
+            groupMembers = {}, buffs = {}, songs = {},
             ctrl = { mode = 'Manual', submode = 'Hunt', running = false, burn = false, ma_name = '', camp_radius = 100, plugins = {} },
         }
+        local function effect(kind, index)
+            local b = box[kind][index]
+            return callable(b and b.name, {
+                Name = function() return b and b.name end,
+                Duration = { TotalSeconds = function() return b and b.duration end },
+            })
+        end
+        local function effectCount(kind)
+            local n = 0
+            for _ in pairs(box[kind]) do n = n + 1 end
+            return n
+        end
         local mq = {
             cmd = function(c) box.cmds[#box.cmds + 1] = c end,
             cmdf = function(f, ...) box.cmds[#box.cmds + 1] = string.format(f, ...) end,
@@ -13267,6 +13457,10 @@ end
                     CountersDisease = function() return box.disease or 0 end,
                     CountersCurse = function() return box.curse or 0 end,
                     CountersCorruption = function() return box.corruption or 0 end,
+                    CountBuffs = function() return effectCount('buffs') end,
+                    CountSongs = function() return effectCount('songs') end,
+                    Buff = function(i) return effect('buffs', i) end,
+                    Song = function(i) return effect('songs', i) end,
                 },
                 Zone = { ShortName = function() return box.zone end, ID = function() return 54 end },
                 Target = {
@@ -13911,10 +14105,101 @@ end
     A.mq.TLO.EverQuest.ServerName = serverName
     A.inst.onCommand('net', { 'net', 'debug' })
     local diagnostics = table.concat(printed, '\n')
-    assert_true(diagnostics:find('cure report: plugin 1.1.0', 1, true) ~= nil,
+    assert_true(diagnostics:find('cure report: plugin 1.2.0', 1, true) ~= nil,
         'Suite 95: existing diagnostics identify the deployed counter reporter')
     assert_true(diagnostics:find('cure peer Bob:', 1, true) ~= nil,
         'Suite 95: existing diagnostics expose received counter schema, freshness and usability')
+
+    -- DL-005: the real sampler covers sparse long/song slots, validates complete
+    -- payloads, and shares only usable observations rather than default-empty data.
+    local function peerBuffs()
+        if type(A.inst.api.peerBuffs) == 'function' then return A.inst.api.peerBuffs('bob') end
+    end
+    local reported = peerBuffs()
+    assert_true(type(reported) == 'table' and next(reported) == nil, 'Suite 95: a complete empty own report is known-empty')
+    B.buffs[42] = { name = 'Armor of Faith Rk. II', duration = 360 }
+    B.songs[30] = { name = 'Spirit of Wolf', duration = 18 }
+    sentB = B.inst.net.sent
+    clock.t = clock.t + 0.3
+    pump(1)
+    reported = peerBuffs()
+    assert_eq(B.inst.net.sent, sentB + 1, 'Suite 95: a new buff/song triggers a heartbeat before the periodic interval')
+    assert_eq(reported and #reported, 2, 'Suite 95: native counts are not used as sparse-slot scan bounds')
+    assert_eq(reported and reported[1] and reported[1].name, 'Armor of Faith Rk. II', 'Suite 95: the full long-buff array includes slot 42')
+    assert_eq(reported and reported[2] and reported[2].name, 'Spirit of Wolf', 'Suite 95: the song array includes slot 30')
+    assert_eq(reported and reported[2] and reported[2].duration, 18, 'Suite 95: reports use remaining song seconds, not base spell duration')
+    A.inst.cfg.acceptCommands = false
+    assert_true(peerBuffs() ~= nil, 'Suite 95: passive buff observations do not require accepting remote commands')
+    A.inst.cfg.acceptCommands = true
+    A.inst.cfg.trust, A.inst.cfg.allowlist = 'allow', {}
+    assert_nil(peerBuffs(), 'Suite 95: buff observations honor the established allowlist')
+    A.inst.cfg.trust = 'all'
+    local function receiveBuffs(report, state, server)
+        A.inst.processMessage({ content = { v = 1, kind = 'heartbeat',
+            data = { zone = B.zone, gameState = state or 'INGAME', buffs = report } },
+            sender = { character = 'Bob', server = server or 'triune', pid = B.pid } })
+    end
+    local complete = { schema = 1, complete = true, count = 1, entries = { { name = 'Armor of Faith', duration = 60 } } }
+    receiveBuffs(complete, 'CHARSELECT')
+    assert_nil(peerBuffs(), 'Suite 95: non-ingame buff reports are unavailable')
+    receiveBuffs(complete, 'INGAME', 'another-server')
+    assert_nil(peerBuffs(), 'Suite 95: a same-named character on another server cannot supply buffs')
+    receiveBuffs(complete)
+    A.gameState = 'CHARSELECT'
+    assert_nil(peerBuffs(), 'Suite 95: the local receiver must also be in game')
+    A.gameState = 'INGAME'
+    B.zone = 'crushbone'
+    receiveBuffs(complete)
+    assert_nil(peerBuffs(), 'Suite 95: a buff report in another zone is unavailable')
+    B.zone = 'gfaydark'
+    for _, bad in ipairs({
+        { schema = 1, complete = false, count = 0, entries = {} },
+        { schema = 2, complete = true, count = 0, entries = {} },
+        { schema = 1, complete = true, count = 2, entries = { { name = 'Only one', duration = 60 } } },
+        { schema = 1, complete = true, count = 2, entries = { [2] = { name = 'Sparse payload', duration = 60 } } },
+        { schema = 1, complete = true, count = 1, entries = { { name = '', duration = 60 } } },
+        { schema = 1, complete = true, count = 1, entries = { { name = 'No duration' } } },
+        { schema = 1, complete = true, count = 1, entries = { { name = 'Bad duration', duration = '60' } } },
+        { schema = 1, complete = true, count = 1, entries = { { name = 'Bad duration', duration = -1 } } },
+        { schema = 1, complete = true, count = 1, entries = { { name = 'Bad duration', duration = math.huge } } },
+        { schema = 1, complete = true, count = 1, entries = { { name = 'Bad duration', duration = 0 / 0 } } },
+    }) do
+        receiveBuffs(bad)
+        assert_nil(peerBuffs(), 'Suite 95: incomplete/truncated/malformed reports cannot establish absence')
+    end
+    receiveBuffs(nil)
+    assert_nil(peerBuffs(), 'Suite 95: legacy heartbeats without buff observations remain unknown')
+    local countBuffs, countSongs, getBuff, getSong =
+        B.mq.TLO.Me.CountBuffs, B.mq.TLO.Me.CountSongs, B.mq.TLO.Me.Buff, B.mq.TLO.Me.Song
+    for _, failure in ipairs({ 'count', 'mismatch', 'slot', 'duration', 'song' }) do
+        if failure == 'count' then B.mq.TLO.Me.CountBuffs = function() error('count unavailable') end
+        elseif failure == 'mismatch' then B.mq.TLO.Me.CountBuffs = function() return 2 end
+        elseif failure == 'slot' then B.mq.TLO.Me.Buff = function(i) if i == 42 then error('slot failed') end; return getBuff(i) end
+        elseif failure == 'duration' then B.buffs[42].duration = nil
+        elseif failure == 'song' then B.mq.TLO.Me.Song = function() error('songs unavailable') end end
+        B.inst.sendHeartbeat(true)
+        pump(1)
+        assert_nil(peerBuffs(), 'Suite 95: a failed ' .. failure .. ' read cannot report missing buffs')
+        local before = B.inst.net.sent
+        local sent, why = B.inst.sendBuffRequest('alice')
+        assert_eq(sent, false, 'Suite 95: incomplete ' .. failure .. ' data cannot be sent as a Buff Me empty list')
+        assert_true(why and why:find('buff state unavailable', 1, true), 'Suite 95: failed buff request reports the observation problem')
+        assert_eq(B.inst.net.sent, before, 'Suite 95: failed observations emit no misleading buff request')
+        B.mq.TLO.Me.CountBuffs, B.mq.TLO.Me.CountSongs, B.mq.TLO.Me.Buff, B.mq.TLO.Me.Song = countBuffs, countSongs, getBuff, getSong
+        B.buffs[42].duration = 360
+    end
+    B.buffs, B.songs = {}, {}
+    clock.t = clock.t + 0.3
+    pump(1)
+    reported = peerBuffs()
+    assert_true(type(reported) == 'table' and next(reported) == nil,
+        'Suite 95: an unknown-to-complete-empty change is sent promptly, without treating unknown as clean')
+    A.inst.onCommand('net', { 'net', 'debug' })
+    diagnostics = table.concat(printed, '\n')
+    assert_true(diagnostics:find('buff report: schema 1  complete true', 1, true) ~= nil,
+        'Suite 95: existing debug output identifies local complete buff observations')
+    assert_true(diagnostics:find('buff peer Bob:', 1, true) ~= nil,
+        'Suite 95: existing debug output exposes peer buff completeness and usability')
     clock.t = clock.t + 3.5 -- no pump: heartbeat goes stale but the peer has not expired yet
     assert_true(A.inst.api.peer('bob') ~= nil, 'Suite 95: peer still on the roster')
     assert_eq(A.inst.api.peerFresh('bob'), nil, 'Suite 95: heartbeat older than 3s is not fresh')
@@ -13925,6 +14210,7 @@ end
     A.inst.onTick()
     assert_nil(A.inst.api.peerCounters('bob'), 'Suite 95: application messages do not refresh the heartbeat timestamp')
     assert_nil(A.inst.api.peerTarget('bob'), 'Suite 95: application messages do not revive stale target state either')
+    assert_nil(peerBuffs(), 'Suite 95: application messages cannot revive stale buff observations')
 
     -- 21. Phase 3: peersInZone and the cross-box buff request flow
     clock.t = clock.t + 0.5
@@ -13932,8 +14218,7 @@ end
     local inZone = A.inst.api.peersInZone()
     assert_eq(#inZone, 1, 'Suite 95: peersInZone lists fresh same-zone peers')
     assert_eq(inZone[1].name, 'Bob', 'Suite 95: peersInZone entry is the peer record')
-    B.mq.TLO.Me.BuffCount = function() return 2 end
-    B.mq.TLO.Me.Buff = function(i) return { Name = function() return ({ 'Temperance', 'Spirit of Wolf' })[i] end } end
+    B.buffs[42], B.songs[30] = { name = 'Temperance', duration = 360 }, { name = 'Spirit of Wolf', duration = 18 }
     local gotReq = nil
     A.core.runtime.enqueueBoxBuffRequest = function(name, has) gotReq = { name = name, has = has } return 2 end
     local okB, whyB = B.inst.sendBuffRequest('alice')
@@ -13941,7 +14226,8 @@ end
     pump(1)
     assert_eq(gotReq and gotReq.name, 'Bob', 'Suite 95: receiver core queues the request for the sender')
     assert_eq(gotReq and #gotReq.has, 2, 'Suite 95: request carries the requester buff names')
-    assert_eq(gotReq and gotReq.has[2], 'Spirit of Wolf', 'Suite 95: buff names read from Me.Buff')
+    assert_eq(gotReq and gotReq.has[1], 'Spirit of Wolf', 'Suite 95: buff requests also include sparse song slots')
+    assert_eq(gotReq and gotReq.has[2], 'Temperance', 'Suite 95: buff requests also include sparse long-buff slots')
     assert_true(lastLog(B, 'Alice queued 2 buff(s) for you') ~= nil, 'Suite 95: requester sees the RPC reply')
     assert_true(lastLog(A, '<- Bob: buff me (2 to cast)') ~= nil, 'Suite 95: receiver logs the request')
     assert_true(type(A.core.runtime.onBoxBuffRequestDone) == 'function', 'Suite 95: plugin installs the done hook on the core')
