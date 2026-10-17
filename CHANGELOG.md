@@ -1,5 +1,11 @@
 # Triune AutoCombat Change Log
 
+## 2026-10-17
+
+- Repair Box Network cure reports: include each character's own affliction flags when client counter totals are zero, preserve unknown reads, and expire counter data by heartbeat age rather than unrelated message traffic. Fresh same-server, same-zone peer reports drive ordered cures without inspection and release pending inspection; older zero-only reports retain the existing fallback. Add report/freshness details to `/ac net debug`. Update both `lua/triune.lua` and `lua/tac/boxnet.lua` on participating characters (`README.md`, `tests/test_pure_logic.lua`).
+
+---
+
 ## Unreleased (after 3.2)
 
 - **Plugin `priority` for `onCommand` and `onBetweenPulls` (`TAC/lua/triune.lua`, `docs/HOOKS.md`, `.agents/AGENTS.md`, `tests/test_pure_logic.lua`). Behaviour change.** A plugin can declare `priority = <number>` on the table its file returns. When two plugins both answer `onCommand` or `onBetweenPulls`, the higher priority is asked first, ties go to the plugin id in plain string order, and a missing priority is 0. Before, these two hooks ran in plugin load order; no shipped plugin declares a priority, so shipped plugins now run in id order for these two hooks (every other hook is unchanged, including `wantsCombatHold`). Only a finite Lua number is valid: anything else (a string, even `'10'`, a table, a boolean, NaN, infinity) counts as 0 and writes one warning to the TAC log, and the plugin still loads. The value is read when the plugin is loaded, so an edited file needs a reload. New plugin API value `core.hookPriority` (experimental), checked with `core.hasCapability('hookPriority')`. Note: this is separate from the per-action `priority` (1 to 99) on spells, discs and clickies, which still runs lowest first. Decision record: `docs/decision_log.md` DL-003.

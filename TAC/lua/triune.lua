@@ -17343,8 +17343,18 @@ end
 function runtime.boxnetCounters(name)
     local bn = runtime.boxnetApi()
     if not bn or type(bn.peerCounters) ~= 'function' or not name or name == '' then return nil end
-    local ok, c = pcall(bn.peerCounters, name, runtime.BOXNET_FRESH_SEC or 3.0)
-    if ok and type(c) == 'table' then return c end
+    local ok, c, schema = pcall(bn.peerCounters, name, runtime.BOXNET_FRESH_SEC or 3.0)
+    if ok and type(c) == 'table' then
+        if schema == 1 then return c end
+        -- An older local plugin cannot distinguish a failed counter read from
+        -- zero. Keep its positives, but let unknown zeros use the usual fallback.
+        local known = {}
+        for key, value in pairs(c) do
+            local count = tonumber(value)
+            if count and count > 0 and count < math.huge then known[key] = count end
+        end
+        return next(known) and known or nil
+    end
     return nil
 end
 
@@ -18260,6 +18270,22 @@ function runtime.processGroupCureProbe()
         runtime.finishGroupCureProbe()
         return false
     end
+    if probe.startedAt and (mq.TLO.Target.ID() or 0) ~= probe.id then
+        runtime.finishGroupCureProbe()
+        return false
+    end
+    local ready = false
+    pcall(function() ready = (mq.TLO.Target.ID() or 0) == probe.id and mq.TLO.Target.BuffsPopulated() == true end)
+    -- Cure status can arrive over Box Network while target buffs are pending.
+    if (ready or probe.when ~= 'missing buff')
+        and not runtime.groupCureNeedsProbe(probe.id, probe.when, probe.spell, probe.entry) then
+        if ready then
+            runtime.groupCureObserved = runtime.groupCureObserved or {}
+            runtime.groupCureObserved[probe.id] = os.clock()
+        end
+        runtime.finishGroupCureProbe()
+        return false
+    end
     if not probe.startedAt then
         probe.originalId = mq.TLO.Target.ID() or 0
         if not runtime.setTarget(probe.id) then
@@ -18268,19 +18294,6 @@ function runtime.processGroupCureProbe()
         end
         probe.startedAt = os.clock()
         return true
-    end
-    if (mq.TLO.Target.ID() or 0) ~= probe.id then
-        runtime.finishGroupCureProbe()
-        return false
-    end
-    local ready = false
-    pcall(function() ready = mq.TLO.Target.BuffsPopulated() == true end)
-    ready = ready and not runtime.groupCureNeedsProbe(probe.id, probe.when, probe.spell, probe.entry)
-    if ready then
-        runtime.groupCureObserved = runtime.groupCureObserved or {}
-        runtime.groupCureObserved[probe.id] = os.clock()
-        runtime.finishGroupCureProbe()
-        return false
     end
     if os.clock() - probe.startedAt >= 0.5 then
         runtime.finishGroupCureProbe('timed out waiting for target buffs')

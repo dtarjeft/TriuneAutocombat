@@ -88,6 +88,26 @@ Everything below is built in. Open them from the buttons on the main window's he
 
 Each of these is a plugin in `lua/tac/`. Turn them on or off under **Settings -> Plugins**.
 
+**Group cures over Box Network:** update both `lua/triune.lua` and `lua/tac/boxnet.lua`
+on the support character and each boxed recipient, enable **Box Network**, and
+restart TAC on each character. Keep the MacroQuest launcher running; this uses
+its existing Actors connection, not EQBC or DanNet. Updating only `triune.lua`
+does not update what the tank broadcasts.
+
+With both characters in game on the same server and zone and permitted by the
+existing Box Network allowlist, fresh reports of their own poison, disease,
+curse and corruption let **Me, then Group** / **Group, then Me** choose a cure
+recipient without targeting them to inspect buffs. The support still explicitly
+targets that recipient for the cure and restores its previous target afterward.
+The Box Net counter column shows `?` for incomplete/unknown data; `C1` can mean a
+curse is present even if the client has no numeric counter total. Missing,
+stale or older zero-only reports use the existing nonblocking inspection
+fallback, rather than declaring that character clean. Older positive reports
+remain usable. Item readiness, burn-only settings, thresholds and heal priority
+still apply. `/ac net debug` reports the local plugin version and counters,
+and each peer's counter schema, heartbeat age and usability; use it on support
+and recipient to distinguish a missing update from stale or unavailable data.
+
 ---
 
 ## Commands you will actually use

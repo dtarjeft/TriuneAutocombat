@@ -4670,7 +4670,7 @@ do
     local runtime = { healActionCache = {}, lastCast = {} }
     local ctrl = { running = true, mode = 'Assist', medbreak_enabled = false }
     local loadout = { clickies = {} }
-    local tracker = { isLockedOut = function() return false end, recordSuccess = function() end }
+    local tracker = { isLockedOut = function() return world.lockedOut == true end, recordSuccess = function() end }
     local function noop() end
     local function no() return false end
     local function yes() return true end
@@ -4833,7 +4833,7 @@ do
         peerCounters = function(name)
             if not world.feed then return nil end
             local id = tonumber(name:match('Character(%d+)'))
-            return world.counters[id] or { poison = 0, disease = 0, curse = 0, corruption = 0 }
+            return world.counters[id] or { poison = 0, disease = 0, curse = 0, corruption = 0 }, 1
         end,
     } } }
     local mockMq = {
@@ -5003,7 +5003,7 @@ do
     local combatTick = real('combatTick')
 
     local function reset(entry, original, castMs)
-        world.clock, world.target = 100, original == nil and mobId or original
+        world.clock, world.target, world.lockedOut = 100, original == nil and mobId or original, false
         world.counters, world.hp = {}, {}
         world.cached, world.cachedAt, world.cacheAge, world.feed = {}, {}, 0, true
         world.buffs, world.cachedBuffs, world.ranges = {}, {}, {}
@@ -5736,6 +5736,222 @@ do
     local combatSource = extractFunction(src, 'combatTick')
     assert_true(combatSource:find('runtime.isTargetInRange(effName, id, c)', 1, true),
         'ordinary clickie dispatch also retains item metadata for its range gate')
+
+    -- DL-004: real plugin instances serialize their own Me data and receive it through
+    -- actor inboxes. The ally spawn deliberately has no character-only members.
+    local function networkPair()
+        local clients, plugins, characters = {}, {}, {}
+        local oldManager = runtime.pluginManager
+        local function copy(value)
+            if type(value) ~= 'table' then return value end
+            local out = {}
+            for key, v in pairs(value) do
+                assert_true(type(v) ~= 'function' and type(v) ~= 'userdata', 'network heartbeat contains only serialized values')
+                out[key] = copy(v)
+            end
+            return out
+        end
+        for _, id in ipairs({ meId, allyId }) do
+            local own = {
+                ID = function() return id end,
+                CleanName = spawns[id].CleanName,
+                Combat = no, Sitting = no,
+            }
+            for _, members in pairs(env.AFFLICTION_MEMBERS) do
+                own[members.counter] = function() return 0 end -- client affect-slot counters can be unavailable
+                own[members.flag] = function()
+                    if (counter(id, members.boxnet) or 0) > 0 then return 'Affliction ' .. members.boxnet end
+                    return nil
+                end
+            end
+            characters[id] = own
+            local pluginMq = { TLO = {
+                Me = own, Target = mockMq.TLO.Target,
+                Zone = { ShortName = function() return 'gfaydark' end, ID = function() return 54 end },
+                EverQuest = { PID = function() return id end, ServerName = function() return '' end },
+                MacroQuest = { GameState = function() return 'INGAME' end, Server = function() return 'triune' end },
+            } }
+            local inst = assert(loadfile('TAC/lua/tac/boxnet.lua'))()
+            inst.clock, inst.registry = function() return world.clock end, {}
+            inst.actorsModule = { register = function(_, handler)
+                local client = { handler = handler, name = own.CleanName(), id = id }
+                clients[#clients + 1] = client
+                return { send = function(_, a, b)
+                    local address, payload = nil, a
+                    if type(b) == 'table' then address, payload = a, b end
+                    for _, peer in ipairs(clients) do
+                        if not address or not address.character or address.character == peer.name then
+                            peer.handler({ content = copy(payload),
+                                sender = { character = client.name, server = 'triune', pid = client.id } })
+                        end
+                    end
+                end }
+            end }
+            local api = { mq = pluginMq, ctrl = ctrl, runtime = {}, VERSION = '3.2' }
+            inst.onInit(api)
+            plugins[id] = inst
+            if id == meId then runtime.pluginManager = { coreApi = api } end
+        end
+        local pair = { support = plugins[meId], tank = plugins[allyId], tankMe = characters[allyId] }
+        function pair.pump()
+            pair.tank.onTick()
+            pair.support.onTick()
+        end
+        function pair.close()
+            for _, inst in pairs(plugins) do inst.onDestroy() end
+            runtime.pluginManager = oldManager
+        end
+        pair.pump()
+        return pair
+    end
+
+    for _, selector in ipairs({ 'F: Me, then Group', 'F: Group, then Me' }) do
+        for _, cure in ipairs(cures) do
+            local entry = { name = cure.spell .. ' Network Clickie', spell = cure.spell,
+                target = selector, when = cure.when, pct = 100, enabled = true }
+            reset(entry)
+            world.counters[allyId] = { [cure.key] = 5 }
+            local pair = networkPair()
+            local label = selector .. ' / network ' .. cure.key
+            local reported = runtime.boxnetCounters('Character' .. allyId)
+            assert_true(reported and (reported[cure.key] or 0) > 0,
+                label .. ': own affliction flag broadcasts when numeric counters are zero')
+            assert_eq(runtime.resolveTargetId(selector, 'ALL', cure.when, cure.spell, 100, entry), allyId,
+                label .. ': actual receiver selects the afflicted tank')
+            assert_eq(world.target, mobId, label .. ': detection keeps the hostile selected until actual casting')
+            assert_nil(runtime.groupCureProbe, label .. ': fresh peer data does not need target inspection')
+            local fired = runtime.processHealPriority()
+            assert_true(fired, label .. ': actual priority dispatch executes the cure')
+            assert_eq(world.firedCommand, '/useitem "' .. entry.name .. '"', label .. ': cure item command is emitted')
+            if fired and world.firedCommand then checkHeldAndRestored(allyId, label) end
+            world.counters[allyId] = {}
+            world.cached[allyId], world.cachedAt[allyId] = { [cure.key] = 5 }, world.clock
+            runtime.groupCureObserved = { [allyId] = world.clock }
+            world.clock = world.clock + 0.3
+            pair.pump()
+            reported = runtime.boxnetCounters('Character' .. allyId)
+            assert_eq(reported and reported[cure.key], 0, label .. ': cleared counters broadcast a fresh known zero')
+            world.firedCommand = nil
+            assert_eq(runtime.processHealPriority(), false, label .. ': fresh clean peer suppresses stale cached affliction')
+            assert_nil(world.firedCommand, label .. ': fresh clean peer is not cured repeatedly')
+            assert_nil(runtime.groupCureProbe, label .. ': fresh clean peer is not inspected')
+            pair.close()
+        end
+
+        local entry = { name = 'Ordered Network Curse Cure', spell = 'Cure Curse', target = selector,
+            when = 'has Curse', pct = 100, enabled = true }
+        reset(entry)
+        world.counters[meId], world.counters[allyId] = { curse = 5 }, { curse = 5 }
+        local pair = networkPair()
+        local expected = selector == 'F: Me, then Group' and meId or allyId
+        assert_eq(runtime.resolveTargetId(selector, 'ALL', entry.when, entry.spell, 100, entry), expected,
+            selector .. ': native self status and real peer reports preserve caster-versus-member ordering')
+        assert_eq(world.target, mobId, selector .. ': ordering itself never changes the hostile target')
+        assert_true(runtime.processHealPriority(), selector .. ': first eligible afflicted recipient is cured')
+        if world.firedCommand then checkHeldAndRestored(expected, selector .. ' network ordering') end
+        pair.close()
+
+        reset(entry)
+        world.counters[allyId] = { curse = 5 }
+        loadout.clickies = { entry, emergencyHeal }
+        world.hp[meId], world.itemSpell, world.hostileAvailable = 30, emergencyHeal.spell, true
+        pair = networkPair()
+        combatTick()
+        assert_eq(tracker.activeSpell, emergencyHeal.spell, selector .. ': emergency HP heal preempts a known network cure')
+        assert_eq(world.firedTarget, mobId, selector .. ': emergency self-heal retains valid hostile redirection')
+        assert_nil(runtime.groupCureProbe, selector .. ': network cure does not inspect during an emergency heal')
+        finishCast()
+        world.hp[meId], world.itemSpell, world.firedCommand = 100, entry.spell, nil
+        pair.pump()
+        assert_true(runtime.processHealPriority(), selector .. ': reported curse remains eligible after the emergency heal')
+        assert_eq(world.firedCommand, '/useitem "' .. entry.name .. '"', selector .. ': cure follows the emergency heal')
+        if world.firedCommand then checkHeldAndRestored(allyId, selector .. ' post-heal network cure') end
+        pair.close()
+
+        for _, report in ipairs({ 'afflicted', 'clean' }) do
+            reset(entry)
+            world.feed, world.cacheDelay, world.hostileAvailable = false, 10, true
+            world.counters[allyId] = { curse = 5 }
+            combatTick()
+            assert_true(runtime.groupCureProbe ~= nil, selector .. ': missing peer data initially queues inspection')
+            assert_eq(world.target, allyId, selector .. ': pending inspection has selected the ally')
+            if report == 'clean' then world.counters[allyId] = {} end
+            pair = networkPair()
+            combatTick()
+            assert_nil(runtime.groupCureProbe, selector .. ': fresh ' .. report .. ' report releases pending inspection immediately')
+            if report == 'afflicted' then
+                assert_eq(world.firedCommand, '/useitem "' .. entry.name .. '"',
+                    selector .. ': newly received curse fires without waiting for target buff data')
+                if world.firedCommand then checkHeldAndRestored(allyId, selector .. ' newly networked cure') end
+            else
+                assert_nil(world.firedCommand, selector .. ': newly clean report prevents an unnecessary cure')
+                assert_eq(world.target, mobId, selector .. ': newly clean report restores the hostile without inspection timeout')
+            end
+            pair.close()
+        end
+
+        for _, report in ipairs({ 'unknown', 'legacy-zero' }) do
+            reset(entry)
+            world.counters[allyId], world.cacheDelay = { curse = 5 }, 0.2
+            pair = networkPair()
+            if report == 'unknown' then
+                pair.tankMe.CountersCurse = function() error('counter member unavailable') end
+                pair.tankMe.Cursed = nil
+                pair.tank.sendHeartbeat(true)
+            else
+                pair.tank.api.broadcast('heartbeat', { zone = 'gfaydark', counters = { curse = 0 } })
+            end
+            pair.support.onTick()
+            local counters = runtime.boxnetCounters('Character' .. allyId)
+            assert_nil(counters and counters.curse, selector .. ': ' .. report .. ' report is not a fresh clean result')
+            assert_nil(runtime.resolveTargetId(selector, 'ALL', entry.when, entry.spell, 100, entry),
+                selector .. ': ' .. report .. ' report retains fallback inspection')
+            assert_eq(world.target, mobId, selector .. ': unknown detection does not itself retarget')
+            combatTick()
+            world.clock = world.clock + 0.3
+            combatTick()
+            assert_eq(world.firedCommand, '/useitem "' .. entry.name .. '"', selector .. ': ' .. report .. ' fallback still cures')
+            if world.firedCommand then checkHeldAndRestored(allyId, selector .. ' ' .. report .. ' fallback') end
+            pair.close()
+        end
+
+        for _, gate in ipairs({ 'disabled', 'zero-threshold', 'burn-only', 'not-ready', 'throttled', 'locked-out' }) do
+            local entry = { name = 'Gated Network Cure', spell = 'Cure Curse', target = selector,
+                when = 'has Curse', pct = 100, enabled = true }
+            reset(entry)
+            world.counters[allyId] = { curse = 5 }
+            if gate == 'disabled' then entry.enabled = false
+            elseif gate == 'zero-threshold' then entry.pct = 0
+            elseif gate == 'burn-only' then entry.burn_only, ctrl.burn = true, false
+            elseif gate == 'not-ready' then world.itemReady = false
+            elseif gate == 'throttled' then runtime.lastCast['c_' .. entry.name] = world.clock
+            elseif gate == 'locked-out' then world.lockedOut = true end
+            local pair = networkPair()
+            assert_eq(runtime.processHealPriority(), false, selector .. ': network cure preserves ' .. gate .. ' gate')
+            assert_nil(world.firedCommand, selector .. ': ' .. gate .. ' does not issue a cure command')
+            assert_eq(world.target, mobId, selector .. ': ' .. gate .. ' does not select the tank')
+            pair.close()
+        end
+
+        entry = { name = 'Stale Network Cure', spell = 'Cure Curse', target = selector,
+            when = 'has Curse', pct = 100, enabled = true }
+        reset(entry)
+        world.counters[allyId], world.cacheDelay = { curse = 5 }, 0.2
+        pair = networkPair()
+        world.clock = world.clock + 3.1
+        pair.tank.api.broadcast('test:activity', {})
+        pair.support.onTick()
+        assert_nil(runtime.boxnetCounters('Character' .. allyId), selector .. ': ordinary peer traffic cannot refresh old counters')
+        assert_nil(runtime.resolveTargetId(selector, 'ALL', entry.when, entry.spell, 100, entry),
+            selector .. ': stale network data remains unknown until fallback inspection')
+        assert_true(runtime.groupCureProbe ~= nil, selector .. ': stale peers retain the existing inspection fallback')
+        combatTick()
+        world.clock = world.clock + 0.3
+        combatTick()
+        assert_eq(world.firedCommand, '/useitem "' .. entry.name .. '"', selector .. ': non-network fallback still executes the cure')
+        if world.firedCommand then checkHeldAndRestored(allyId, selector .. ' stale-peer fallback') end
+        pair.close()
+    end
 
     local loopSource = extractFunction(src, 'runMainLoop')
     assert_true(loopSource:find('elseif not ctrl.running then%s+runtime.finishGroupCureProbe%('),
@@ -13059,7 +13275,9 @@ end
                     PctHPs = function() return box.targetHp or 50 end,
                     Type = function() return 'NPC' end,
                 },
-                EverQuest = { PID = function() return box.pid end },
+                EverQuest = { PID = function() return box.pid end, ServerName = function() return 'triune' end },
+                MacroQuest = { GameState = function() return box.gameState or 'INGAME' end,
+                    Server = function() return 'triune' end },
                 Group = {
                     Member = function(n)
                         if box.groupMembers[lower(n)] then return callable('member', { ID = function() return 7 end }) end
@@ -13627,11 +13845,86 @@ end
     assert_eq(pc and pc.poison, 3, 'Suite 95: peerCounters carries poison counters')
     assert_eq(pc and pc.disease, 0, 'Suite 95: peerCounters carries disease counters')
     assert_eq(pc and pc.curse, 0, 'Suite 95: peerCounters carries curse counters')
+    -- DL-004: positive own flags, unknown versus clean, legacy peers and heartbeat age.
+    for _, members in ipairs({
+        { key = 'poison', counter = 'CountersPoison', flag = 'Poisoned' },
+        { key = 'disease', counter = 'CountersDisease', flag = 'Diseased' },
+        { key = 'curse', counter = 'CountersCurse', flag = 'Cursed' },
+        { key = 'corruption', counter = 'CountersCorruption', flag = 'Corrupted' },
+    }) do
+        local getter, flag = B.mq.TLO.Me[members.counter], B.mq.TLO.Me[members.flag]
+        B.mq.TLO.Me[members.counter] = function() return 0 end
+        B.mq.TLO.Me[members.flag] = function() return 'An affliction' end
+        clock.t = clock.t + 0.3
+        pump(1)
+        pc = A.inst.api.peerCounters('bob')
+        assert_true(pc and (pc[members.key] or 0) > 0,
+            'Suite 95: own ' .. members.flag .. ' reports affliction despite empty affect-slot counters')
+        B.mq.TLO.Me[members.counter] = function() error('counter member unavailable') end
+        B.mq.TLO.Me[members.flag] = nil
+        clock.t = clock.t + 0.3
+        pump(1)
+        pc = A.inst.api.peerCounters('bob')
+        assert_nil(pc and pc[members.key], 'Suite 95: failed ' .. members.counter .. ' is unknown, not zero')
+        B.mq.TLO.Me[members.counter] = function() return 0 end
+        clock.t = clock.t + 0.3
+        pump(1)
+        pc = A.inst.api.peerCounters('bob')
+        assert_eq(pc and pc[members.key], 0, 'Suite 95: unknown-to-clean change is sent before the periodic heartbeat')
+        B.mq.TLO.Me[members.counter], B.mq.TLO.Me[members.flag] = getter, flag
+    end
+    B.gameState = 'CHARSELECT'
+    clock.t = clock.t + 0.3
+    pump(1)
+    assert_nil(A.inst.api.peerCounters('bob'), 'Suite 95: non-ingame peer counters are unavailable')
+    B.gameState = 'INGAME'
+    clock.t = clock.t + 0.3
+    pump(1)
+    A.inst.cfg.trust, A.inst.cfg.allowlist = 'allow', {}
+    assert_nil(A.inst.api.peerCounters('bob'), 'Suite 95: cure feed respects the existing peer allowlist')
+    A.inst.cfg.trust = 'all'
+    local identity = { character = 'Bob', server = 'triune', pid = B.pid }
+    local legacy = { zone = B.zone, counters = { poison = 2, curse = 0 } }
+    A.inst.processMessage({ content = { v = 1, kind = 'heartbeat', data = legacy }, sender = identity })
+    pc = A.inst.api.peerCounters('bob')
+    assert_eq(pc and pc.poison, 2, 'Suite 95: legacy positive counters remain usable')
+    assert_nil(pc and pc.curse, 'Suite 95: legacy default-zero counters do not prove a peer is clean')
+    A.inst.processMessage({ content = { v = 1, kind = 'heartbeat',
+        data = { zone = B.zone, gameState = 'INGAME', counterSchema = 1,
+            counters = { curse = -1, poison = 'bad', disease = 0 / 0, corruption = math.huge } } }, sender = identity })
+    pc = A.inst.api.peerCounters('bob')
+    assert_true(pc == nil or next(pc) == nil, 'Suite 95: malformed counters stay unknown')
+    A.inst.processMessage({ content = { v = 1, kind = 'heartbeat',
+        data = { zone = B.zone, gameState = 'INGAME', counterSchema = 1, counters = { curse = 5 } } },
+        sender = { character = 'Bob', server = 'another-server', pid = B.pid } })
+    assert_nil(A.inst.api.peerCounters('bob'), 'Suite 95: other-server counters cannot cure a same-named group member')
+    B.inst.sendHeartbeat(true)
+    pump(1)
+    A.inst.processMessage({ content = { v = 1, kind = 'test:activity', data = {} },
+        sender = { character = 'Bob', server = 'triune', pid = B.pid + 1 } })
+    assert_nil(A.inst.api.peerCounters('bob'), 'Suite 95: a new transport process cannot retain the prior process counters')
+    B.inst.sendHeartbeat(true)
+    pump(1)
+    local serverName = A.mq.TLO.EverQuest.ServerName
+    A.mq.TLO.EverQuest.ServerName = function() return 'not-the-transport-server' end
+    assert_true(A.inst.api.peerCounters('bob') ~= nil, 'Suite 95: counter identity uses MacroQuest.Server before legacy server sources')
+    A.mq.TLO.EverQuest.ServerName = serverName
+    A.inst.onCommand('net', { 'net', 'debug' })
+    local diagnostics = table.concat(printed, '\n')
+    assert_true(diagnostics:find('cure report: plugin 1.1.0', 1, true) ~= nil,
+        'Suite 95: existing diagnostics identify the deployed counter reporter')
+    assert_true(diagnostics:find('cure peer Bob:', 1, true) ~= nil,
+        'Suite 95: existing diagnostics expose received counter schema, freshness and usability')
     clock.t = clock.t + 3.5 -- no pump: heartbeat goes stale but the peer has not expired yet
     assert_true(A.inst.api.peer('bob') ~= nil, 'Suite 95: peer still on the roster')
     assert_eq(A.inst.api.peerFresh('bob'), nil, 'Suite 95: heartbeat older than 3s is not fresh')
     assert_eq(A.inst.api.peerCounters('bob'), nil, 'Suite 95: stale counters are not offered')
     assert_true(A.inst.api.peerFresh('bob', 10) ~= nil, 'Suite 95: caller can widen the freshness window')
+    B.inst.api.broadcast('test:activity', {})
+    bus.flush()
+    A.inst.onTick()
+    assert_nil(A.inst.api.peerCounters('bob'), 'Suite 95: application messages do not refresh the heartbeat timestamp')
+    assert_nil(A.inst.api.peerTarget('bob'), 'Suite 95: application messages do not revive stale target state either')
 
     -- 21. Phase 3: peersInZone and the cross-box buff request flow
     clock.t = clock.t + 0.5
@@ -14486,7 +14779,7 @@ end)()
     local fakeApi = {
         available = function() return true end,
         peerTarget = function(name, maxAge) S.lastPeerName, S.lastMaxAge = name, maxAge return S.feed end,
-        peerCounters = function(name) S.lastCounterName = name return S.counters end,
+        peerCounters = function(name) S.lastCounterName = name return S.counters, 1 end,
     }
     local ctrl96 = { mode = 'Assist', xtar_nav_dist = 150, ma_id = 50, ma_name = 'Tank' }
     local env = {
@@ -14604,6 +14897,10 @@ end)()
     local isCorrupted = loadFunc(src, 'isCorrupted', env)
     S.counters = { corruption = 1 }
     assert_eq(isCorrupted(900), true, 'Suite 96: isCorrupted from Box Network counters')
+    fakeApi.peerCounters = function() return { curse = 0, poison = 2 } end
+    local mixed = boxnetCounters('Boxer')
+    assert_nil(mixed and mixed.curse, 'Suite 96: new core treats old plugin default zeros as unknown')
+    assert_eq(mixed and mixed.poison, 2, 'Suite 96: new core retains old plugin positive counters')
 end)()
 
 
